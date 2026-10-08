@@ -3,37 +3,37 @@
 Each Bridge<Name> wrapper builds its input struct on the stack, calls
 PVRSRVBridgeCall(w1=bridge, w2=func, x3=in, w4=in_size, x5=out, w6=out_size),
 then copies fields out of the output buffer. This script emulates the
-straight-line stack traffic around that call (no branch following) and
-reports every store into the input buffer and every load from the output
-buffer. Results are checked against the live capture in bringup_layouts.csv.
+straight-line stack traffic around that call (no branch following), reports
+every store into the input buffer and every load from the output buffer, and
+checks the bridge IDs and buffer sizes against the captures in CAPTURES.
+
+Usage: PVR_VENDOR=<dir with srv_um.dis and syms.txt> python decode_layouts.py
 """
 import csv
+import os
 import re
 from pathlib import Path
 
-import os
-
 ROOT = Path(__file__).resolve().parent
-# Directory holding srv_um.dis and syms.txt generated from the device's own libsrv_um.so.
-# The vendor binaries are not part of the repo; set PVR_VENDOR to point at them.
+# Holds srv_um.dis and syms.txt generated from the device's own libsrv_um.so.
+# The vendor binaries are not part of the repo, so PVR_VENDOR must point at them.
 VENDOR = Path(os.environ.get("PVR_VENDOR", ROOT / "vendor"))
-BRIDGE_CALL = 0x37A70
 # Bring-up (device open, buffer alloc, connect) and the submit/sync run (buffer fill + TDM submit + fence wait).
 CAPTURES = ["bringup_layouts.csv", "submit_layouts.csv"]
 
-LINE = re.compile(r"^\s*([0-9a-f]+):\s+(\S+)\s*(.*)$")
-CALL = re.compile(r"bl\t0x([0-9a-f]+) <PVRSRVBridgeCall>")
+INSN = re.compile(r"^\s*([0-9a-f]+):\s+(\S+)\s*(.*)$")
 MEM = re.compile(r"\[(\w+)(?:,\s*#(-?0x[0-9a-f]+|-?\d+))?\]")
-IMM = re.compile(r"#(-?0x[0-9a-f]+|-?\d+)")
+# Control-flow instructions that do not write their first operand, so it must keep its value.
+CONTROL = {"cbz", "cbnz", "b", "b.ne", "b.eq", "tbz", "tbnz", "nop"}
 
 
 def load_insns():
     insns = {}
     for line in (VENDOR / "srv_um.dis").read_text(errors="replace").splitlines():
-        m = LINE.match(line)
+        m = INSN.match(line)
         if m:
-            ops = [o.strip() for o in m.group(3).split("//")[0].split(",")] if m.group(3) else []
-            insns[int(m.group(1), 16)] = (m.group(2), [o for o in ops if o])
+            ops = [o.strip() for o in m.group(3).split("//")[0].split(",") if o.strip()]
+            insns[int(m.group(1), 16)] = (m.group(2), ops)
     return insns
 
 
@@ -74,12 +74,12 @@ def is_x(name):
     return name.startswith("x")
 
 
-def imm(text):
-    return int(text.lstrip("#"), 0)
+def const(val):
+    return val[1] if val[0] == "const" else None
 
 
 class Ctx:
-    """Symbolic register file: value kinds are ('const', n), ('sp', off), ('arg', n), ('stk', off), ('out', off)."""
+    """Symbolic registers: ('const', n), ('sp', off), ('arg', n), ('stk', off), ('out', off), ('mem', off), ('?',)."""
 
     def __init__(self):
         self.reg = {n: ("arg", n) for n in range(31)}
@@ -89,8 +89,7 @@ class Ctx:
             return ("const", 0)
         if name == "sp":
             return ("sp", 0)
-        n = regnum(name)
-        return self.reg.get(n, ("?",))
+        return self.reg.get(regnum(name), ("?",))
 
     def set(self, name, val):
         n = regnum(name)
@@ -100,178 +99,160 @@ class Ctx:
 
 def addr_of(ctx, mem_text):
     m = MEM.search(mem_text)
-    base, off = m.group(1), (imm(m.group(2)) if m.group(2) else 0)
-    b = ctx.get(base)
-    return b, off
+    off = int(m.group(2), 0) if m.group(2) else 0
+    return ctx.get(m.group(1)), off
 
 
-def widths(mn, ops):
-    """Return list of (width, src_reg_name) for a store instruction."""
+def mem_operand(ops):
+    return next((i for i, o in enumerate(ops) if "[" in o), None)
+
+
+def store_widths(mn, srcs):
     if mn in ("strb", "sturb"):
-        return [(1, ops[0])]
+        return [1]
     if mn in ("strh", "sturh"):
-        return [(2, ops[0])]
-    if mn in ("str", "stur"):
-        return [(8 if is_x(ops[0]) else 4, ops[0])]
-    if mn == "stp":
-        w = 8 if is_x(ops[0]) else 4
-        return [(w, ops[0]), (w, ops[1])]
-    return []
+        return [2]
+    w = 8 if is_x(srcs[0]) else 4
+    return [w, w] if mn == "stp" else [w]
 
 
-def analyse(start, end, insns, bridge_hint=None):
+def analyse(start, end, insns):
+    """Emulate one wrapper up to its PVRSRVBridgeCall site.
+
+    Returns (call, stores, addrs_after_call): call holds the IDs and buffer
+    registers at the call (None if there is no call site), stores lists
+    (absolute_sp_offset, width, value) for every store to the stack.
+    """
     ctx = Ctx()
     addrs = sorted(a for a in insns if start <= a < end)
-    call_at = None
-    call_info = {}
-    stores = []   # (abs_off, width, src_value)
-    pre_loads = []
-    out_src = {}  # reg -> ('out', off)
-    for a in addrs:
+    stores = []
+    for idx, a in enumerate(addrs):
         mn, ops = insns[a]
-        if mn == "bl" and CALL.search(f"{mn}\t{ops[0]}" if ops else mn):
-            call_at = a
-            call_info = {
-                "bridge": ctx.get("w1"),
-                "func": ctx.get("w2"),
+        if mn == "bl" and ops and "<PVRSRVBridgeCall>" in ops[0]:
+            call = {
+                "bridge": const(ctx.get("w1")),
+                "func": const(ctx.get("w2")),
                 "in_base": ctx.get("x3"),
-                "in_size": ctx.get("w4"),
+                "in_size": const(ctx.get("w4")),
                 "out_base": ctx.get("x5"),
-                "out_size": ctx.get("w6"),
+                "out_size": const(ctx.get("w6")),
             }
-            break
+            return call, stores, addrs[idx + 1:]
         if mn in ("mov", "movz") and len(ops) == 2:
-            ctx.set(ops[0], ctx.get(ops[1]) if not ops[1].startswith("#") else ("const", imm(ops[1])))
+            ctx.set(ops[0], ("const", int(ops[1].lstrip("#"), 0)) if ops[1].startswith("#") else ctx.get(ops[1]))
         elif mn in ("add", "sub") and len(ops) == 3:
             base = ctx.get(ops[1])
             if ops[2].startswith("#") and base[0] == "sp":
-                k = imm(ops[2])
+                k = int(ops[2].lstrip("#"), 0)
                 ctx.set(ops[0], ("sp", base[1] + (k if mn == "add" else -k)))
             elif ops[2].startswith("#") and base[0] == "const":
-                ctx.set(ops[0], ("const", base[1] + (imm(ops[2]) if mn == "add" else -imm(ops[2]))))
-        elif mn.startswith("str") or mn.startswith("stp") or mn.startswith("stur") or mn.startswith("sturb"):
-            # memory operand is the first bracketed operand
-            mem_idx = next(i for i, o in enumerate(ops) if "[" in o)
-            base, off = addr_of(ctx, ",".join(ops[mem_idx:]))
-            src_ops = ops[:mem_idx]
+                k = int(ops[2].lstrip("#"), 0)
+                ctx.set(ops[0], ("const", base[1] + (k if mn == "add" else -k)))
+        elif mn.startswith(("str", "stp", "stur")):
+            mem = mem_operand(ops)
+            base, off = addr_of(ctx, ",".join(ops[mem:]))
             if base[0] == "sp":
+                srcs = ops[:mem]
                 pos = base[1] + off
-                w = 0
-                for width, src in zip([x[0] for x in widths(mn, src_ops)], src_ops):
-                    stores.append((pos + w, width, ctx.get(src), src))
-                    w += width
-            elif base[0] == "stk" or base[0] == "arg":
-                # store through a pointer held in a register (caller output pointer)
-                for src in src_ops:
-                    val = ctx.get(src)
-                    if val[0] == "out":
-                        out_src.setdefault(("dest", base, off), []).append(val)
-        elif mn.startswith("ldr") or mn.startswith("ldur") or mn.startswith("ldp"):
-            mem_idx = next((i for i, o in enumerate(ops) if "[" in o), None)
-            if mem_idx is None:
+                for src, width in zip(srcs, store_widths(mn, srcs)):
+                    stores.append((pos, width, ctx.get(src)))
+                    pos += width
+        elif mn.startswith(("ldr", "ldur", "ldp")):
+            mem = mem_operand(ops)
+            if mem is None:
                 continue
-            base, off = addr_of(ctx, ",".join(ops[mem_idx:]))
-            dst = ops[:mem_idx]
-            if "x29" in ops[mem_idx] and off >= 0:
-                # x29 is the frame pointer: non-negative offsets address the caller's stack arguments
-                for d in dst:
-                    ctx.set(d, ("stk", off))
+            base, off = addr_of(ctx, ",".join(ops[mem:]))
+            if "x29" in ops[mem] and off >= 0:
+                # x29 is the frame pointer: non-negative offsets address the caller's stack arguments.
+                value = ("stk", off)
             elif base[0] == "sp":
-                pre_loads.append((base[1] + off, a, dst))
-                for d in dst:
-                    ctx.set(d, ("mem", base[1] + off))
-            elif base[0] == "sp" or base[0] == "arg":
-                for d in dst:
-                    ctx.set(d, ("stk", off))
+                value = ("mem", base[1] + off)
+            elif base[0] == "arg":
+                value = ("stk", off)
             else:
-                for d in dst:
-                    ctx.set(d, ("?",))
-        elif mn in ("cbz", "cbnz", "b", "b.ne", "b.eq", "tbz", "tbnz", "ret", "retaa", "adr", "adrp", "nop"):
-            if mn in ("adr", "adrp") and ops:
-                ctx.set(ops[0], ("?",))
-            if mn == "ret" or mn == "retaa":
-                break
-        else:
-            # any other writer clobbers its destination
-            if ops and regnum(ops[0]) is not None:
-                ctx.set(ops[0], ("?",))
-    # Output-side pass: from call site onward, walk loads from out buffer.
-    out_fields = []
-    if call_at is not None:
-        ctx2 = Ctx()
-        post = [a for a in addrs if a > call_at]
-        base_out = call_info["out_base"]
-        out_sp = base_out[1] if base_out[0] == "sp" else None
-        out_regs = {}
-        for a in post:
-            mn, ops = insns[a]
-            if mn == "ret" or mn == "retaa":
-                break
-            if mn.startswith("ldr") and any("[" in o for o in ops):
-                mem_idx = next(i for i, o in enumerate(ops) if "[" in o)
-                base, off = addr_of(ctx2, ",".join(ops[mem_idx:]))
-                if base[0] == "sp" and out_sp is not None:
-                    rel = base[1] + off - out_sp
-                    width = 8 if is_x(ops[0]) else (1 if mn == "ldrb" else 4)
-                    for d in ops[:mem_idx]:
-                        out_regs[regnum(d)] = (rel, width)
-                        ctx2.set(d, ("out", rel))
-                    continue
-                for d in ops[:mem_idx]:
-                    ctx2.set(d, ("?",))
-            if mn.startswith("str") and any("[" in o for o in ops):
-                src = ops[0]
-                n = regnum(src)
-                if n in out_regs:
-                    rel, width = out_regs[n]
-                    out_fields.append((rel, width, "store-to-caller-pointer"))
+                value = ("?",)
+            for d in ops[:mem]:
+                ctx.set(d, value)
+        elif mn in ("ret", "retaa"):
+            break
+        elif mn in CONTROL:
+            continue
+        elif ops and regnum(ops[0]) is not None:
+            ctx.set(ops[0], ("?",))
+    return None, stores, []
+
+
+def output_fields(insns, after_call, out_base):
+    """Loads from the output buffer after the call and where they are stored to caller pointers."""
+    out_sp = out_base[1] if out_base[0] == "sp" else None
+    ctx = Ctx()
+    out_regs = {}
+    fields = []
+    for a in after_call:
+        mn, ops = insns[a]
+        if mn in ("ret", "retaa"):
+            break
+        if mn.startswith("ldr") and mem_operand(ops) is not None:
+            mem = mem_operand(ops)
+            base, off = addr_of(ctx, ",".join(ops[mem:]))
+            if base[0] == "sp" and out_sp is not None:
+                rel = base[1] + off - out_sp
+                width = 8 if is_x(ops[0]) else (1 if mn == "ldrb" else 4)
+                for d in ops[:mem]:
+                    out_regs[regnum(d)] = (rel, width)
+                    ctx.set(d, ("out", rel))
                 continue
-            if mn == "mov" and len(ops) == 2 and regnum(ops[1]) in out_regs:
-                ctx2.set(ops[0], ("out", out_regs[regnum(ops[1])][0]))
-                out_regs[regnum(ops[0])] = out_regs[regnum(ops[1])]
-    return call_info, stores, out_fields
+            for d in ops[:mem]:
+                ctx.set(d, ("?",))
+        if mn.startswith("str") and mem_operand(ops) is not None:
+            if regnum(ops[0]) in out_regs:
+                fields.append((*out_regs[regnum(ops[0])], "store-to-caller-pointer"))
+            continue
+        if mn == "mov" and len(ops) == 2 and regnum(ops[1]) in out_regs:
+            ctx.set(ops[0], ("out", out_regs[regnum(ops[1])][0]))
+            out_regs[regnum(ops[0])] = out_regs[regnum(ops[1])]
+    return fields
 
 
 def main():
     insns = load_insns()
     syms = load_syms()
-    rows = []
     cap = {}
     # Each capture CSV contributes its calls; a symbol seen in both keeps the first sample.
     for capture in CAPTURES:
         with (ROOT / capture).open() as f:
             for r in csv.DictReader(f):
                 cap.setdefault(r["symbol"], r)
-    names = [n for _, n in syms]
+    rows = []
     for i, (start, name) in enumerate(syms):
         if name not in cap:
             continue
         end = syms[i + 1][0] if i + 1 < len(syms) else start + 0x400
-        info, stores, outs = analyse(start, end, insns)
-        c = cap[name]
-        if "in_base" not in info:
+        call, stores, after = analyse(start, end, insns)
+        if call is None:
             print("NO CALL SITE:", name)
             continue
-        base = info["in_base"][1] if info["in_base"][0] == "sp" else None
-        size = info["in_size"][1] if info["in_size"][0] == "const" else 0
-        in_fields = sorted({(off - base, w, describe(v)) for off, w, v, _ in stores
+        c = cap[name]
+        base = call["in_base"][1] if call["in_base"][0] == "sp" else None
+        size = call["in_size"] or 0
+        in_fields = sorted({(off - base, w, describe(v)) for off, w, v in stores
                             if base is not None and base <= off < base + size})
         rows.append({
             "symbol": name,
-            "bridge": info.get("bridge"),
-            "func": info.get("func"),
-            "in_size_code": info.get("in_size"),
+            "bridge": call["bridge"],
+            "func": call["func"],
+            "in_size_code": call["in_size"],
             "in_size_captured": int(c["in_size"]),
-            "out_size_code": info.get("out_size"),
+            "out_size_code": call["out_size"],
             "out_size_captured": int(c["out_size"]),
             "in_hex": c["in_hex"],
             "out_hex": c["out_hex"],
             "in_fields": in_fields,
-            "out_fields": sorted(set(outs)),
+            "out_fields": sorted(set(output_fields(insns, after, call["out_base"]))),
         })
     for r in rows:
-        print(r["symbol"], r["bridge"][1], r["func"][1], "in", r["in_size_code"][1], r["in_size_captured"],
-              "out", r["out_size_code"][1], r["out_size_captured"])
+        print(r["symbol"], r["bridge"], r["func"], "in", r["in_size_code"], r["in_size_captured"],
+              "out", r["out_size_code"], r["out_size_captured"])
         for f in r["in_fields"]:
             print("   in  ", f, "sample=", sample(r["in_hex"], f[0], f[1]))
         for f in r["out_fields"]:
@@ -279,11 +260,11 @@ def main():
     failures = []
     for r in rows:
         c = cap[r["symbol"]]
-        if (r["bridge"][1], r["func"][1]) != (int(c["bridge"]), int(c["func"])):
+        if (r["bridge"], r["func"]) != (int(c["bridge"]), int(c["func"])):
             failures.append((r["symbol"], "bridge/func"))
-        if r["in_size_code"][1] != int(c["in_size"]):
+        if r["in_size_code"] != int(c["in_size"]):
             failures.append((r["symbol"], "in size"))
-        if r["out_size_code"][1] != int(c["out_size"]):
+        if r["out_size_code"] != int(c["out_size"]):
             failures.append((r["symbol"], "out size"))
     print("checked", len(rows), "functions; failures:", failures or "none")
     write_reference(rows)
@@ -335,9 +316,9 @@ DDK headers or a kernel-side read to confirm.
 def write_reference(rows):
     lines = [HEADER]
     for r in rows:
-        lines.append(f"\n## {r['symbol']} (bridge {r['bridge'][1]}, function {r['func'][1]})\n")
-        lines.append(f"Input {r['in_size_code'][1]} bytes (captured {r['in_size_captured']}), "
-                     f"output {r['out_size_code'][1]} bytes (captured {r['out_size_captured']}).\n")
+        lines.append(f"\n## {r['symbol']} (bridge {r['bridge']}, function {r['func']})\n")
+        lines.append(f"Input {r['in_size_code']} bytes (captured {r['in_size_captured']}), "
+                     f"output {r['out_size_code']} bytes (captured {r['out_size_captured']}).\n")
         if r["in_fields"]:
             lines.append("| in offset | width | origin | sample |\n|---|---|---|---|")
             for off, w, origin in r["in_fields"]:
