@@ -369,7 +369,9 @@ def write_reference(rows):
 
 
 if __name__ == "__main__":
-    if sys.argv[1:2] == ["--from-log"] and len(sys.argv) == 4:
+    if sys.argv[1:2] == ["--from-log"]:
+        if len(sys.argv) != 4:
+            raise SystemExit("usage: decode_layouts.py --from-log <bridge.log> <capture.csv>")
         from_log(sys.argv[2], sys.argv[3])
     else:
         main()
