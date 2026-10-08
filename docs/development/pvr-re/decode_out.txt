@@ -39,6 +39,13 @@ BridgeDevmemIntReserveRangeAndMapPMR 6 16 in 40 40 out 12 12
    in   (24, 8, 'incoming arg reg 4') sample= 0x15
    in   (32, 8, 'incoming arg reg 5') sample= 0x333
    out  (0, 8, 'store-to-caller-pointer') sample= 0x19
+BridgeChangeSparseMem 6 18 in 36 36 out 4 4
+   in   (0, 8, 'incoming arg reg 6') sample= 0x77
+   in   (8, 8, 'incoming arg reg 2') sample= 0xb400007190656070
+   in   (16, 8, 'incoming arg reg 4') sample= 0x0
+   in   (24, 4, 'incoming arg reg 1') sample= 0x17f
+   in   (28, 4, 'incoming arg reg 3') sample= 0x0
+   in   (32, 4, 'incoming arg reg 5') sample= 0x1
 BridgeHeapCfgHeapCount 6 22 in 4 4 out 8 8
    in   (0, 4, 'incoming arg reg 1') sample= 0x0
    out  (4, 4, 'store-to-caller-pointer') sample= 0x10
@@ -80,6 +87,28 @@ BridgeRGXCreateComputeContext 129 0 in 56 56 out 12 12
    in   (48, 4, 'caller stack +0x20') sample= 0xffffffff
    in   (52, 4, 'incoming arg reg 7') sample= 0x0
    out  (0, 8, 'store-to-caller-pointer') sample= 0x3d
+BridgeRGXKickCDM 129 8 in 112 112 out 12 12
+   in   (0, 8, 'caller stack +0x70') sample= 0x0
+   in   (8, 8, 'incoming arg reg 1') sample= 0x3d
+   in   (16, 8, 'incoming arg reg 4') sample= 0x0
+   in   (24, 8, 'incoming arg reg 5') sample= 0x0
+   in   (32, 8, 'caller stack +0x50') sample= 0x7fde863a40
+   in   (40, 8, 'caller stack +0x30') sample= 0xb400007170651a70
+   in   (48, 8, 'caller stack +0x18') sample= 0x7fde863a8c
+   in   (56, 8, 'incoming arg reg 3') sample= 0x0
+   in   (64, 8, 'caller stack +0x58') sample= 0x7fde8639b0
+   in   (72, 4, 'incoming arg reg 6') sample= 0xffffffff
+   in   (76, 4, 'caller stack +0x20') sample= 0xffffffff
+   in   (80, 4, 'incoming arg reg 7') sample= 0x7
+   in   (84, 4, 'incoming arg reg 2') sample= 0x0
+   in   (88, 4, 'caller stack +0x28') sample= 0x78
+   in   (92, 4, 'caller stack +0x40') sample= 0x1
+   in   (96, 4, 'caller stack +0x60') sample= 0x0
+   in   (100, 4, 'caller stack +0x68') sample= 0x0
+   in   (104, 4, 'caller stack +0x38') sample= 0x0
+   in   (108, 4, 'caller stack +0x48') sample= 0x0
+   out  (4, 4, 'store-to-caller-pointer') sample= 0x12
+   out  (8, 4, 'store-to-caller-pointer') sample= 0x493a6
 BridgeRGXCreateHWRTDataSet 130 11 in 50 50 out 12 12
    in   (0, 8, 'incoming arg reg 1') sample= 0x0
    in   (8, 8, 'incoming arg reg 2') sample= 0x5a
@@ -189,4 +218,4 @@ BridgeSyncAllocEvent 2 7 in 17 17 out 4 4
    in   (8, 4, 'incoming arg reg 3') sample= 0x20
    in   (12, 4, 'incoming arg reg 2') sample= 0x40a09000
    in   (16, 1, 'incoming arg reg 1') sample= 0x0
-checked 34 functions; failures: none
+checked 36 functions; failures: none
