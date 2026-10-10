@@ -1,5 +1,6 @@
 package com.droiddeck.launcher.session
 
+import com.droiddeck.launcher.gpu.GpuInfo
 import com.droiddeck.launcher.gpu.LinuxVulkanDriver
 import com.droiddeck.launcher.gpu.LinuxVulkanDriverManager
 
@@ -291,6 +292,19 @@ class SessionService : Service() {
             .filter { it.isNotEmpty() && !it.startsWith("#") && it.contains('=') && !it.startsWith("=") }
         if (lines.isNotEmpty()) Log.i(TAG, "extra environment from $ENV_SWITCH: $lines")
         return lines
+    }
+
+    /**
+     * The Linux driver id a session should use: the user's choice when one is set, otherwise the
+     * driver the apk bundles for this GPU. The runtime carries no glibc driver for a PowerVR
+     * (Tensor G5), so on one of those a session would otherwise draw with a Turnip that cannot load
+     * there - the shim is installed from the apk on the spot and selected. Never overrides a
+     * choice: an empty preference on an Adreno stays the runtime's own driver.
+     */
+    private fun effectiveLinuxDriver(chosen: String): String {
+        if (!chosen.isEmpty()) return chosen
+        val id = LinuxVulkanDriverManager.bundledIdFor(GpuInfo.detect()) ?: return ""
+        return LinuxVulkanDriverManager(this).installBundled(id) ?: ""
     }
 
     private fun tuDebug(linuxDriverId: String): String? {
@@ -602,7 +616,7 @@ class SessionService : Service() {
         // import falls back to. One driver for every session: the driver's shader cache is keyed on
         // its build, and with one per mode every emulator compiled its shaders twice.
         val linuxDriverId = SessionPrefs.linuxDriver(this)
-        LinuxVulkanDriver.resolveIcdPath(this, linuxDriverId)
+        LinuxVulkanDriver.resolveIcdPath(this, effectiveLinuxDriver(linuxDriverId))
             ?.let { guest.add(LinuxVulkanDriver.ENV + "=" + it) }
         // Turnip's own debug switches, for the runtime's driver and everything on it. The file in
         // Downloads holds the value verbatim ("sysmem", "sysmem,deck_emu"); with nothing there, an

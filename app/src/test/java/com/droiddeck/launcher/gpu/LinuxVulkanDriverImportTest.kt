@@ -5,6 +5,7 @@ import android.net.Uri
 import org.json.JSONObject
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertTrue
+import org.junit.Assert.assertNull
 import org.junit.Assert.fail
 import org.junit.Before
 import org.junit.Test
@@ -123,5 +124,29 @@ class LinuxVulkanDriverImportTest {
         assertTrue(manager.enumerateInstalledDrivers().isEmpty())
         File(dir, LinuxVulkanDriverManager.ICD_NAME).writeText("{}")
         assertEquals(listOf("half"), manager.enumerateInstalledDrivers())
+    }
+
+    @Test fun aSupportLibraryInTheZipIsKept() {
+        // A glibc driver may be a set (the PowerVR shim ships a linker and a Wayland client beside
+        // the ICD), and it finds them relative to itself, so the importer must not drop them. A
+        // single-.so Turnip zip is unaffected - it carries nothing else.
+        val id = manager.installDriver(zip(mapOf(
+            LinuxVulkanDriverManager.META_NAME to JSONObject().put("name", "PowerVR").toString().toByteArray(),
+            "libvulkan_powervr.so" to library("libc.so.6"),
+            "libhybris.so" to library("libc.so.6"),
+            "q.so" to library("libc.so.6"),
+        )), "PowerVR")
+        assertEquals("libvulkan_powervr.so", manager.libraryName(id))
+        assertTrue(File(manager.getDriverDir(id), "libhybris.so").isFile)
+        assertTrue(File(manager.getDriverDir(id), "q.so").isFile)
+    }
+
+    @Test fun onlyAPowerVrGetsTheBundledShim() {
+        // The bundled driver is offered for the GPU the runtime has no glibc driver for, and only
+        // that one: an Adreno or Mali keeps the runtime's own driver untouched.
+        assertEquals(LinuxVulkanDriverManager.BUNDLED_POWERVR_G5X,
+            LinuxVulkanDriverManager.bundledIdFor(GpuInfo("PowerVR D-Series", 0, GpuInfo.Family.POWERVR_GXX, "Tensor G5", false)))
+        assertNull(LinuxVulkanDriverManager.bundledIdFor(GpuInfo("Adreno 740", 740, GpuInfo.Family.A7XX, "", false)))
+        assertNull(LinuxVulkanDriverManager.bundledIdFor(GpuInfo("Mali-G715", 0, GpuInfo.Family.MALI_G715, "Tensor G4", false)))
     }
 }

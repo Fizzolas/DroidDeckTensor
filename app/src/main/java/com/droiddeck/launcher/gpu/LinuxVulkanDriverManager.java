@@ -6,6 +6,7 @@ import android.util.Log;
 
 import com.droiddeck.launcher.R;
 import com.droiddeck.launcher.core.FileUtils;
+import com.droiddeck.launcher.core.TarZst;
 
 import org.json.JSONObject;
 
@@ -63,6 +64,18 @@ public class LinuxVulkanDriverManager {
     public static final String ICD_NAME = "icd.json";
     public static final String META_NAME = "meta.json";
 
+    /**
+     * A driver the apk ships itself, beside the imported ones. The PowerVR/Tensor G5 shim is the
+     * only one that must be bundled: the runtime carries no glibc driver for that GPU, so a session
+     * on one has nothing to draw with unless this is installed - and nothing the user could import
+     * by hand. It is a set of libraries (the ICD, the bionic shim, the linker, the Wayland client),
+     * not a single .so, so each id's archive unpacks whatever it holds into the driver directory.
+     */
+    public static final String BUNDLED_POWERVR_G5X = "powervr-g5x";
+    /** Where a bundled driver's archive lives in the apk. */
+    private static final String ASSET_DIR = "linux_driver/";
+    private static final String ASSET_SUFFIX = ".tzst";
+
     private final Context context;
     private final File rootDir;
 
@@ -74,6 +87,67 @@ public class LinuxVulkanDriverManager {
 
     public File getDriverDir(String id) {
         return new File(rootDir, id);
+    }
+
+    /** Whether the apk carries a bundled driver's archive (the one thing that decides if it exists). */
+    public boolean carried(String id) {
+        try (InputStream in = context.getAssets().open(ASSET_DIR + id + ASSET_SUFFIX)) {
+            return in != null;
+        } catch (IOException e) {
+            return false;
+        }
+    }
+
+    /**
+     * Install a bundled driver (its archive in the apk) into the drivers directory if it is not
+     * there yet, and return its id. Returns null when the apk carries no such archive. Idempotent:
+     * a present install is left alone, and no meta.json means it is (re)installed, so an app update
+     * replaces the driver. The bundled driver is only ever installed on request - never
+     * auto-selected - so "Auto" and an Adreno device are untouched.
+     */
+    public String installBundled(String id) {
+        if (id == null || id.isEmpty() || id.contains("/") || id.contains("..")) return null;
+        if (!carried(id)) {
+            Log.w(TAG, "this apk carries no " + ASSET_DIR + id + ASSET_SUFFIX + "; bundled driver unavailable");
+            return null;
+        }
+        File dir = getDriverDir(id);
+        if (new File(dir, META_NAME).isFile() && isInstalled(id)) return id;
+        FileUtils.delete(dir);
+        if (!dir.mkdirs()) { Log.e(TAG, "cannot create " + dir); return null; }
+        if (!TarZst.extractAsset(context, ASSET_DIR + id + ASSET_SUFFIX, dir)) {
+            Log.e(TAG, "cannot extract " + ASSET_DIR + id + ASSET_SUFFIX);
+            return null;
+        }
+        String lib = libraryName(id);
+        if (lib == null) { Log.e(TAG, "bundled " + id + " has no " + LIB_PREFIX + "*.so"); return null; }
+        try {
+            JSONObject icd = new JSONObject();
+            icd.put("file_format_version", "1.0.0");
+            JSONObject body = new JSONObject();
+            body.put("library_path", new File(dir, lib).getAbsolutePath());
+            body.put("api_version", "1.4.0");   // the PowerVR HAL reports 1.4.317
+            icd.put("ICD", body);
+            if (!FileUtils.writeString(new File(dir, ICD_NAME), icd.toString(2))) return null;
+            JSONObject meta = new JSONObject();
+            meta.put("schemaVersion", 1);
+            meta.put("kind", "linux-vulkan-icd");
+            meta.put("name", "PowerVR (Tensor G5)");
+            meta.put("driverVersion", "1.4.317");
+            meta.put("libc", "glibc");
+            meta.put("bundled", true);
+            if (!FileUtils.writeString(new File(dir, META_NAME), meta.toString(2))) return null;
+        } catch (org.json.JSONException e) {
+            Log.e(TAG, "bundled manifest write failed", e);
+            return null;
+        }
+        Log.i(TAG, "installed bundled Linux driver " + id + " (" + lib + ") -> " + dir);
+        return id;
+    }
+
+    /** The bundled driver id this GPU needs, or null: a PowerVR (Tensor G5) gets the shim. */
+    public static String bundledIdFor(GpuInfo gpu) {
+        return gpu.getFamily().getVendor() == GpuInfo.Vendor.POWERVR ? BUNDLED_POWERVR_G5X : null;
     }
 
     /** Installed = has the library AND the generated manifest (a half-extracted dir is never offered). */
