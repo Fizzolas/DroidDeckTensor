@@ -565,3 +565,74 @@ entry order, so a rebuild from unchanged inputs is byte-identical. The ICD insid
 (`9bcabaf73caf5fc30c5cd38da7de0204ba25b3a1872f0f2298fa5b53975b16b8`) can therefore be compared against
 a fresh `build_icd.sh` output with sha256, which is how the "was the new apk actually shipped" question
 gets answered.
+
+## 14. The line every session printed, and what it cost to ignore (2026-10-10)
+
+`MESA: error: zink: failed drmPrimeFDToHandle Invalid argument` appears in **every** session's log, from
+the first one in §10 onward. §10 called it "the first suspect" and then never chased it, because the
+client carried on past it and looked healthy. It is a real defect, and chasing it turned up a second
+one that matters more.
+
+**What it is.** Steam's client renders through **mesa zink** (`pEngineName: mesa zink`, in every
+session), i.e. GL on top of Vulkan. Under Xwayland its GLX/DRI3 path goes
+`dri_gbm -> dri2_query_image -> zink_bo_get_kms_handle -> drmPrimeFDToHandle`, and that last is a **GEM**
+ioctl. `drm-gem(7)`: *"a driver that does not support gem will return ENODEV for all these ioctls."*
+The render node on this device is `pvrsrvkm` (`OF_COMPATIBLE "img,gpu"`) - no GEM. Measured directly on
+the device, with the node open:
+
+```
+PRIME_FD_TO_HANDLE on /dev/dri/renderD128: rc=-1 errno=22 (Invalid argument)
+```
+
+`EINVAL` is the `Invalid argument` in that log line. This is the same failure the project already fixed
+once for a different GPU family: `tools/linuxfs/preload/drm.c` exists precisely to stand in for GEM
+handles on a node that has none, and its header says so ("Compositors and Mesa validate or convert
+dma-bufs with PRIME ioctls on the render node; KGSL has no GEM"). **It was keyed to KGSL alone.**
+`/dev/kgsl-3d0` does not exist here, so `is_kgsl()` returned false for every fd and the emulation was
+dead code on this device.
+
+**The fix is a predicate, not new logic.** The rule is now the driver's own answer rather than the
+node's name: the PRIME calls are sent to the real ioctl first and answered here when it fails with
+`ENODEV`/`EINVAL`/`ENOTTY`/`EOPNOTSUPP`. A node that has a GEM and refuses one unknown handle also
+answers `EINVAL`, and standing in for it is safe for the same reason the shim exists at all - a handle
+is only a token to these callers. KGSL keeps its name-based path, so Adreno behaviour is untouched.
+Everything downstream (`drmPrimeFDToHandle`, `drmPrimeHandleToFD`, `drmCloseBufferHandle`, and the
+`GEM_CLOSE` interposer in `netif.c`, which already routes through `bl_drm_gem_close`) works once the
+predicate matches.
+
+**Measured:** 26 of those errors before, **0** after. **The client still segfaults.** This was a real
+defect and it was *not* the crash - stated plainly, because the earlier hypothesis that it was the
+crash is falsified here.
+
+## 15. A bundled driver that could never be updated (2026-10-10, measured)
+
+Found while checking the fix above had actually reached the device, by counting the new ICD's log lines
+in a fresh session: they were still there, thousands of them. The guest was running the ICD from
+whenever the driver had first been extracted, not the one in the apk just installed.
+
+`LinuxVulkanDriverManager.installBundled`:
+
+```java
+if (new File(dir, META_NAME).isFile() && isInstalled(id)) return id;   // never re-extracts
+```
+
+A complete install is trusted forever. The method's own doc comment promised the opposite - *"A driver
+whose files are incomplete ... is re-extracted, **which is what an app update relies on**"* - so this
+was a bug against stated intent, not a missing feature. Since the bundled driver **is** the shim every
+session runs on, the effect is that an app update could never ship a new ICD: exactly the "the new apk
+was not shipped" trap, hit silently.
+
+The extracted `meta.json` now records `installedByVersionCode`, and a complete install is trusted only
+when that is the apk asking (`builtByThisApk`). An install from before the stamp existed reads as "not
+this apk" and is re-extracted once, which converges and cannot leave a stale build behind.
+
+**Measured after installing 0.3.3:** the guest's ICD log spam went from thousands of lines to **0** -
+the new library is the one in use. This is the fix that makes every future ICD change testable.
+
+**Method note, for whoever picks this up.** Both defects were in **shared components keyed to a GPU
+family** (`tools/linuxfs/preload/*.c`, and the driver manager's "installed" test), not in the Steam
+client, which was only the symptom carrier. The signal for the first was in every log from the start and
+was deprioritised for looking non-fatal; the signal for the second was a log line that should have
+disappeared and did not. When a shim's precondition is a property of the GPU family, adding a family
+means auditing every shim keyed to the old one - and when a change is supposed to alter what the guest
+logs, count the lines rather than trusting the install.
