@@ -825,3 +825,47 @@ not the shim's own logic, not Steam.
 **Not established:** whether the slot was never resolved (lazy binding not entered) or was resolved to
 the wrong address. Distinguishing them is the next measurement, and the interposer used for §17 can
 answer it by logging the resolver entry for this slot.
+
+## 20. Characterization: the HAL's PLT is not one stuck slot, it is a set (2026-10-10)
+
+§19 left one question: is the bad `strcmp` slot a single slot, or is PLT resolution broken generally?
+Measured - and it is neither "one" nor "all", which matters for what to do next.
+
+**Method.** With the guard fix in place (§18), the crash catcher dumped the whole of the HAL's
+`.got.plt` at fault time: file offset `0x286ab0`, `0xb00` bytes, 352 slots (the HAL's base comes from
+`x30 - 0x1b9f10`, since the fault's link register is inside `vulkan_device_open`). Every slot was then
+resolved against `/proc/self/maps` from the same report.
+
+**Result:**
+
+* **17 of 352 slots hold an address in no mapping.**
+* Their targets are all in one ~6 KB span, `0x76f5b2bd5c`-`0x76f5b2d700`, which is a real **hole**
+  between `q.so`'s last mapping (`0x76f5adf000`-`0x76f5ae2000`) and this ICD's first
+  (`0x76f5b40000`).
+* The symbols behind them are a coherent set:
+
+  ```
+  malloc, memcpy, strlen, strcmp, fclose, fgets, fseek, ftell,
+  pthread_mutex_lock, pthread_mutex_unlock, pthread_cond_wait,
+  pthread_cond_signal, pthread_cond_broadcast,
+  pthread_rwlock_rdlock, pthread_rwlock_wrlock, pthread_rwlock_unlock,
+  pthread_getspecific
+  ```
+
+* Neighbouring slots resolve correctly - 3, 8, 15, 69, 72, 83 land in glibc's `libc.so.6` and
+  `libufwriter.so` - so the whole table is not bad, and this is not a base-miscalculation artefact.
+
+**Why this shape.** Those 17 are exactly the class of libc function libhybris **interposes** rather than
+passes through: the memory allocator and the pthread primitives are the ones its `libhybris.so` hook
+layer replaces so bionic code can run on glibc. The addresses point into a region that was never
+mapped, so the mechanism is that the HAL's imports of these were resolved to somewhere that is not
+there. Which of {resolved to the wrong address, resolved but the region was unmapped afterwards, never
+resolved} it is has **not** been established, and that is the next measurement.
+
+**What this changes.** Not one slot - so not a small patch. Not the whole table - so not "the linker
+cannot do PLT at all", which would have been the worst answer. It is a bounded set of interposed libc
+symbols, which is a concrete thing to chase rather than a mystery.
+
+**Also a correction:** the catcher's `q.so_base` readout assumes the faulting `pc` is at `q.so+0x6c17c`,
+which is only true of the §17 crash. In this report it printed a meaningless value; only `si_addr`,
+`pc`, `lr` and the register set are load-bearing there.
