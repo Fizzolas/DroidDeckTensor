@@ -55,12 +55,41 @@ glibc runtime + both DSOs staged on device; run through the glibc loader:
 #      HYBRIS_LD_LIBRARY_PATH=/system/lib64:/vendor/lib64:/system/lib64/hw:/vendor/lib64/hw
 ```
 
-## Known remaining work (not blockers — the load already works)
+## The ICD: `libvulkan_powervr.so` (done — enumeration + queues)
+
+`icd/pvr_icd.c` is a glibc Vulkan **ICD** built on the shim. It links `libhybris.so` (so the bionic
+hook layer is present), `android_dlopen_ext`s the HAL, drives `HMI`/`open("vk0")`, and forwards
+`vk_icdGetInstanceProcAddr` / `vk_icdGetPhysicalDeviceProcAddr` / `vk_icdNegotiateLoaderICDInterfaceVersion`
+to the HAL's `GetInstanceProcAddr`. Build:
+
+```sh
+zig cc -target aarch64-linux-gnu.2.38 -fPIC -shared -O1 -o libvulkan_powervr.so icd/pvr_icd.c \
+  -L<links> -l:libhybris.so                 # <links> holds libhybris.so
+```
+
+Manifest for the guest (`VK_ICD_FILENAMES`):
+
+```json
+{"file_format_version":"1.0.0","ICD":{"library_path":"/usr/lib/libvulkan_powervr.so","api_version":"1.4.0"}}
+```
+
+**Proven (2026-10-10):** the real glibc Vulkan loader (`libvulkan.so.1`) discovers this ICD and
+enumerates the GPU — `vkCreateInstance` → 1 device `PowerVR D-Series DXT-48-1536 MC1`, 1 queue family
+(GRAPHICS, 2 queues). See `probes/vk_loader_test.c`. In DroidDeck terms the guest would ship
+`libvulkan_powervr.so` (built by this repo) + the two shim DSOs + the manifest, and
+`LinuxVulkanDriverManager` / `BwrapSpawner` already look for exactly that name.
+
+## Known remaining work
 
 * The process must link the hook DSO only; linking the linker DSO **too**, or leaving mm.so in the
   path, mixes two linkers and segfaults in `prelink_image`. The linker DSO is dlopen'd at runtime.
 * glibc's stack canary and bionic's `__stack_chk_guard` differ; `libhybris.so` must export the guard
   (it does) or teardown trips `__stack_chk_fail`. Harnesses should `_exit()` after their proof.
-* Still to build on top of this: a real `libvulkan_powervr.so` ICD wrapper around `HMI`/`open("vk0")`,
-  gralloc/AHB → dma-buf export for the swapchain, `/dev/pvr_sync` fence translation, and the guest
-  Wayland/X11 WSI. The driver-loading half — the part that was thought impossible — is done.
+* **`vkCreateDevice` hangs under glibc (open).** It returns 0 bionically (same driver, same device),
+  so the hang is in the libhybris path, not the driver. The driver's own threads (`vkmem_free`,
+  `vk_tlsem4_bg`) are created — one futex-waits correctly — but device init spins rather than
+  blocking. Prime suspects: the `pthread_attr_t` layout translation (`_hybris_hook_pthread_attr_init`/
+  `pthread_create`/`pthread_getschedparam`), and glibc-TLS vs bionic-TLS for the driver's
+  `__thread` state. Enumerating the device works before this, so the ICD and loader path are sound.
+* Still to build after device creation: gralloc/AHB → dma-buf export for the swapchain,
+  `/dev/pvr_sync` fence translation, and the guest Wayland/X11 WSI.
