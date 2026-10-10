@@ -55,8 +55,9 @@ static void *(*g_create)(const void *, const void *, VkInstance *);
 static VkInstance g_instance;         /* the instance we made for the HAL */
 
 /* The instance extensions this ICD provides on top of the HAL (the HAL has only Android surfaces). */
-static const char *const ICD_INSTANCE_EXTENSIONS[] = { "VK_KHR_surface", "VK_KHR_wayland_surface" };
-#define ICD_NUM_INSTANCE_EXTENSIONS 2
+static const char *const ICD_INSTANCE_EXTENSIONS[] = {
+    "VK_KHR_surface", "VK_KHR_wayland_surface", "VK_KHR_xcb_surface", "VK_KHR_xlib_surface" };
+#define ICD_NUM_INSTANCE_EXTENSIONS 4
 
 static void icd_log(const char *m) { fprintf(stderr, "pvr_icd: %s\n", m); }
 

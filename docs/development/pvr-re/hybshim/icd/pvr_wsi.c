@@ -9,14 +9,22 @@
  * vk_icdGetInstanceProcAddr for instance-level names, and stored on the instance for device level.
  */
 #define VK_USE_PLATFORM_WAYLAND_KHR 1
+#define VK_USE_PLATFORM_XCB_KHR 1
+#define VK_USE_PLATFORM_XLIB_KHR 1
 #include <vulkan/vulkan.h>
 #include <vulkan/vk_icd.h>
 #include <wayland-client.h>
 #include <linux-dmabuf-v1-client-protocol.h>
+#include <xcb/xcb.h>
+#include <xcb/dri3.h>
+#include <xcb/present.h>
+#include <X11/Xlib.h>
+#include <X11/Xlib-xcb.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
+#include <fcntl.h>
 
 #define WSI_LOG(...) do { fprintf(stderr, "pvr_wsi: " __VA_ARGS__); fputc('\n', stderr); } while (0)
 
@@ -30,11 +38,21 @@ static void *dev_proc(VkDevice dev, const char *name) {
 
 /* ---- per-surface ---------------------------------------------------------------- */
 
+/* Which platform the presentation goes through. A swapchain image is an exportable dma-buf either
+ * way; only the "show this image" step differs (wl_buffer vs DRI3 Pixmap + PresentPixmap). */
+enum wsi_kind { WSI_WAYLAND = 0, WSI_X11 = 1 };
+
 struct wsi_surface {
     VkSurfaceKHR handle;          /* set to (VkSurfaceKHR)this by the ICD */
+    enum wsi_kind kind;
+    /* Wayland (kind == WSI_WAYLAND) */
     struct wl_display *display;
     struct wl_surface *surface;
     struct zwp_linux_dmabuf_v1 *dmabuf;
+    /* X11 (kind == WSI_X11) */
+    xcb_connection_t *c;
+    xcb_window_t window;
+    uint8_t x_depth, x_bpp;
     int32_t width, height;
 };
 
@@ -90,6 +108,7 @@ static VkResult wsi_create_wayland_surface(VkInstance instance, const VkWaylandS
     struct wsi_display *wd = wsi_for_display(ci->display);
     struct wsi_surface *s = calloc(1, sizeof(*s));
     if (!s) return VK_ERROR_OUT_OF_HOST_MEMORY;
+    s->kind = WSI_WAYLAND;
     s->display = ci->display;
     s->surface = ci->surface;
     s->dmabuf = wd ? wd->dmabuf : NULL;
@@ -97,6 +116,38 @@ static VkResult wsi_create_wayland_surface(VkInstance instance, const VkWaylandS
     if (!s->dmabuf) WSI_LOG("no zwp_linux_dmabuf_v1 on the display; present will be unavailable");
     *out = (VkSurfaceKHR)s;
     return VK_SUCCESS;
+}
+
+/* vkCreateXcbSurfaceKHR / vkCreateXlibSurfaceKHR. Steam is an X11 client under gamescope's Xwayland;
+ * a swapchain image here is the same exportable dma-buf, bound to an X Pixmap at present time. */
+static VkResult wsi_create_xcb_surface(VkInstance instance, const VkXcbSurfaceCreateInfoKHR *ci,
+                                       const VkAllocationCallbacks *alloc, VkSurfaceKHR *out) {
+    (void)instance; (void)alloc;
+    if (!ci || !ci->connection || !ci->window) return VK_ERROR_INITIALIZATION_FAILED;
+    xcb_connection_t *c = (xcb_connection_t *)ci->connection;
+    xcb_query_extension_reply_t *dri3 = xcb_get_extension_data(c, &xcb_dri3_id);
+    xcb_query_extension_reply_t *present = xcb_get_extension_data(c, &xcb_present_id);
+    if (!dri3 || !dri3->present || !present || !present->present) {
+        WSI_LOG("X server has no DRI3/Present (%d/%d); present will be unavailable",
+                dri3 ? dri3->present : 0, present ? present->present : 0);
+    }
+    struct wsi_surface *s = calloc(1, sizeof(*s));
+    if (!s) return VK_ERROR_OUT_OF_HOST_MEMORY;
+    s->kind = WSI_X11; s->c = c; s->window = ci->window;
+    s->x_depth = 24; s->x_bpp = 32; s->width = 1280; s->height = 720;
+    *out = (VkSurfaceKHR)s;
+    return VK_SUCCESS;
+}
+
+static VkResult wsi_create_xlib_surface(VkInstance instance, const VkXlibSurfaceCreateInfoKHR *ci,
+                                        const VkAllocationCallbacks *alloc, VkSurfaceKHR *out) {
+    /* An Xlib Display* is not an xcb_connection_t; XGetXCBConnection (libX11-xcb) is the only correct
+     * bridge. Its result is borrowed — it belongs to the Display — so the surface does not own it. */
+    if (!ci || !ci->dpy || !ci->window) return VK_ERROR_INITIALIZATION_FAILED;
+    struct { uint32_t sType; const void *pNext; uint32_t flags; xcb_connection_t *connection; xcb_window_t window; } shim = { 0 };
+    shim.connection = XGetXCBConnection((Display *)ci->dpy);
+    shim.window = (xcb_window_t)ci->window;
+    return wsi_create_xcb_surface(instance, (const VkXcbSurfaceCreateInfoKHR *)&shim, alloc, out);
 }
 
 static void wsi_destroy_surface(VkInstance instance, VkSurfaceKHR surface, const VkAllocationCallbacks *alloc) {
@@ -148,7 +199,7 @@ static VkResult wsi_surface_present_modes(VkPhysicalDevice pd, VkSurfaceKHR surf
 
 /* ---- swapchain ------------------------------------------------------------------ */
 
-struct wsi_swapchain_image { VkImage image; VkDeviceMemory mem; int fd; struct wl_buffer *buffer; };
+struct wsi_swapchain_image { VkImage image; VkDeviceMemory mem; int fd; struct wl_buffer *buffer; xcb_pixmap_t pixmap; };
 struct wsi_swapchain {
     VkSwapchainKHR handle;
     VkDevice device;
@@ -157,6 +208,7 @@ struct wsi_swapchain {
     int32_t width, height;
     uint32_t drm_format;
     uint32_t stride;   /* the image's real row pitch, from vkGetImageSubresourceLayout */
+    uint64_t serial;   /* PresentPixmap's per-window monotonic serial (X11 present) */
     struct wsi_swapchain_image images[3];
     PFN_vkCreateImage CreateImage; PFN_vkGetImageMemoryRequirements GetImageMemoryRequirements;
     PFN_vkGetImageSubresourceLayout GetImageSubresourceLayout;
@@ -259,6 +311,8 @@ static void wsi_destroy_swapchain(VkDevice device, VkSwapchainKHR sw, const VkAl
      * swapchain teardown does not leak one per resize. */
     for (uint32_t i = 0; i < sc->count; i++) {
         if (sc->images[i].buffer) { wl_buffer_destroy(sc->images[i].buffer); sc->images[i].buffer = NULL; }
+        if (sc->images[i].pixmap && sc->surface && sc->surface->kind == WSI_X11)
+            xcb_free_pixmap(sc->surface->c, sc->images[i].pixmap);
         if (sc->images[i].fd >= 0) { close(sc->images[i].fd); sc->images[i].fd = -1; }
         if (sc->images[i].image && sc->DestroyImage) sc->DestroyImage(device, sc->images[i].image, alloc);
         if (sc->images[i].mem && sc->FreeMemory) sc->FreeMemory(device, sc->images[i].mem, alloc);
@@ -294,6 +348,26 @@ static VkResult wsi_queue_present(VkQueue queue, const VkPresentInfoKHR *pi) {
         uint32_t idx = pi->pImageIndices[i];
         if (!sc || idx >= sc->count) { if (pi->pResults) pi->pResults[i] = VK_ERROR_SURFACE_LOST_KHR; continue; }
         struct wsi_surface *surf = sc->surface;
+        if (surf->kind == WSI_X11) {
+            /* Give the image's dma-buf to Xwayland as a DRI3 Pixmap (once per image) and show it with
+             * Present. buffer_from_pixmap is the X->client direction, not needed here. */
+            if (sc->images[idx].fd < 0) { if (pi->pResults) pi->pResults[i] = VK_ERROR_SURFACE_LOST_KHR; continue; }
+            if (!sc->images[idx].pixmap) {
+                xcb_pixmap_t px = xcb_generate_id(surf->c);
+                int32_t fds[1] = { sc->images[idx].fd };
+                xcb_dri3_pixmap_from_buffers(surf->c, px, surf->window, 1,
+                                             (uint16_t)sc->width, (uint16_t)sc->height,
+                                             sc->stride, 0, 0, 0, 0, 0, 0, 0,
+                                             surf->x_depth, surf->x_bpp, 0 /* LINEAR */, fds);
+                sc->images[idx].pixmap = px;
+            }
+            xcb_present_pixmap(surf->c, surf->window, sc->images[idx].pixmap, ++sc->serial,
+                               XCB_NONE, XCB_NONE, 0, 0, XCB_NONE, XCB_NONE, XCB_NONE,
+                               XCB_PRESENT_OPTION_NONE, 0, 0, 0, 0, NULL);
+            xcb_flush(surf->c);
+            if (pi->pResults) pi->pResults[i] = VK_SUCCESS;
+            continue;
+        }
         if (!surf->dmabuf || sc->images[idx].fd < 0) { if (pi->pResults) pi->pResults[i] = VK_ERROR_SURFACE_LOST_KHR; continue; }
         /* A buffer for this image that the compositor has not released yet: drop our reference
          * (destroying it also frees the binding the release listener would have) so the slot is ours. */
@@ -328,6 +402,10 @@ static VkResult wsi_present_support(VkPhysicalDevice pd, uint32_t qf, VkSurfaceK
 void *pvr_wsi_proc(const char *name) {
     struct ent { const char *n; void *p; } t[] = {
         { "vkCreateWaylandSurfaceKHR", (void *)wsi_create_wayland_surface },
+        { "vkCreateXcbSurfaceKHR", (void *)wsi_create_xcb_surface },
+        { "vkCreateXlibSurfaceKHR", (void *)wsi_create_xlib_surface },
+        { "vkGetPhysicalDeviceXcbPresentationSupportKHR", (void *)wsi_present_support },
+        { "vkGetPhysicalDeviceXlibPresentationSupportKHR", (void *)wsi_present_support },
         { "vkDestroySurfaceKHR", (void *)wsi_destroy_surface },
         { "vkGetPhysicalDeviceSurfaceCapabilitiesKHR", (void *)wsi_surface_caps },
         { "vkGetPhysicalDeviceSurfaceFormatsKHR", (void *)wsi_surface_formats },
