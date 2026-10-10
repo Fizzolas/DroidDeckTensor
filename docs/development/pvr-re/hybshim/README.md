@@ -41,6 +41,13 @@ The upstream tree assumed an older clang and `android-headers`. Three edits make
 3. Build with `-D_GNU_SOURCE -D_LARGEFILE64_SOURCE -D_FORTIFY_SOURCE=1`, `-std=c++17`, and the zig
    `asm/` include dirs (`aarch64-linux-any` + `any-linux-any`) for `tlsdesc_resolver.S`.
 
+> **Do NOT define `HYBRIS_SHM_MASK_TOP` yourself.** `hooks_shm.h` defines it correctly as
+> `UINTPTR_MAX - 15`; a hand-written `#define HYBRIS_SHM_MASK_TOP 0` (which an early version of this
+> recipe had) makes `hybris_check_android_shared_cond` classify *every* heap pointer as "shared with
+> Android", so `_hybris_hook_pthread_cond_wait` returns immediately instead of blocking — device
+> creation then spins forever. This one line cost hours; it is the whole reason `vkCreateDevice`
+> hangs. The `config/android-config.h` here no longer defines it.
+
 **Use the Q linker, not MM.** MM is Android 6 and rejects modern `R_AARCH64_TLSDESC` relocations
 ("unknown reloc type 1031"); Q handles them. Build q.so with `WANT_LINKER_Q`, and build `hooks.c`
 with the same `-DWANT_LINKER_Q` so the two agree on `LINKER_NAME_DEFAULT`.
@@ -74,10 +81,10 @@ Manifest for the guest (`VK_ICD_FILENAMES`):
 ```
 
 **Proven (2026-10-10):** the real glibc Vulkan loader (`libvulkan.so.1`) discovers this ICD and
-enumerates the GPU — `vkCreateInstance` → 1 device `PowerVR D-Series DXT-48-1536 MC1`, 1 queue family
-(GRAPHICS, 2 queues). See `probes/vk_loader_test.c`. In DroidDeck terms the guest would ship
-`libvulkan_powervr.so` (built by this repo) + the two shim DSOs + the manifest, and
-`LinuxVulkanDriverManager` / `BwrapSpawner` already look for exactly that name.
+drives the GPU — `vkCreateInstance` → 1 device `PowerVR D-Series DXT-48-1536 MC1`, 1 queue family
+(GRAPHICS, 2 queues), **and `vkCreateDevice` → 0**. See `probes/vk_loader_test.c`. In DroidDeck terms
+the guest would ship `libvulkan_powervr.so` (built by this repo) + the two shim DSOs + the manifest,
+and `LinuxVulkanDriverManager` / `BwrapSpawner` already look for exactly that name.
 
 ## Known remaining work
 
@@ -85,11 +92,6 @@ enumerates the GPU — `vkCreateInstance` → 1 device `PowerVR D-Series DXT-48-
   path, mixes two linkers and segfaults in `prelink_image`. The linker DSO is dlopen'd at runtime.
 * glibc's stack canary and bionic's `__stack_chk_guard` differ; `libhybris.so` must export the guard
   (it does) or teardown trips `__stack_chk_fail`. Harnesses should `_exit()` after their proof.
-* **`vkCreateDevice` hangs under glibc (open).** It returns 0 bionically (same driver, same device),
-  so the hang is in the libhybris path, not the driver. The driver's own threads (`vkmem_free`,
-  `vk_tlsem4_bg`) are created — one futex-waits correctly — but device init spins rather than
-  blocking. Prime suspects: the `pthread_attr_t` layout translation (`_hybris_hook_pthread_attr_init`/
-  `pthread_create`/`pthread_getschedparam`), and glibc-TLS vs bionic-TLS for the driver's
-  `__thread` state. Enumerating the device works before this, so the ICD and loader path are sound.
-* Still to build after device creation: gralloc/AHB → dma-buf export for the swapchain,
-  `/dev/pvr_sync` fence translation, and the guest Wayland/X11 WSI.
+* Device creation works; the remaining work is the surface path: **WSI** (create a swapchain),
+  gralloc/AHB → dma-buf export for the swapchain images, and `/dev/pvr_sync` fence translation for
+  the guest's Wayland/X11 presentation. Then `vkcube` inside the guest, then Steam, then a game.

@@ -144,6 +144,12 @@ device extensions visible through glibc: 148   (drm_format_modifier, external_me
 BC3_UNORM optimalTilingFeatures=0x0000d401  SAMPLED (DXVK DXTn OK)
 ```
 
+And on top of it, a **glibc Vulkan ICD** (`pvr-re/hybshim/icd/pvr_icd.c`, built as
+`libvulkan_powervr.so`) that the real glibc Vulkan loader discovers via `VK_ICD_FILENAMES`:
+`vkCreateInstance` -> 1 device `PowerVR D-Series DXT-48-1536 MC1` (1.4.317), 1 queue family
+(GRAPHICS, 2 queues), and **`vkCreateDevice` -> 0**. That is the whole chain the guest needs to
+enumerate and open the GPU, from glibc.
+
 Three consecutive runs, exit 0. So the bionic vendor driver **does** run under glibc — the trap that
 `pvr_dltest.c` showed is exactly what libhybris's emulated bionic linker (`q.so`) and libc-hook layer
 (`libhybris.so`) resolve. The build uses only `zig` (no Android SDK, no sudo); the recipe and the
