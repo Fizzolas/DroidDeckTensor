@@ -63,6 +63,11 @@ static void icd_log(const char *m) { fprintf(stderr, "pvr_icd: %s\n", m); }
 
 /* The Wayland WSI this ICD carries (the HAL only does Android surfaces). */
 extern void *pvr_wsi_proc(const char *name);
+/* Told about each device the HAL creates, so the WSI can complete an acquire's fence/semaphore with
+ * the HAL's own queue entries (see the note in pvr_wsi.c). */
+extern void pvr_wsi_register_device(VkDevice dev, uint32_t queue_family, void *queue_submit,
+                                    void *create_fence, void *wait_fences, void *destroy_fence,
+                                    void *get_device_queue);
 static int icd_load(void);   /* defined below; used by pvr_icd_resolve */
 
 /* Self-configuration: the guest session runs with a clean environment (env -i), so this ICD points
@@ -154,6 +159,22 @@ static VkResult icd_create_device(void *pd, const void *ci, const void *alloc, v
     copy.ppEnabledExtensionNames = kept;
     VkResult r = hal(pd, &copy, alloc, out);
     free(kept);
+    if (r != VK_SUCCESS) return r;
+    /* The WSI drives its own queue submissions to complete a frame's fences and semaphores, so it
+     * needs the HAL's device entrypoints -- and the queue family the app's queues come from, taken
+     * from the first VkDeviceQueueCreateInfo (this device has one general family). */
+    if (out && *out) {
+        uint32_t qf = 0;
+        const uint32_t *q = (const uint32_t *)((const uint32_t *)ci + 3);  /* queueCreateInfoCount */
+        if (q && *q > 0) qf = q[1];                                        /* pQueueCreateInfos[0].queueFamilyIndex */
+        void *(*gdpa)(void *, const char *) =
+            (void *(*)(void *, const char *))g_gipa(*out, "vkGetDeviceProcAddr");
+        if (gdpa) {
+            pvr_wsi_register_device(*out, qf, gdpa(*out, "vkQueueSubmit"), gdpa(*out, "vkCreateFence"),
+                                    gdpa(*out, "vkWaitForFences"), gdpa(*out, "vkDestroyFence"),
+                                    gdpa(*out, "vkGetDeviceQueue"));
+        }
+    }
     return r;
 }
 
@@ -334,12 +355,15 @@ void *vk_icdGetPhysicalDeviceProcAddr(VkPhysicalDevice pd, const char *pName) {
     return g_gipa(g_instance, pName);
 }
 
-/* Some loaders call these directly rather than via GetInstanceProcAddr. */
+/* A loader that implements ICD interface 1 (and every loader from 1.3.x on) calls vk_icdCreateInstance
+ * DIRECTLY rather than fetching "vkCreateInstance" from vk_icdGetInstanceProcAddr. This used to hand
+ * the app's create-info straight to the HAL, which meant VK_KHR_wayland_surface / VK_KHR_xcb_surface /
+ * VK_KHR_xlib_surface reached the PowerVR blob -- it knows only Android surfaces, so the call failed and
+ * SDL reported "VK_KHR_wayland_surface extension is not enabled in the Vulkan instance" and could not
+ * create its backend, which is what stopped the Steam session. Route it through icd_create_instance,
+ * which strips our extension names before the HAL sees them; the app still gets them on the instance
+ * this ICD serves. */
 __attribute__((visibility("default")))
 int vk_icdCreateInstance(const void *ci, const void *alloc, VkInstance *out) {
-    if (icd_load() != 0) return VK_ERROR_INITIALIZATION_FAILED;
-    void *fn = g_gipa(NULL, "vkCreateInstance");
-    if (!fn) fn = (void *)g_create;
-    if (!fn) return VK_ERROR_INITIALIZATION_FAILED;
-    return ((int (*)(const void *, const void *, VkInstance *))fn)(ci, alloc, out);
+    return (int)icd_create_instance(ci, alloc, out);
 }

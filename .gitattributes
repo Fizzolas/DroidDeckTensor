@@ -1,0 +1,29 @@
+# Line endings.
+#
+# The guest half of this project is Linux: bash scripts, an XKB keymap, labwc/LXQt config and
+# .desktop files that are bind-mounted into the runtime's rootfs and executed there. A CRLF
+# checkout breaks them in ways that look like something else entirely - bash reports
+# "syntax error near unexpected token `$'\r''" and exits 2, which the app shows as
+# "<name> stopped unexpectedly" - so a Windows checkout must not be able to produce one.
+#
+# `text=auto eol=lf` normalises every text file to LF in the repository AND in the working tree,
+# whatever the machine's core.autocrlf says. Binary files are detected and left alone.
+* text=auto eol=lf
+
+# The one genuinely Windows-only file: cmd.exe reads CRLF batch files, and gradlew.bat is
+# committed with CRLF upstream.
+*.bat text eol=crlf
+*.cmd text eol=crlf
+
+# Explicitly binary - never normalise, never diff as text. `text=auto` already detects most of
+# these, but naming them keeps a future checkout from guessing wrong about an asset whose bytes
+# are the deliverable (the driver bundles, the fonts, the startup movie).
+*.tzst binary
+*.so binary
+*.png binary
+*.jpg binary
+*.webm binary
+*.ttf binary
+*.p12 binary
+*.jar binary
+*.dex binary

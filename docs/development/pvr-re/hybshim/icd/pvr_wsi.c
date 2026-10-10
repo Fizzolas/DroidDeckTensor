@@ -25,6 +25,7 @@
 #include <string.h>
 #include <unistd.h>
 #include <fcntl.h>
+#include <pthread.h>
 
 #define WSI_LOG(...) do { fprintf(stderr, "pvr_wsi: " __VA_ARGS__); fputc('\n', stderr); } while (0)
 
@@ -35,6 +36,62 @@ static void *dev_proc(VkDevice dev, const char *name) {
     if (!gdpa) gdpa = (PFN_vkGetDeviceProcAddr)pvr_icd_resolve(NULL, "vkGetDeviceProcAddr");
     return gdpa ? gdpa(dev, name) : NULL;
 }
+
+/* A release fence the app waits on must actually signal, and an acquire semaphore it makes its
+ * vkQueueSubmit wait on must actually be signaled, or its first frame never completes: the submit
+ * pends forever on a binary semaphore nobody signaled and vkWaitForFences never returns. The images
+ * here are handed out in turn and are always immediately available, so the honest answer is to
+ * complete both objects the instant they are returned. Vulkan binary semaphores have no
+ * host-side signal entrypoint, so this is done through an empty queue submit -- the HAL's own
+ * vkQueueSubmit, because ours must not recurse into itself. */
+/* The device-level entries these paths need, taken from the HAL rather than off the global
+ * vkGetDeviceProcAddr -- resolving them through pvr_icd_resolve would hand back THIS file's own
+ * vkQueueSubmit, and the internal submits below would then recurse into the entrypoint that made
+ * them. Filled in when the device is created (see wsi_register_device). */
+struct wsi_device_entries {
+    VkDevice dev;
+    uint32_t queue_family;      /* from the create-info: which family the app's queues come from */
+    PFN_vkQueueSubmit QueueSubmit;
+    PFN_vkCreateFence CreateFence;
+    PFN_vkWaitForFences WaitForFences;
+    PFN_vkDestroyFence DestroyFence;
+    PFN_vkGetDeviceQueue GetDeviceQueue;
+};
+static struct wsi_device_entries g_devs[4];
+static int g_ndevs;
+
+/* Called by the ICD when it creates the device, with the HAL entrypoints already resolved. The
+ * queue family comes from the first VkDeviceQueueCreateInfo, which is the family an app's graphics
+ * queue is on here -- this device has a single general queue family. */
+void pvr_wsi_register_device(VkDevice dev, uint32_t queue_family, void *queue_submit, void *create_fence,
+                             void *wait_fences, void *destroy_fence, void *get_device_queue) {
+    if (g_ndevs >= 4) return;
+    struct wsi_device_entries *e = &g_devs[g_ndevs++];
+    e->dev = dev;
+    e->queue_family = queue_family;
+    e->QueueSubmit = (PFN_vkQueueSubmit)queue_submit;
+    e->CreateFence = (PFN_vkCreateFence)create_fence;
+    e->WaitForFences = (PFN_vkWaitForFences)wait_fences;
+    e->DestroyFence = (PFN_vkDestroyFence)destroy_fence;
+    e->GetDeviceQueue = (PFN_vkGetDeviceQueue)get_device_queue;
+}
+
+static struct wsi_device_entries *wsi_entries(VkDevice dev) {
+    for (int i = 0; i < g_ndevs; i++) if (g_devs[i].dev == dev) return &g_devs[i];
+    return NULL;
+}
+
+/* The HAL's vkQueueSubmit: signal [sem] and/or complete [fence] on [queue] with an empty submit. */
+static int wsi_signal_on_queue(VkDevice dev, VkQueue queue, VkFence fence, VkSemaphore sem) {
+    if (!fence && !sem) return 1;
+    struct wsi_device_entries *e = wsi_entries(dev);
+    if (!e || !e->QueueSubmit || !queue) return 0;
+    VkSubmitInfo si = { VK_STRUCTURE_TYPE_SUBMIT_INFO };
+    si.signalSemaphoreCount = sem ? 1 : 0;
+    si.pSignalSemaphores = sem ? &sem : NULL;
+    return e->QueueSubmit(queue, 1, &si, fence) == VK_SUCCESS;
+}
+
 
 /* ---- per-surface ---------------------------------------------------------------- */
 
@@ -112,7 +169,9 @@ static VkResult wsi_create_wayland_surface(VkInstance instance, const VkWaylandS
     s->display = ci->display;
     s->surface = ci->surface;
     s->dmabuf = wd ? wd->dmabuf : NULL;
-    s->width = 1280; s->height = 720;
+    /* No size yet: a wl_surface is sized by the first buffer committed to it, so the app picks (see
+     * wsi_surface_caps). */
+    s->width = -1; s->height = -1;
     if (!s->dmabuf) WSI_LOG("no zwp_linux_dmabuf_v1 on the display; present will be unavailable");
     *out = (VkSurfaceKHR)s;
     return VK_SUCCESS;
@@ -134,7 +193,19 @@ static VkResult wsi_create_xcb_surface(VkInstance instance, const VkXcbSurfaceCr
     struct wsi_surface *s = calloc(1, sizeof(*s));
     if (!s) return VK_ERROR_OUT_OF_HOST_MEMORY;
     s->kind = WSI_X11; s->c = c; s->window = ci->window;
-    s->x_depth = 24; s->x_bpp = 32; s->width = 1280; s->height = 720;
+    /* The window's own depth, not an assumed 24: a DRI3 pixmap whose depth differs from its window
+     * is a protocol error. depth 24 draws into a 32-bit pixmap, so the bpp is the depth rounded up. */
+    xcb_get_geometry_cookie_t gc = xcb_get_geometry(c, ci->window);
+    xcb_get_geometry_reply_t *g = xcb_get_geometry_reply(c, gc, NULL);
+    if (g) {
+        s->x_depth = g->depth;
+        s->width = g->width;
+        s->height = g->height;
+        free(g);
+    } else {
+        s->x_depth = 24;
+    }
+    s->x_bpp = s->x_depth <= 8 ? 8 : (s->x_depth <= 16 ? 16 : (s->x_depth <= 24 ? 32 : 32));
     *out = (VkSurfaceKHR)s;
     return VK_SUCCESS;
 }
@@ -163,8 +234,34 @@ static VkResult wsi_surface_caps(VkPhysicalDevice pd, VkSurfaceKHR surface, VkSu
     memset(caps, 0, sizeof(*caps));
     caps->minImageCount = 2;
     caps->maxImageCount = 3;
-    caps->currentExtent.width = (uint32_t)s->width;
-    caps->currentExtent.height = (uint32_t)s->height;
+    /* The size of the window this presents into, re-read every time. Reporting a hardcoded extent is
+     * worse than reporting none: a real non-UINT32_MAX currentExtent tells the app that exact size is
+     * required, so Steam built a 1280x720 swapchain and presented it into the gamescope window (the
+     * panel-matched 1600x720 by default) -- a DRI3 pixmap of the wrong size, which present drops or
+     * shows garbled. If the window's geometry cannot be read, UINT32_MAX is the spec's "you choose". */
+    if (s->kind == WSI_X11 && s->c) {
+        xcb_get_geometry_cookie_t gc = xcb_get_geometry(s->c, s->window);
+        xcb_get_geometry_reply_t *g = xcb_get_geometry_reply(s->c, gc, NULL);
+        if (g) {
+            if (g->width > 0) s->width = g->width;
+            if (g->height > 0) s->height = g->height;
+            free(g);
+        } else {
+            s->width = s->height = -1;   /* unreadable: let the app pick, see below */
+        }
+    } else if (s->kind == WSI_WAYLAND && s->surface) {
+        /* wl_surface has no size of its own before a buffer is committed; the compositor's
+         * configure is what carries it and this WSI does not track it yet, so leave the choice to
+         * the app rather than invent one. */
+        s->width = s->height = -1;
+    }
+    if (s->width <= 0 || s->height <= 0) {
+        caps->currentExtent.width = UINT32_MAX;
+        caps->currentExtent.height = UINT32_MAX;
+    } else {
+        caps->currentExtent.width = (uint32_t)s->width;
+        caps->currentExtent.height = (uint32_t)s->height;
+    }
     caps->minImageExtent = (VkExtent2D){1, 1};
     caps->maxImageExtent = (VkExtent2D){4096, 4096};
     caps->maxImageArrayLayers = 1;
@@ -204,11 +301,18 @@ struct wsi_swapchain {
     VkSwapchainKHR handle;
     VkDevice device;
     struct wsi_surface *surface;
-    uint32_t count, next;
+    uint32_t count;
+    uint32_t pending;  /* the image the next acquire hands out */
     int32_t width, height;
     uint32_t drm_format;
     uint32_t stride;   /* the image's real row pitch, from vkGetImageSubresourceLayout */
     uint64_t serial;   /* PresentPixmap's per-window monotonic serial (X11 present) */
+    VkQueue queue;     /* the queue the app created its device with: our acquires submit to it */
+    /* Serializes the acquire(/present) bookkeeping: the app may own more than one swapchain, and
+     * its render thread and a streaming/UI thread can drive two of them at once, both of which
+     * land on these same WSI entrypoints. One lock for the whole WSI is coarse but this is a
+     * hand-off path, not a hot loop. */
+    pthread_mutex_t lock;
     struct wsi_swapchain_image images[3];
     PFN_vkCreateImage CreateImage; PFN_vkGetImageMemoryRequirements GetImageMemoryRequirements;
     PFN_vkGetImageSubresourceLayout GetImageSubresourceLayout;
@@ -217,6 +321,11 @@ struct wsi_swapchain {
     PFN_vkGetMemoryFdKHR GetMemoryFdKHR; PFN_vkGetPhysicalDeviceMemoryProperties GetPhysDevMemProps;
     VkPhysicalDeviceMemoryProperties memProps;
 };
+
+/* The device lock, held across an acquire so the image index, the release fence and the signal
+ * semaphore move together, and across a present so the wait semaphores are honored before the
+ * buffer is handed to the compositor. See the note on [struct wsi_swapchain]. */
+static pthread_mutex_t wsi_lock = PTHREAD_MUTEX_INITIALIZER;
 
 /* One fd per buffer, carried to the release listener through wl_buffer user_data. */
 struct wsi_buffer_binding { struct wsi_swapchain *sc; uint32_t index; };
@@ -234,7 +343,12 @@ static VkResult wsi_create_swapchain(VkDevice device, const VkSwapchainCreateInf
     struct wsi_surface *surf = (struct wsi_surface *)ci->surface;
     struct wsi_swapchain *sc = calloc(1, sizeof(*sc));
     if (!sc) return VK_ERROR_OUT_OF_HOST_MEMORY;
-    sc->device = device; sc->surface = surf; sc->next = 0;
+    pthread_mutex_init(&sc->lock, NULL);
+    sc->device = device; sc->surface = surf; sc->pending = 0;
+    /* The queue the app renders on and will present to. It may not have asked the HAL for it yet, so
+     * fetch it here and let its own vkGetDeviceQueue return the same one. */
+    struct wsi_device_entries *de = wsi_entries(device);
+    if (de && de->GetDeviceQueue) de->GetDeviceQueue(device, de->queue_family, 0, &sc->queue);
     sc->width = ci->imageExtent.width; sc->height = ci->imageExtent.height;
     sc->drm_format = drm_format_for(ci->imageFormat);
     sc->count = ci->minImageCount > 3 ? 3 : (ci->minImageCount < 2 ? 2 : ci->minImageCount);
@@ -317,6 +431,7 @@ static void wsi_destroy_swapchain(VkDevice device, VkSwapchainKHR sw, const VkAl
         if (sc->images[i].image && sc->DestroyImage) sc->DestroyImage(device, sc->images[i].image, alloc);
         if (sc->images[i].mem && sc->FreeMemory) sc->FreeMemory(device, sc->images[i].mem, alloc);
     }
+    pthread_mutex_destroy(&sc->lock);
     free(sc);
 }
 
@@ -332,20 +447,67 @@ static VkResult wsi_get_swapchain_images(VkDevice device, VkSwapchainKHR sw, uin
 
 static VkResult wsi_acquire_next_image(VkDevice device, VkSwapchainKHR sw, uint64_t timeout,
                                        VkSemaphore sem, VkFence fence, uint32_t *index) {
-    (void)device; (void)timeout; (void)sem; (void)fence;
+    (void)timeout;
+    if (!sw || !index) return VK_ERROR_INITIALIZATION_FAILED;
     struct wsi_swapchain *sc = (struct wsi_swapchain *)sw;
-    *index = sc->next;
-    sc->next = (sc->next + 1) % sc->count;
+    pthread_mutex_lock(&sc->lock);
+    uint32_t idx = sc->pending;
+    sc->pending = (idx + 1) % sc->count;
+    int ok = wsi_signal_on_queue(device, sc->queue, fence, sem);
+    pthread_mutex_unlock(&sc->lock);
+    if (!ok && (sem || fence)) {
+        /* Say so rather than hand back an image the app will wait on forever. */
+        WSI_LOG("acquire: no HAL vkQueueSubmit for %p; the frame would hang", (void *)device);
+        return VK_ERROR_INITIALIZATION_FAILED;
+    }
+    *index = idx;
     return VK_SUCCESS;
 }
 
 /* ---- present: dmabuf fd -> wl_buffer -> attach -> commit ------------------------ */
 
+/* Wait for a binary semaphore the app signaled through vkQueueSubmit. There is no host-side
+ * vkWaitSemaphores for a binary semaphore (that entrypoint is for timelines), so the wait is
+ * expressed as a queue operation: an empty submit that takes the semaphore as a WAIT and a fresh
+ * fence, then a wait on that fence. The timeout exists only so a semaphore that never signals is
+ * reported instead of hanging the session. */
+static VkResult wsi_wait_binary(VkDevice dev, VkQueue queue, VkSemaphore sem) {
+    struct wsi_device_entries *e = wsi_entries(dev);
+    if (!e || !e->QueueSubmit || !e->CreateFence || !e->WaitForFences || !e->DestroyFence) {
+        WSI_LOG("present: no HAL fence entries for %p; not waiting on the semaphore", (void *)dev);
+        return VK_ERROR_INITIALIZATION_FAILED;
+    }
+    VkFenceCreateInfo fci = { VK_STRUCTURE_TYPE_FENCE_CREATE_INFO };
+    VkFence f = VK_NULL_HANDLE;
+    VkResult r = e->CreateFence(dev, &fci, NULL, &f);
+    if (r != VK_SUCCESS) return r;
+    VkPipelineStageFlags stage = VK_PIPELINE_STAGE_ALL_COMMANDS_BIT;
+    VkSubmitInfo si = { VK_STRUCTURE_TYPE_SUBMIT_INFO };
+    si.waitSemaphoreCount = 1; si.pWaitSemaphores = &sem; si.pWaitDstStageMask = &stage;
+    r = e->QueueSubmit(queue, 1, &si, f);
+    if (r == VK_SUCCESS) r = e->WaitForFences(dev, 1, &f, VK_TRUE, 1000000000ull /* 1s */);
+    e->DestroyFence(dev, f, NULL);
+    return r;
+}
+
 static VkResult wsi_queue_present(VkQueue queue, const VkPresentInfoKHR *pi) {
     (void)queue;
+    pthread_mutex_lock(&wsi_lock);
     for (uint32_t i = 0; i < pi->swapchainCount; i++) {
         struct wsi_swapchain *sc = (struct wsi_swapchain *)pi->pSwapchains[i];
         uint32_t idx = pi->pImageIndices[i];
+        /* What the frame was rendered behind: the app makes the queue's rendering wait on a
+         * semaphore and presents with it here. The image is about to be read by the compositor, so
+         * wait for that work to finish first. Waiting with a timeout keeps a semaphore that never
+         * signals from wedging the session outright. It must happen before the early-outs below, or
+         * a present that fails for any other reason would leave the app's frame outstanding. */
+        if (sc && pi->pWaitSemaphores && i < pi->waitSemaphoreCount) {
+            VkSemaphore ws = pi->pWaitSemaphores[i];
+            if (ws) {
+                VkResult w = wsi_wait_binary(sc->device, queue, ws);
+                if (w != VK_SUCCESS) WSI_LOG("present: wait on the render semaphore failed %d", w);
+            }
+        }
         if (!sc || idx >= sc->count) { if (pi->pResults) pi->pResults[i] = VK_ERROR_SURFACE_LOST_KHR; continue; }
         struct wsi_surface *surf = sc->surface;
         if (surf->kind == WSI_X11) {
@@ -386,6 +548,7 @@ static VkResult wsi_queue_present(VkQueue queue, const VkPresentInfoKHR *pi) {
         wl_display_flush(surf->display);
         if (pi->pResults) pi->pResults[i] = VK_SUCCESS;
     }
+    pthread_mutex_unlock(&wsi_lock);
     return VK_SUCCESS;
 }
 
