@@ -21,6 +21,12 @@
 #include <string.h>
 #include <stdint.h>
 #include <dlfcn.h>
+#include <sys/stat.h>
+#include <sys/sysmacros.h>
+#include <unistd.h>
+#include <dirent.h>
+#include <errno.h>
+#include <fcntl.h>
 
 /* libhybris entry points (provided by libhybris.so, which this DSO links against). */
 extern void *android_dlopen_ext(const char *filename, int flag, const void *info);
@@ -285,6 +291,203 @@ static VkResult icd_enum_instance_ext_OLD(const char *layer, uint32_t *count, vo
     return (r == VK_INCOMPLETE || cap < n) ? VK_INCOMPLETE : VK_SUCCESS;
 }
 
+/* ---- VK_EXT_physical_device_drm -------------------------------------------------------------
+ *
+ * The PowerVR HAL advertises this extension and then writes NOTHING into
+ * VkPhysicalDeviceDrmPropertiesEXT - measured on device: with the struct poisoned, every field is
+ * still the poison after vkGetPhysicalDeviceProperties2 returns (see probes/pvr_drm_props_probe.c).
+ * An app that zero-initialises the struct (the spec's advice) therefore reads hasPrimary = 0.
+ *
+ * gamescope 3.16.29 gates its backend on exactly that field (rendervulkan.cpp):
+ *     if ( !GetBackend()->UsesVulkanSwapchain() && !drmProps.hasPrimary ) { "physical device has no
+ *     primary node"; return false; }
+ * and CWaylandBackend::UsesVulkanSwapchain() is false, so the nested Wayland backend was required to
+ * have a KMS primary node it never opens. With the struct left empty the gate always fired, the
+ * backend was deleted, and gamescope fell back to SDL against the instance it already made with an
+ * empty extension list, which dies with "VK_KHR_wayland_surface extension is not enabled in the
+ * Vulkan instance".
+ *
+ * The HAL's silence is what has to be corrected, so fill the struct in here from the node the HAL
+ * actually drives. This is the answer a working DRM driver would give; the HAL omitting it is the
+ * defect, not a fact to pass on. The gate is therefore satisfied truthfully rather than bypassed.
+ *
+ * hasPrimary comes out true on this device because it IS true: the PowerVR GPU exposes a card node
+ * of its own. /sys/class/drm/card2 and /sys/class/drm/renderD128 are both symlinks into
+ * /sys/devices/platform/34f00000.gpu0/drm/, and libdrm's drmGetDeviceFromDevId() reports them as one
+ * device (probes/pvr_drm_gate_probe.c: "available_nodes: primary=/dev/dri/card2
+ * render=/dev/dri/renderD128"). Nothing here invents a node: a device whose kernel driver registers
+ * no primary would still report hasPrimary = 0, which is the correct answer for it.
+ *
+ * The entrypoint is reached through vk_icdGetInstanceProcAddr, which is where the loader resolves it
+ * (its own trampoline calls the pointer the ICD returned there). Putting it in
+ * vk_icdGetPhysicalDeviceProcAddr instead is dead code: the loader only consults that for entry
+ * points it has no trampoline for, and vkGetPhysicalDeviceProperties2 has one. */
+#define STYPE_PHYS_DEV_PROPERTIES_2 1000059000u
+#define STYPE_DRM_PROPERTIES_EXT    1000353000u
+
+typedef struct {
+    uint32_t sType; void *pNext;
+    uint32_t hasPrimary, hasRender;
+    int64_t primaryMajor, primaryMinor, renderMajor, renderMinor;
+} PhysDevDrmProps;
+typedef struct { uint32_t sType; void *pNext; void *properties; } PhysDevProps2;
+
+static int g_drm_dev_known;
+static int g_drm_has_primary;
+static int64_t g_drm_primary_major, g_drm_primary_minor, g_drm_render_major, g_drm_render_minor;
+
+/* Which DRM device a node belongs to, the way libdrm answers it: a card node and a render node are
+ * the same device when the kernel put them in one device's sysfs directory, so their
+ * /sys/dev/char/<maj>:<min>/device links resolve to the same target. Comparing device NUMBERS would
+ * not work - card2 is 226:2 and renderD128 is 226:128, different numbers, one device. This phone's
+ * card0 (display) and card1 (2D block) are separate DRM devices with their own directories, so they
+ * correctly do not count as this GPU's primary. */
+static int icd_node_device(const char *node, int64_t *maj, int64_t *min, char *device, size_t devlen) {
+    struct stat st;
+    char link[128], path[64];
+    if (stat(node, &st) != 0) return 0;
+    *maj = major(st.st_rdev); *min = minor(st.st_rdev);
+    snprintf(path, sizeof(path), "/sys/dev/char/%lld:%lld/device", (long long)*maj, (long long)*min);
+    ssize_t n = readlink(path, link, sizeof(link) - 1);
+    if (n <= 0) return 0;
+    link[n] = 0;
+    snprintf(device, devlen, "%s", link);
+    return 1;
+}
+
+/* The primary node of a render node's DRM device: the card* entry of that device's own sysfs
+ * device/drm/ directory. Being in that directory IS the membership test - the kernel puts a device's
+ * nodes together - so no device-link comparison is needed.
+ *
+ * The numbers come from the entry's dev file rather than from stat()ing /dev/dri/card*, which cannot
+ * work in the guest: its /dev/dri is a fabricated directory holding only the render node (a phone
+ * app may not stat the real one - those nodes are graphics_device, which its policy does not grant),
+ * so a card node is discoverable only through sysfs. */
+static int icd_find_primary_for(const char *render_node, int64_t *pmaj, int64_t *pmin) {
+    char device[128], dir[192];
+    int64_t rmaj, rmin;
+    if (!icd_node_device(render_node, &rmaj, &rmin, device, sizeof(device))) return 0;
+    snprintf(dir, sizeof(dir), "/sys/dev/char/%lld:%lld/device/drm", (long long)rmaj, (long long)rmin);
+    DIR *d = opendir(dir);
+    if (!d) return 0;
+    int found = 0;
+    struct dirent *e;
+    while ((e = readdir(d)) && !found) {
+        char devfile[256];
+        if (strncmp(e->d_name, "card", 4) != 0) continue;
+        snprintf(devfile, sizeof(devfile), "%s/%s/dev", dir, e->d_name);
+        FILE *f = fopen(devfile, "r");
+        if (!f) continue;
+        long cmaj = -1, cmin = -1;
+        if (fscanf(f, "%ld:%ld", &cmaj, &cmin) == 2 && cmaj >= 0 && cmin >= 0) {
+            *pmaj = cmaj; *pmin = cmin; found = 1;
+        }
+        fclose(f);
+    }
+    closedir(d);
+    return found;
+}
+
+/* The DRM device behind the render node the HAL drives (PowerVR's is renderD128; nothing here
+ * hardcodes that), and the primary node of that same device, if one is registered. */
+static void icd_find_drm_dev(int *has_primary, int64_t *pmaj, int64_t *pmin, int64_t *rmaj, int64_t *rmin) {
+    if (!g_drm_dev_known) {
+        g_drm_dev_known = 1;
+        for (int minor = 0; minor < 256; minor++) {
+            char path[64];
+            struct stat st;
+            snprintf(path, sizeof(path), "/dev/dri/renderD%d", minor);
+            if (stat(path, &st) != 0) continue;
+            g_drm_render_major = major(st.st_rdev);
+            g_drm_render_minor = minor;
+            if (icd_find_primary_for(path, &g_drm_primary_major, &g_drm_primary_minor)) g_drm_has_primary = 1;
+            break;
+        }
+    }
+    *has_primary = g_drm_has_primary;
+    *pmaj = g_drm_primary_major; *pmin = g_drm_primary_minor;
+    *rmaj = g_drm_render_major; *rmin = g_drm_render_minor;
+}
+
+/* The HAL refuses a DRM-format-modifier image query that also carries
+ * VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT and the VkImageFormatListCreateInfo that goes with it, with
+ * VK_ERROR_FEATURE_NOT_PRESENT:
+ *
+ *   SAMPLED|STORAGE|XFER_SRC                     -> VK_SUCCESS, EXPORTABLE|IMPORTABLE
+ *   same + MUTABLE_FORMAT + format list           -> VK_ERROR_FEATURE_NOT_PRESENT
+ *
+ * gamescope asks the second way for its composited output: BInit sets that bit and list whenever an
+ * image's UNORM and SRGB views differ, then treats any result other than VK_ERROR_FORMAT_NOT_SUPPORTED
+ * as fatal, so it never reaches its own EXPORTABLE test and dies at "assert( modifiers.size() > 0 )".
+ *
+ * Mutable format describes a VIEW capability, not whether the format+modifier can be a dma-buf image
+ * at all - which is what gamescope is really asking - so this retries that question without the two
+ * bits, and only when the HAL's refusal is that specific error on a modifier-tiled query. */
+#define VK_ERROR_FEATURE_NOT_PRESENT_ (-11)
+#define VK_IMAGE_TILING_DRM_FORMAT_MODIFIER_EXT_ 1000158000u
+#define VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT_ 0x00000008u
+#define STYPE_IMAGE_FORMAT_LIST 1000147000u
+#define STYPE_EXT_IMG_FMT_INFO_ 1000071000u
+
+typedef struct { uint32_t sType; void *pNext; uint32_t format, type, tiling, usage, flags; } ImgFmtInfo2;
+typedef struct { uint32_t sType; void *pNext; } VkBase;
+typedef struct { uint32_t sType; void *pNext; uint32_t viewFormatCount; const void *pViewFormats; } FmtList;
+
+static void *icd_gipa_forward(void *instance, const char *name) {
+    if (!g_gipa && icd_load() != 0) return NULL;
+    return g_gipa ? g_gipa((VkInstance)instance, name) : NULL;
+}
+
+static VkResult icd_get_phys_dev_img_fmt_props2(void *pd, void *info, void *out) {
+    VkResult (*hal)(void *, void *, void *) =
+        (VkResult (*)(void *, void *, void *))icd_gipa_forward(g_instance, "vkGetPhysicalDeviceImageFormatProperties2");
+    if (!hal) return VK_ERROR_INITIALIZATION_FAILED;
+
+    VkResult r = hal(pd, info, out);
+    ImgFmtInfo2 *i = (ImgFmtInfo2 *)info;
+    if (r != VK_ERROR_FEATURE_NOT_PRESENT_ || !i || i->tiling != VK_IMAGE_TILING_DRM_FORMAT_MODIFIER_EXT_)
+        return r;
+    if (!(i->flags & VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT_)) return r;
+
+    /* Rebuild the pNext chain by UNLINKING the format-list struct from the live chain - each struct's
+     * pNext is rewritten to skip it. (An array of pointers is not a pNext chain, and handing the HAL
+     * one is what made an earlier attempt at this silently fail.) */
+    ImgFmtInfo2 retry = *i;
+    VkBase *prev = (VkBase *)&retry;
+    for (VkBase *b = (VkBase *)i->pNext; b; b = (VkBase *)b->pNext) {
+        if (b->sType == STYPE_IMAGE_FORMAT_LIST) { prev->pNext = b->pNext; continue; }
+        prev->pNext = b; prev = b;
+    }
+    prev->pNext = NULL;
+    retry.flags = i->flags & ~VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT_;
+
+    VkResult r2 = hal(pd, &retry, out);
+    fprintf(stderr, "pvr_icd: DRM-modifier query fmt=0x%x usage=0x%x with MUTABLE_FORMAT -> %d; "
+                    "retried without it -> %d\n", i->format, i->usage, r, r2);
+    return (r2 == VK_SUCCESS) ? r2 : r;   /* still unsupported: keep the original answer */
+}
+
+static void icd_get_phys_dev_props2(void *pd, void *props2) {
+    PhysDevProps2 *p2 = (PhysDevProps2 *)props2;
+    if (!p2) return;
+    /* The HAL answers for the rest of the chain; it just leaves this struct empty. */
+    if (!g_gipa && icd_load() != 0) return;
+    void (*hal)(void *, void *) = (void (*)(void *, void *))g_gipa(g_instance, "vkGetPhysicalDeviceProperties2");
+    if (!hal) hal = (void (*)(void *, void *))g_gipa(g_instance, "vkGetPhysicalDeviceProperties2KHR");
+    if (hal) hal(pd, props2);
+    int has_primary; int64_t pmaj, pmin, rmaj, rmin;
+    icd_find_drm_dev(&has_primary, &pmaj, &pmin, &rmaj, &rmin);
+    for (PhysDevDrmProps *d = (PhysDevDrmProps *)p2->pNext; d; d = (PhysDevDrmProps *)d->pNext) {
+        if (d->sType != STYPE_DRM_PROPERTIES_EXT) continue;
+        d->hasPrimary = (uint32_t)has_primary;
+        d->primaryMajor = pmaj; d->primaryMinor = pmin;
+        d->hasRender = 1;
+        d->renderMajor = rmaj; d->renderMinor = rmin;
+        fprintf(stderr, "pvr_icd: physical_device_drm: hasPrimary=%d primary=%lld:%lld render=%lld:%lld\n",
+                has_primary, (long long)pmaj, (long long)pmin, (long long)rmaj, (long long)rmin);
+    }
+}
+
 /* Intercept instance creation: make one for the HAL without our extension names in it. */
 typedef struct {
     uint32_t sType; const void *pNext; uint32_t flags; const void *pApplicationInfo;
@@ -340,6 +543,15 @@ void *vk_icdGetInstanceProcAddr(VkInstance instance, const char *pName) {
     if (!strcmp(pName, "vkEnumerateDeviceExtensionProperties")) return (void *)icd_enum_device_ext;
     if (!strcmp(pName, "vkEnumerateInstanceExtensionProperties")) return (void *)icd_enum_instance_ext;
     if (!strcmp(pName, "vkCreateInstance")) return (void *)icd_create_instance;
+    /* The loader's own trampoline for vkGetPhysicalDeviceProperties2 calls whatever this returns, so
+     * this is where the HAL's empty VK_EXT_physical_device_drm answer is corrected. */
+    if (!strcmp(pName, "vkGetPhysicalDeviceProperties2") || !strcmp(pName, "vkGetPhysicalDeviceProperties2KHR"))
+        return (void *)icd_get_phys_dev_props2;
+    /* A DRM-modifier image query the HAL refuses only because of the mutable-format bits; see the
+     * note above icd_get_phys_dev_img_fmt_props2. */
+    if (!strcmp(pName, "vkGetPhysicalDeviceImageFormatProperties2") ||
+        !strcmp(pName, "vkGetPhysicalDeviceImageFormatProperties2KHR"))
+        return (void *)icd_get_phys_dev_img_fmt_props2;
     if (!g_gipa) { if (icd_load() != 0) return NULL; }
     return g_gipa(instance, pName);
 }

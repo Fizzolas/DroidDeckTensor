@@ -59,6 +59,63 @@ class InstanceExtensionStripTest(unittest.TestCase):
         self.assertNotIn('g_create', entry, 'vk_icdCreateInstance must not fall back to the HAL create')
 
 
+class DrmPropertiesAreFilledInTest(unittest.TestCase):
+    """The HAL advertises VK_EXT_physical_device_drm and then writes nothing into the struct.
+
+    An app that zero-initialises it therefore reads hasPrimary=0 - and gamescope 3.16.29 gates its
+    backend on exactly that (`if ( !GetBackend()->UsesVulkanSwapchain() && !drmProps.hasPrimary )`),
+    so the nested Wayland backend was required to have a KMS primary node it never opens. The ICD
+    must answer with the DRM device behind the node the HAL drives.
+    """
+
+    def test_the_icd_implements_get_physical_device_properties2(self):
+        text = source(PVR_ICD_C)
+        self.assertIn('icd_get_phys_dev_props2', text)
+
+    def test_the_entrypoint_is_reachable_through_the_instance_proc_addr(self):
+        """The loader's own trampoline calls the pointer returned from vk_icdGetInstanceProcAddr.
+
+        Putting it in vk_icdGetPhysicalDeviceProcAddr instead is dead code: the loader only consults
+        that for entry points it has no trampoline for, and this one has one.
+        """
+        text = source(PVR_ICD_C)
+        body = re.search(r'void \*vk_icdGetInstanceProcAddr\(.*?\n\}', text, re.S)
+        self.assertIsNotNone(body, 'vk_icdGetInstanceProcAddr not found')
+        entry = body.group(0)
+        self.assertIn('"vkGetPhysicalDeviceProperties2"', entry,
+                      'the loader resolves this through vk_icdGetInstanceProcAddr')
+        self.assertIn('icd_get_phys_dev_props2', entry)
+
+    def test_the_drm_properties_struct_is_recognised_by_its_stype(self):
+        text = source(PVR_ICD_C)
+        self.assertIn('1000353000', text, 'VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DRM_PROPERTIES_EXT')
+
+    def test_the_primary_node_is_found_through_sysfs_not_by_statting_it(self):
+        """The guest's /dev/dri holds only the render node, so a card node has no path to stat.
+
+        A phone app may not stat the real /dev/dri either - those nodes are graphics_device, which
+        its policy does not grant - so the card node is discoverable only through the sysfs tree the
+        app builds. Reading it by /dev/dri/card* would always fail and hasPrimary would stay false.
+        """
+        text = source(PVR_ICD_C)
+        body = re.search(r'static int icd_find_primary_for\(.*?\n\}', text, re.S)
+        self.assertIsNotNone(body, 'icd_find_primary_for not found')
+        entry = body.group(0)
+        self.assertIn('/device/drm', entry, 'the card node is found in the render node\'s device dir')
+        self.assertIn('opendir', entry)
+        self.assertIn('/dev', entry, 'the dev file is read from the sysfs entry')
+        self.assertNotIn('stat(cpath', entry, 'the card node must not be stat-ed by its own path')
+
+    def test_the_hal_still_answers_for_the_rest_of_the_chain(self):
+        """The HAL must fill the other pNext structs; this ICD only corrects the DRM one."""
+        text = source(PVR_ICD_C)
+        body = re.search(r'static void icd_get_phys_dev_props2\(.*?\n\}', text, re.S)
+        self.assertIsNotNone(body, 'icd_get_phys_dev_props2 not found')
+        entry = body.group(0)
+        self.assertIn('hal(pd, props2)', entry, 'the HAL still answers the call')
+        self.assertIn('STYPE_DRM_PROPERTIES_EXT', entry)
+
+
 class AcquireCompletesSemaphoreAndFenceTest(unittest.TestCase):
     """A real renderer acquires with a semaphore and/or a fence and waits on them."""
 

@@ -14,6 +14,7 @@ import java.io.File;
 import java.io.IOException;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
+import java.nio.file.Paths;
 import java.util.ArrayList;
 import java.util.List;
 
@@ -373,32 +374,129 @@ public final class LinuxRuntime {
         File dri = new File(base, "dri");
         File device = new File(base, "sys/" + major + ":" + minor + "/device");
         File drm = new File(device, "drm/" + node);
+        // Where the kernel's own device directory for this node is. libdrm insists that
+        // /sys/dev/char/<maj>:<min>/device be a SYMLINK - drmParseSubsystemType() readlinks it and
+        // looks for "/platform" in the target, and the node's drm/ directory is read through it.
+        // Fabricating a real directory there makes readlink fail, libdrm drops every node, and
+        // gamescope dies at "drmGetDeviceFromDevId() failed". Where the kernel describes this node,
+        // point at its directory instead: it holds the node's real uevent, subsystem, driver and the
+        // device's whole drm/ directory - the GPU's card node included. Only where it does not (an
+        // Adreno's /dev/kgsl-3d0, which is not a DRM node at all) is the tree fabricated by hand.
+        String real = realDeviceDir(major, minor, node);
         try {
-            if ((!dri.isDirectory() && !dri.mkdirs()) || (!drm.isDirectory() && !drm.mkdirs())) {
-                return;
-            }
+            deleteRecursively(device);
+            dri.mkdirs();
             new File(dri, node).createNewFile();
-            Files.write(new File(drm, "dev").toPath(),
-                    (major + ":" + minor + "\n").getBytes(StandardCharsets.UTF_8));
-            Files.write(new File(device, "uevent").toPath(),
-                    ("DRIVER=" + driverName + "\nMODALIAS=platform:" + driverName + "\n").getBytes(StandardCharsets.UTF_8));
-            File subsystem = new File(device, "subsystem");
-            if (!Files.isSymbolicLink(subsystem.toPath())) {
-                Os.symlink("/sys/bus/platform", subsystem.getPath());
+            if (real != null) {
+                device.getParentFile().mkdirs();
+                Os.symlink(real, device.getPath());
+            } else {
+                drm.mkdirs();
+                Files.write(new File(drm, "dev").toPath(),
+                        (major + ":" + minor + "\n").getBytes(StandardCharsets.UTF_8));
+                Files.write(new File(device, "uevent").toPath(),
+                        ("DRIVER=" + driverName + "\nMODALIAS=platform:" + driverName + "\n").getBytes(StandardCharsets.UTF_8));
+                Os.symlink("/sys/bus/platform", new File(device, "subsystem").getPath());
+                // What MangoHud names a GPU's driver by; msm_drm is how an Adreno's render node reads
+                // on a mainline kernel, and the driver it reads the load of (bindAdrenoStats).
+                Os.symlink("/sys/bus/platform/drivers/" + driverDir, new File(device, "driver").getPath());
             }
-            // What MangoHud names a GPU's driver by; msm_drm is how an Adreno's render node reads
-            // on a mainline kernel, and the driver it reads the load of (bindAdrenoStats).
-            File driver = new File(device, "driver");
-            if (!Files.isSymbolicLink(driver.toPath())) {
-                Os.symlink("/sys/bus/platform/drivers/" + driverDir, driver.getPath());
+            // The GPU's card node, the way libdrm finds a device's primary: the card* entry beside
+            // the render node. gamescope's Wayland backend requires one (rendervulkan.cpp), so
+            // without it the session dies at "physical device has no primary node" and falls back to
+            // SDL. Where the device link above is the kernel's own directory this already comes with
+            // it; otherwise it is described here from the real sysfs, which the app may read.
+            String card = powervr ? cardNodeFor(gpuNode) : null;
+            if (card != null) {
+                String[] cardDev = card.split(":");
+                File cardEntry = new File(drm.getParentFile(), "card" + cardDev[1]);
+                Files.write(new File(cardEntry, "dev").toPath(),
+                        (card + "\n").getBytes(StandardCharsets.UTF_8));
+                // The device numbers on the uevent's own MAJOR/MINOR lines are what the ICD reads to
+                // report the primary dev_t (it cannot stat /dev/dri/card* either).
+                Files.write(new File(cardEntry, "uevent").toPath(),
+                        ("MAJOR=" + cardDev[0] + "\nMINOR=" + cardDev[1] + "\nDEVNAME=dri/card" + cardDev[1]
+                                + "\nDEVTYPE=drm_minor\n").getBytes(StandardCharsets.UTF_8));
+                new File(dri, "card" + cardDev[1]).createNewFile();
             }
         } catch (IOException | ErrnoException e) {
-            return;
+            // Never abandon the binds below: a stand-in that could not be built completely is still
+            // better than a guest with no /dev/dri at all, which fails gamescope outright.
+            android.util.Log.w("LinuxRuntime", "drm stand-in incomplete: " + e);
         }
         bind(cmd, new File(base, "sys").getPath() + ":/sys/dev/char");
         bind(cmd, dri.getPath() + ":/dev/dri");
         bind(cmd, gpuNode + ":/dev/dri/" + node);
         bindDrmClass(base, cmd, node, major + ":" + minor);
+    }
+
+    /**
+     * Remove a file, a symlink or a directory tree, so a stand-in built by an earlier session is
+     * replaced rather than added to. Never follows a symlink: an earlier build made the device link
+     * a directory, and this must not walk into the kernel's own sysfs through it.
+     */
+    private static void deleteRecursively(File file) {
+        if (!Files.isSymbolicLink(file.toPath()) && file.isDirectory()) {
+            File[] children = file.listFiles();
+            if (children != null) for (File child : children) deleteRecursively(child);
+        }
+        try {
+            Files.deleteIfExists(file.toPath());
+        } catch (IOException e) {
+            // A stand-in that cannot be replaced is rebuilt over, not fatal to the session.
+        }
+    }
+
+    /**
+     * The kernel's own directory for a DRM node, or null where it does not describe this one.
+     *
+     * libdrm resolves /sys/dev/char/&lt;maj&gt;:&lt;min&gt;/device as a symlink, so this reads the kernel's
+     * node and returns the directory it points into - the device's own sysfs directory, which holds
+     * the node's real uevent, subsystem, driver and its whole drm/ directory. Pointing the stand-in's
+     * device link at it makes libdrm describe the node exactly as it would on a stock kernel, and the
+     * drm/ directory it reads is the real one, so the GPU's card node comes with it.
+     */
+    private static String realDeviceDir(long major, long minor, String node) {
+        try {
+            File real = new File("/sys/dev/char/" + major + ":" + minor + "/device").getCanonicalFile();
+            return new File(real, "drm/" + node).isDirectory() ? real.getPath() : null;
+        } catch (IOException e) {
+            return null;
+        }
+    }
+
+    /**
+     * The device numbers of the GPU's own card node, or null where the kernel registers none.
+     *
+     * A card node is the same DRM device as the render node when the kernel put both in one device's
+     * sysfs directory, so this lists the render node's device/drm/ and reads the card* entry's own
+     * dev file. The path is built from the render node's major:minor rather than stat-ing
+     * /dev/dri/card* directly: on a phone those nodes are labelled graphics_device, which the app's
+     * policy does not grant, so stat() returns EACCES - while the sysfs tree is readable.
+     */
+    private static String cardNodeFor(String gpuNode) {
+        StructStat st;
+        try {
+            st = Os.stat(gpuNode);
+        } catch (ErrnoException e) {
+            return null;
+        }
+        long dev = st.st_rdev;
+        long major = ((dev >> 8) & 0xfff) | ((dev >> 32) & ~0xfffL);
+        long minor = (dev & 0xff) | ((dev >> 12) & ~0xffL);
+        File drmDir = new File("/sys/dev/char/" + major + ":" + minor + "/device/drm");
+        File[] entries = drmDir.listFiles((d, name) -> name.startsWith("card"));
+        if (entries == null) return null;
+        for (File card : entries) {
+            try {
+                String numbers = new String(Files.readAllBytes(new File(card, "dev").toPath()),
+                        StandardCharsets.UTF_8).trim();
+                if (numbers.matches("\\d+:\\d+")) return numbers;
+            } catch (IOException e) {
+                // A card node whose dev cannot be read is simply not the one we can describe.
+            }
+        }
+        return null;
     }
 
     /**

@@ -226,3 +226,269 @@ gets its own title (*"PowerVR GPU (Tensor G5)"*) and wording (*"… can drive it
 PowerVR driver, but PowerVR support is experimental and untested"*) instead of "DroidDeck needs an
 Adreno". The English string is the source; the other 8 locales fall back to it until translated
 (the same debt `gpuinfo_powervr_experimental` carries).
+
+---
+
+## 8. Why the guest never reached Steam, and the fix (2026-10-10, measured)
+
+**Symptom.** Every session died ~5 s in with `<name> stopped unexpectedly`; the session log ended at
+
+```
+[gamescope] Info  vulkan: physical device supports DRM format modifiers
+[gamescope] Error vulkan: physical device has no primary node
+ERROR: wayland: Display scaling requires the missing 'zxdg_output_manager_v1' protocol: disabling
+Failed to load plugin 'libdecor-gtk.so': failed to init
+SDL_Vulkan_CreateSurface failed: VK_KHR_wayland_surface extension is not enabled in the Vulkan instance.Failed to create backend.
+```
+
+and `Initted Wayland backend` (printed only when `CWaylandBackend::Init()` completes) never appeared.
+
+**What gamescope actually does.** `CVulkanDevice::createDevice()` (3.16.29, `src/rendervulkan.cpp`):
+
+```c
+if ( !GetBackend()->UsesVulkanSwapchain() && !drmProps.hasPrimary ) { errorf("no primary node"); return false; }
+if ( !drmProps.hasRender ) { errorf("no render node"); return false; }
+dev_t renderDevId = makedev( drmProps.renderMajor, drmProps.renderMinor );
+drmGetDeviceFromDevId( renderDevId, 0, &drmDev );
+m_drmRendererFd = open( drmDev->nodes[DRM_NODE_RENDER], O_RDWR | O_CLOEXEC );
+```
+
+`CWaylandBackend::UsesVulkanSwapchain()` is `false`, so the nested Wayland backend was held to the
+DRM/KMS backend's primary-node requirement — a node it never opens (`m_drmPrimaryDevId` is read only by
+`CDRMBackend`). On failure `IBackend::Set` deletes the backend and gamescope falls back to SDL against
+the instance it already made with an empty extension list, which is the SDL line above.
+
+**The real defect: the HAL writes nothing into the struct.** The PowerVR HAL advertises
+`VK_EXT_physical_device_drm` and then leaves `VkPhysicalDeviceDrmPropertiesEXT` untouched. Measured
+through this ICD with the struct poisoned (`probes/pvr_drm_props_probe.c`):
+
+```
+raw drmProps words: 3ba02ce8 cdcdcdcd 00000000 00000000 cdcdcdcd ...   <- sType only; all fields still poison
+```
+
+so an app that zero-initialises the struct — the spec's advice, and what gamescope does — reads
+`hasPrimary = 0` whatever the device is. (An earlier note that the HAL "honestly reports
+hasPrimary=false" was a measurement artefact: the probe then in the tree used a shortened stand-in for
+`VkPhysicalDeviceProperties`, which the driver writes past, clobbering the pNext struct behind it.)
+
+**The fix — in the ICD, no gamescope rebuild.** `pvr_icd.c` now answers
+`vkGetPhysicalDeviceProperties2` itself: it calls the HAL for the rest of the chain and then fills the
+DRM struct with the device behind the render node the HAL drives, matched the way libdrm does it (two
+nodes are one DRM device when their `/sys/dev/char/<maj>:<min>/device` links resolve alike — card2 is
+226:2 and renderD128 is 226:128, different numbers, one device). Measured on the device:
+
+```
+pvr_icd: physical_device_drm: hasPrimary=1 primary=226:2 render=226:128
+```
+
+This is reachable through `vk_icdGetInstanceProcAddr` — the loader's own trampoline for
+`vkGetPhysicalDeviceProperties2` calls the pointer the ICD returned there. Putting it in
+`vk_icdGetPhysicalDeviceProcAddr` instead is dead code (the loader consults that only for entry points
+it has no trampoline for), which is why an earlier attempt there changed nothing.
+
+**Why hasPrimary=1 is honest here, not a lie.** On this device the PowerVR GPU *does* expose a card
+node: `/sys/class/drm/card2` and `/sys/class/drm/renderD128` are both symlinks into
+`/sys/devices/platform/34f00000.gpu0/drm/`, and `drmGetDeviceFromDevId` run against real libdrm reports
+them as one device. Reporting it is what a working DRM driver would do; the HAL omitting it is the
+defect.
+
+**The remaining steps were checked too** (`probes/pvr_drm_gate_probe.c`, real libdrm 2.4.134):
+
+```
+drmGetNodeTypeFromDevId(226:128) = 2 (render)
+drmGetDeviceFromDevId() -> 0, bustype=2
+available_nodes: primary=/dev/dri/card2 render=/dev/dri/renderD128
+open("/dev/dri/renderD128", O_RDWR|O_CLOEXEC) -> fd 3
+RESULT: PASS
+```
+
+so every step of the Wayland backend's `createDevice()` succeeds with the stand-in the app already
+binds. Nothing on the app side had to change.
+
+**Status: the ICD is fixed and the driver asset rebuilt; a full session on the current build has not
+yet been run** (it needs the Linux runtime re-installed in the app, and the device was locked). The
+expected log change is the absence of `physical device has no primary node` and the presence of
+`Initted Wayland backend`. Pre-registered next failures, if any: `drmGetDeviceFromDevId() failed`,
+`failed to open DRM render node`, or `physical device has no render node` — each names a different
+cause, none of them the gate.
+
+---
+
+## 9. Audit: what each session failure was, measured (2026-10-10, session 2026-10-10-29..42)
+
+Read from the guest's own `session.log` plus two probes (`probes/pvr_drm_props_probe.c`,
+`probes/pvr_fmt_props_probe.c`) and an instrumented ICD. Each line is a measurement, not inference.
+
+**#1 `physical device has no primary node` — FIXED.** The HAL advertises `VK_EXT_physical_device_drm`
+and writes nothing into `VkPhysicalDeviceDrmPropertiesEXT` (poisoned struct stayed poison). The ICD
+now fills it from the GPU's card node; log: `hasPrimary=1 primary=226:2 render=226:128`.
+
+**#2 `drmGetDeviceFromDevId() failed` — FIXED.** Two causes, both in the app's stand-in:
+* the `/dev/dri` binds were skipped entirely (an early `return` in `bindGpuNode`'s error path);
+* `/sys/dev/char/<maj>:<min>/device` was a real directory, but libdrm `readlink`s it and looks for
+  `/platform`, so every node was dropped. It is now a symlink to the kernel's own device directory.
+Log: `opendir(/dev/dri)=ok`, `device -> /sys/devices/platform/34f00000.gpu0`, then
+`xdg_backend: Initted Wayland backend` — the Wayland backend initialises.
+
+**#3 `assert( modifiers.size() > 0 )` in `CVulkanTexture::BInit` — NOT FIXED. Root cause narrowed.**
+Measured, via the ICD instrumented to wrap `vkGetPhysicalDeviceImageFormatProperties2`:
+
+```
+fmt=0x2c usage=0xd tiling=1000158000 flags=0x8->0x0 chain=2 mod=0x0 r=-11 retry=-11
+```
+
+* The query that fails is `vkGetPhysicalDeviceImageFormatProperties2`, DRM-modifier tiling,
+  DMA_BUF handle, `usage=0xd` (TRANSFER_SRC|TRANSFER_DST|SAMPLED), `flags=0x8` (MUTABLE_FORMAT).
+* The HAL returns `VK_ERROR_FEATURE_NOT_PRESENT (-11)`.
+* **`vkGetPhysicalDeviceFormatProperties2` is never called** (0 calls) — so this is not the modifier
+  enumeration, and the earlier "zero modifiers" errors are a separate, non-fatal path.
+* gamescope treats any result other than `VK_ERROR_FORMAT_NOT_SUPPORTED` as fatal, so it never runs
+  its own EXPORTABLE test, `modifiers` stays empty, and the assert fires.
+
+**Not the cause** (each tested and ruled out): the HAL's exportability reporting (correct —
+`features=0x00000006` EXPORTABLE|IMPORTABLE for every usage tried); the usage bits (all seven single
+bits, and `0xd`, pass); removing `MUTABLE_FORMAT` + the format list in the ICD (still `-11`); the
+modifier value (the repro uses LINEAR, `0x0`).
+
+**Standing contradiction, unresolved:** the standalone probe reproduces `-11` *only* with
+`MUTABLE_FORMAT` + a format list, while the HAL's own criterion is `usage & DRM_FORMAT_MODIFIER_BIT`
+(`vk_present.c`'s `modifier_importable`, which the HAL's validator mirrors) — and `usage=0xd` has that
+bit clear. So either that criterion is not what the HAL checks, or something about the guest's chain
+differs from the probe's. **This is the open question; the next step is to determine the HAL's actual
+condition, not to keep patching.**
+
+**What has never executed:** `vkCreateSwapchainKHR`, `vkAcquireNextImageKHR`, `vkQueuePresentKHR`,
+Xwayland, and Steam itself. Every finding so far is upstream of the swapchain.
+
+**Temporary instrumentation:** the ICD carried diagnostic wrappers (`diag`, `fmtprops2`,
+`imgfmtprops2`) while this was measured; they have been removed and the shipped ICD contains only the
+two fixes above.
+
+## 10. The gate is passed; where the session stands now (2026-10-10, session 2026-10-10-43)
+
+The session that all of §9 was preparing for was finally run end to end. Everything in §8 and §9
+holds, and the three stacked failures are gone. This section is what the log actually says.
+
+**The ICD in the shipped apk is the built one.** `assets/linux_driver/powervr-g5x.tzst` holds
+`libvulkan_powervr.so` at sha256 `9f25d109f07bea3e68abebb46fc67a402504ec77222b6791da8b22097fb80aa5`,
+identical to a fresh `build_icd.sh` output — so this log is evidence about the current source.
+
+**What now works, in order, all measured:**
+
+* `physical_device_drm: hasPrimary=1 primary=226:2 render=226:128` — §9 #1's fix, live.
+* `xdg_backend: Initted Wayland backend` — the gate. `gamescope` no longer dies at
+  `rendervulkan.cpp`'s primary-node check, and `SDL_VIDEODRIVER` is no longer needed (§8).
+* `wlserver: Running compositor on wayland display 'gamescope-0'`, `Starting Xwayland on :0` and `:1`.
+* **The ICD's X11 WSI path executed for the first time.** `e95ed6b` shipped it and `f075cf6` recorded
+  the present path as unverified; it is now exercised:
+  `[Gamescope WSI] Created swapchain for xid: 0x800002 swapchain: 0x3000f1f350 - imageCount: 3`,
+  `pvr_wsi: swapchain: 3 images 1602x720 stride 6408 fmt 44 (fd0=25)`.
+* **Steam ran and finished its first-run update** (666665 KB, extracted, installed). Its GPU query
+  answers through our ICD: `name: "PowerVR D-Series DXT-48-1536 MC1"`, `driver_version 1.662.3024`.
+
+**Where it stops — and the measurement was cut short.** Exactly one swapchain is created in the whole
+log, for xid `0x800002`, the update-UI window (`Using update UI: glx`, `Create window`). That is
+*expected* for the first three and a half minutes: the main client cannot start until the update it is
+downloading has been installed. What matters is the end of the timeline:
+
+```
+16:27:42  Cleaning up...
+16:27:43  Update complete, launching Steam...
+16:27:44  Startup - Steam Client launched with: ... (the real client, tid 2346)
+16:27:44  Process started with command-line: ... '-child-update-ui' ... (tid 2347)
+16:27:45  Create window
+16:28:02  app.log: DroidDeckWayland: [program] disconnected: gamescope   <- the session was stopped
+```
+
+So the real client had **17 seconds** before the session ended, and its UI was never observed coming
+up. That reading was superseded by the very next session (§11), which ran the same build with the
+client already installed — and the client **segfaults**. See §11.
+
+The log is the authority here, not a screenshot: the last capture was mostly blank and a blank frame
+means only that the compositor drew its base layer.
+
+**Nothing in §9 was re-opened.** The `vkGetPhysicalDeviceFormatProperties2 returned zero modifiers`
+errors are still printed and are still not fatal; the retry still reports
+`DRM-modifier query fmt=0x2c usage=0x6 with MUTABLE_FORMAT -> -11; retried without it -> 0`.
+
+## 11. The client gets its own swapchain, then segfaults (2026-10-10, session 2026-10-10-44-steam)
+
+§10 left one thing unresolved for lack of time: the session it measured was stopped 17 s after Steam's
+real client launched. The next session on the same build answered it. Steam was already installed, so
+there was nothing to download and the session was left alone.
+
+**What changed, measured:**
+
+* `[Gamescope WSI] Creating Gamescope surface: xid: 0x1200002` — a **second** X11 surface, distinct
+  from the update-UI's `0x800002`. This is the client's own UI window, and it is the first time in any
+  session that the main client reached the WSI at all. `pvr_wsi` then builds the swapchain through the
+  ICD's XCB/DRI3 path, so Steam's own presentation path works as far as swapchain creation.
+* The swapchain is destroyed again immediately
+  (`[Gamescope WSI] Destroying swapchain: 0x30012cea90`), so the client was still sizing its window.
+* Steam's GPU query still answers through the ICD
+  (`name: "PowerVR D-Series DXT-48-1536 MC1"`), and it went on to query `GpuTopology` and write
+  `/tmp/steamJIKnMl`, so the Vulkan path up to that point is healthy.
+
+**The wall — and it is not the ICD.** The client dies of signal 11, and the guest names the exact
+line:
+
+```
+/usr/local/bin/droiddeck-session: line 287: 5133 Segmentation fault
+  "$steam_root/steamrtarm64/steam" ... -cef-ozone-platform=x11 -cef-use-gl=angle -cef-use-angle=vulkan
+== steam exited rc=139
+```
+
+`steamui_system.txt` places it: `CX11WindowProperty: failed to read window property:
+GAMESCOPE_VIEWPORT_SUPPORTED`, at 16:37:47. The client's window appeared at 16:37:48 — the very
+second the surface is created — and the process was down by 16:37:49. So the crash is in the **client
+UI coming up**, not in the ICD, the loader or the HAL.
+
+**Reproduced 2/2.** Session 45 (§11 note: press Play again; Steam's script restarts the client itself
+once) shows the identical sequence, same pid-level detail, `steam exited rc=139`:
+
+```
+XRRGetOutputInfo Workaround: initialized with override: 1 real: (nil)
+Error: XRRGetOutputInfo() is not available
+[Gamescope WSI] Creating Gamescope surface: xid: 0x1200002
+pvr_wsi: swapchain: 3 images 1x1 stride 8 fmt 44 (fd0=38)
+[Gamescope WSI] Destroying swapchain: 0x30012cea80
+Error: XRRGetOutputInfo() is not available
+== steam exited rc=139
+```
+
+So this is deterministic, not a race.
+
+**The suspects, in order, all measured from the log:**
+
+1. **`Error: XRRGetOutputInfo() is not available`**, immediately before the crash line, in both
+   sessions. The guest's Xwayland does not implement RandR's `RRGetOutputInfo`. Notably, **gamescope
+   prints this at startup in §10's session too** (0x800002, the update-UI window) and that process
+   survives — so the call is not fatal in itself. What is new here is that the **main client takes
+   the same path**, and the client's own X11/RandR use may not tolerate the missing reply the way
+   gamescope does.
+2. **`GAMESCOPE_VIEWPORT_SUPPORTED` unreadable** — a client→compositor property that never got set.
+   The client's parametric piece for a 1x1-then-resize Steam UI may depend on it.
+3. **`XRRGetOutputInfo Workaround: initialized with override: 1 real: (nil)`** — a workaround *is*
+   installed (`override: 1`) but `real` is null, i.e. it has no real function to override. **That
+   string is not printed by anything in this repo** (grep over `tools/`, `app/src/main/assets/` finds
+   only this doc): it comes from the hosted runtime's **patched `libXrandr.so.2`** (the same
+   `override`/`real` pair the guest's `libXrandr` also carries, per `tools/gamescope/
+   runtime-sonames.txt`). Reading that patch is the cheap next move; it is also the layer that must
+   return a usable output mode for this to work.
+
+**Not the ICD.** No `vkCreateSwapchainKHR`/`vkAcquireNextImageKHR`/`vkQueuePresentKHR` failure is
+logged for `0x1200002`, and the ICD created the swapchain cleanly. §10's note that the X11 present
+path was "implemented, present path unverified" (`f075cf6`) is now narrower: **the X11 path gets to a
+created swapchain for the real client; the client dies before it presents from it.**
+
+**The next step is a backtrace, not a log.** Signal 11 with no further detail has to be resolved with
+a core or a debugger inside the guest session (`gdbserver`/`gdb` around the client under
+`droiddeck-session`, or a core dump read with the `steam` binary). Everything above is where to look,
+not what was proven.
+
+**How to re-run this in one command** (the `SessionActivity` is not exported, so `am start` on it is
+refused; this trampoline is):
+
+```
+adb shell 'am start -n com.droiddeck.launcher/.agent.AgentStartActivity --es request eyJtb2RlIjoic3RlYW0ifQ=='
+```
