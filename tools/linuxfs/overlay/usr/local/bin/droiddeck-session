@@ -234,15 +234,7 @@ if [ -z "${BL_INSIDE:-}" ]; then
     args+=(--mangoapp)
     echo "== gamescope: mangoapp on ($(command -v mangoapp), config $MANGOHUD_CONFIGFILE)"
   fi
-  # gamescope's own nested window is an SDL one and presents through the ICD's Wayland surface, so it
-  # must run on SDL's Wayland driver. Left to choose, SDL picked a driver that hands Vulkan an EMPTY
-  # extension list, so gamescope built its instance with no VK_KHR_wayland_surface and its backend
-  # never came up - "SDL_Vulkan_CreateSurface failed: VK_KHR_wayland_surface extension is not enabled
-  # in the Vulkan instance" - and the session died before the client started. Both names are set: the
-  # runtime's libSDL2 is sdl2-compat (SDL3 underneath), SDL3 reads the SDL_VIDEO_DRIVER hint and
-  # accepts the SDL_VIDEODRIVER environment variable, so either may be the one consulted. This is the
-  # outer pass only; the inner one (below) still points the client's toolkits at Xwayland.
-  export BL_INSIDE=1 SDL_VIDEODRIVER=wayland SDL_VIDEO_DRIVER=wayland
+  export BL_INSIDE=1
   exec gamescope "${args[@]}" -- "$0" "$mode" "$@"
 fi
 
