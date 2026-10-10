@@ -2,6 +2,7 @@ package com.droiddeck.launcher.session
 
 import android.util.Log
 import com.droiddeck.launcher.core.SessionPart
+import com.droiddeck.launcher.gpu.GpuInfo
 import com.droiddeck.launcher.runtime.LinuxRuntime
 import java.io.File
 import java.io.RandomAccessFile
@@ -122,7 +123,7 @@ class GpuStatsComponent(val dir: File) : SessionPart() {
 
     companion object {
         private const val TAG = "SessionService"
-        const val KGSL = "/sys/class/kgsl/kgsl-3d0"
+        const val KGSL = GpuInfo.KGSL_DIR
         /** Must match LinuxRuntime.bindAdrenoStats. */
         const val MSM_LOAD = "/sys/kernel/debug/dri/0/perf_now"
         const val MSM_CLOCK = "/sys/devices/platform/soc@0/3d00000.gpu/devfreq/3d00000.gpu/cur_freq"
@@ -135,7 +136,7 @@ class GpuStatsComponent(val dir: File) : SessionPart() {
         )
         /** The GPU's devfreq node is named by its register address, which differs between Snapdragons. */
         private val DEVFREQ_NODES = listOf(
-            "kgsl-3d0", "3d00000.qcom,kgsl-3d0", "2c00000.qcom,kgsl-3d0", "5000000.qcom,kgsl-3d0", "5900000.qcom,kgsl-3d0",
+            GpuInfo.KGSL_NAME, "3d00000.qcom,kgsl-3d0", "2c00000.qcom,kgsl-3d0", "5000000.qcom,kgsl-3d0", "5900000.qcom,kgsl-3d0",
         )
 
         private fun clockSources(): List<String> {

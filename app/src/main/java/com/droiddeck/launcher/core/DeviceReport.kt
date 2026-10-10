@@ -6,6 +6,7 @@ import android.os.Build
 import android.os.Environment
 import android.os.StatFs
 import android.util.Log
+import com.droiddeck.launcher.gpu.GpuInfo
 import com.droiddeck.launcher.gpu.LinuxVulkanDriver
 import com.droiddeck.launcher.gpu.LinuxVulkanDriverManager
 import com.droiddeck.launcher.gpu.TurnipDriver
@@ -101,9 +102,9 @@ object DeviceReport {
         }
 
         h("GPU")
-        k("KGSL gpu_model", readSys("/sys/class/kgsl/kgsl-3d0/gpu_model"))
-        k("KGSL chip id", readSys("/sys/class/kgsl/kgsl-3d0/gpu_chipid"))
-        k("System Vulkan ICD", if (File("/vendor/lib64/hw/vulkan.adreno.so").exists()) "/vendor/lib64/hw/vulkan.adreno.so" else "not at the usual path")
+        k("KGSL gpu_model", readSys("${GpuInfo.KGSL_DIR}/gpu_model"))
+        k("KGSL chip id", readSys("${GpuInfo.KGSL_DIR}/gpu_chipid"))
+        k("System Vulkan ICD", if (File(GpuInfo.ADRENO_VULKAN_DRIVER).exists()) GpuInfo.ADRENO_VULKAN_DRIVER else "not at the usual path")
 
         h("Display")
         k("Session output", SessionState.outputSize?.let { "${it.first}x${it.second}" })
@@ -118,7 +119,7 @@ object DeviceReport {
 
         h("Drivers")
         val gpu = com.droiddeck.launcher.gpu.GpuInfo.detect()
-        k("GPU", "${gpu.name} · ${gpu.family.label} · ${gpu.supportText}" + if (gpu.oneUi8Gen2) " · One UI 8 Gen 2" else "")
+        k("GPU", "${gpu.name} · ${gpu.family.label} · ${gpu.supportTextInEnglish(context)}" + if (gpu.oneUi8Gen2) " · One UI 8 Gen 2" else "")
         k("Driver mode", SessionPrefs.gpuDriverMode(context) +
             (com.droiddeck.launcher.gpu.DriverPairs.recommendedKey(gpu, com.droiddeck.launcher.gpu.DriverPairs.from(
                 com.droiddeck.launcher.gpu.TurnipReleases.cached(context)))?.let { " (recommended pair: $it)" } ?: ""))

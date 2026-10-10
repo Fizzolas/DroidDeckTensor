@@ -23,7 +23,7 @@ object DeviceInfo {
         // After Vulkan has been asked, detection can use its name too.
         val gpu = GpuInfo.detect()
         return listOf(
-            chip(), gpu(gpu), cpu(), memory(context), system(), vulkan(context, vk), drivers(context, gpu),
+            chip(), gpu(context, gpu), cpu(), memory(context), system(), vulkan(context, vk), drivers(context, gpu),
         ).filter { it.rows.isNotEmpty() }
     }
 
@@ -59,7 +59,7 @@ object DeviceInfo {
         add("Family", read("/sys/devices/soc0/family"))
     })
 
-    private fun gpu(gpu: GpuInfo) = Section("GPU", buildList<Pair<String, String>> {
+    private fun gpu(context: Context, gpu: GpuInfo) = Section("GPU", buildList<Pair<String, String>> {
         add("GPU", gpu.name)
         add("Family", gpu.family.label)
         add("Model found from", when (gpu.modelSource) {
@@ -69,11 +69,11 @@ object DeviceInfo {
             else -> "unknown"
         })
         add("Kernel name", gpu.kgslName)
-        val kgsl = "/sys/class/kgsl/kgsl-3d0"
+        val kgsl = GpuInfo.KGSL_DIR
         add("Clock range", gpuRange())
         add("Load", read("$kgsl/gpu_busy_percentage")?.let { if (it.endsWith("%")) it else "$it %" })
         add("Temperature", read("$kgsl/temp")?.toLongOrNull()?.let { if (it > 1000) "${it / 1000} °C" else "$it °C" })
-        add("Support", gpu.supportText)
+        add("Support", gpu.supportTextInEnglish(context))
     })
 
     private fun cpu() = Section("CPU", buildList<Pair<String, String>> {
@@ -97,10 +97,10 @@ object DeviceInfo {
     /** The GPU's slowest and fastest step: KGSL's list, else a devfreq GPU node (Mali and others). */
     private fun gpuRange(): String? {
         fun mhz(hz: Long) = "${hz / 1_000_000} MHz"
-        val kgsl = read("/sys/class/kgsl/kgsl-3d0/gpu_available_frequencies")
+        val kgsl = read("${GpuInfo.KGSL_DIR}/gpu_available_frequencies")
             ?.split(Regex("\\s+"))?.mapNotNull { it.toLongOrNull() }?.filter { it > 0 }.orEmpty()
         if (kgsl.isNotEmpty()) return "${mhz(kgsl.min())}–${mhz(kgsl.max())} (${kgsl.size} steps)"
-        read("/sys/class/kgsl/kgsl-3d0/max_gpuclk")?.toLongOrNull()?.let { return "up to ${mhz(it)}" }
+        read("${GpuInfo.KGSL_DIR}/max_gpuclk")?.toLongOrNull()?.let { return "up to ${mhz(it)}" }
         val node = File("/sys/class/devfreq").listFiles()?.firstOrNull { f ->
             val n = f.name.lowercase()
             (n.contains("gpu") || n.contains("mali") || n.contains("kgsl-3d")) && listOf("bus", "bw", "memlat").none { n.contains(it) }

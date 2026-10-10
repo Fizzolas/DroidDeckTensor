@@ -72,7 +72,7 @@ import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import com.droiddeck.launcher.core.AppLanguage
-import com.droiddeck.launcher.core.DeviceSupport
+import com.droiddeck.launcher.gpu.SocNames
 import com.droiddeck.launcher.core.PhantomProcessLimit
 import com.droiddeck.launcher.core.PhantomProcessStatus
 import com.droiddeck.launcher.session.SessionPrefs
@@ -159,7 +159,7 @@ internal fun SetupPanel(
     // Tested hardware passes; an Adreno below it (a 610, say) warns rather than claiming support.
     val gpu = remember { com.droiddeck.launcher.gpu.GpuInfo.detect() }
     val gpuOk = gpu.support == com.droiddeck.launcher.gpu.GpuInfo.Support.TESTED
-    val gpuName = remember { DeviceSupport.gpuName(ctx) }
+    val gpuName = remember { SocNames.deviceName(ctx) }
     val limitBlocks = PhantomProcessLimit.blocksSteam(s.phantomProcessStatus)
     val signedIn = s.offlineAccount != null
     var showLimitDetails by rememberSaveable { mutableStateOf(false) }

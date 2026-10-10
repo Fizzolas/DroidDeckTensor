@@ -21,9 +21,9 @@ ROOT = Path(__file__).resolve().parent
 VENDOR = Path(os.environ.get("PVR_VENDOR", ROOT / "vendor"))
 # Bring-up (device open, buffer alloc, connect) and the submit/sync run (buffer fill + TDM submit + fence wait).
 CAPTURES = ["bringup_layouts.csv", "submit_layouts.csv", "dispatch_layouts.csv"]
+CAPTURE_COLUMNS = ["bridge", "func", "symbol", "calls", "ret", "in_size", "in_hex", "out_size", "out_hex"]
 
 INSN = re.compile(r"^\s*([0-9a-f]+):\s+(\S+)\s*(.*)$")
-BRIDGE_LINE = re.compile(r"B bridge=(\d+) func=(\d+) ret=(-?\d+) errno=\d+ in(?:\[(\d+)\])?=(\S*|NULL) out(?:\[(\d+)\])?=(\S*|NULL)")
 MEM = re.compile(r"\[(\w+)(?:,\s*#(-?0x[0-9a-f]+|-?\d+))?\]")
 # Control-flow instructions that do not write their first operand, so it must keep its value.
 CONTROL = {"cbz", "cbnz", "b", "b.ne", "b.eq", "tbz", "tbnz", "nop"}
@@ -48,31 +48,132 @@ def load_syms():
     return syms
 
 
-def from_log(log_path, csv_path):
-    """Write a capture CSV from a raw bridge log: one row per (bridge, func), first sample kept."""
+ABI = ROOT / "hooks" / "bridge_abi.h"
+# The log formats live in the hook's header, so the hook and this parser share one definition.
+DEFINE = re.compile(r'#define\s+(BRIDGE_LOG_\w+)\s+"(.*)"')
+
+
+def fmt_re(fmt, str_pats):
+    """Compile the shared log formats, including the other-ioctl record's %08x request."""
+    out = []
+    pats = iter(str_pats)
+    for tok in re.split(r"(%02x|%08x|%[usd])", fmt):
+        if tok == "%u":
+            out.append(r"([0-9]+)")
+        elif tok == "%d":
+            out.append(r"(-?[0-9]+)")
+        elif tok == "%02x":
+            out.append("[0-9a-f]{2}")
+        elif tok == "%08x":
+            out.append("([0-9a-f]{8})")
+        elif tok == "%s":
+            out.append(next(pats))
+        else:
+            out.append(re.escape(tok))
+    return re.compile("".join(out))
+
+
+def log_regexes():
+    fmts = dict(DEFINE.findall(ABI.read_text()))
+    tag = "(in|out)"
+    hexes = fmt_re(fmts["BRIDGE_LOG_BYTE"], []).pattern
+    return {
+        "call": fmt_re(fmts["BRIDGE_LOG_CALL"], []),
+        "data": re.compile(fmt_re(fmts["BRIDGE_LOG_DATA_HEAD"], [tag]).pattern + f"((?:{hexes})*)"),
+        "null": fmt_re(fmts["BRIDGE_LOG_NULL"], [tag]),
+        "bytes": re.compile(f"(?:{hexes})*"),
+        "other": fmt_re(fmts["BRIDGE_LOG_OTHER"], []),
+    }
+
+
+def integer(text, label, signed=False):
+    pattern = r"-?[0-9]+" if signed else r"[0-9]+"
+    if not isinstance(text, str) or not re.fullmatch(pattern, text):
+        raise ValueError(f"{label}: invalid integer {text!r}")
+    value = int(text)
+    low, high = (-(1 << 31), (1 << 31) - 1) if signed else (0, (1 << 32) - 1)
+    if not low <= value <= high:
+        raise ValueError(f"{label}: integer out of range {text!r}")
+    return value
+
+
+def validate_buffer(size, hex_text, tag, rx):
+    count = integer(size, f"{tag} size")
+    if not isinstance(hex_text, str) or not rx["bytes"].fullmatch(hex_text):
+        raise ValueError(f"{tag}: invalid hex bytes")
+    if len(hex_text) != count * 2:
+        raise ValueError(f"{tag} size: declared {count} bytes, captured {len(hex_text) // 2}")
+
+
+def parse_bridge_line(line, rx):
+    """Parse a complete B record; ignore blank/valid D lines, reject everything else."""
+    if not line.strip():
+        return None
+    other = rx["other"].fullmatch(line)
+    if other:
+        integer(other[2], "ioctl ret", signed=True)
+        integer(other[3], "ioctl errno", signed=True)
+        return None
+    m = rx["call"].match(line)
+    if not m:
+        raise ValueError("malformed capture record")
+    rec = {"bridge": integer(m[1], "bridge"), "func": integer(m[2], "func"), "ret": m[3]}
+    integer(m[3], "ret", signed=True)
+    integer(m[4], "errno", signed=True)
+    rest = line[m.end():]
+    for tag in ("in", "out"):
+        d = rx["data"].match(rest)
+        if d and d[1] == tag:
+            validate_buffer(d[2], d[3], tag, rx)
+            rec[tag] = (d[2], d[3])
+            rest = rest[d.end():]
+            continue
+        n = rx["null"].match(rest)
+        if not n or n[1] != tag:
+            raise ValueError(f"malformed or missing {tag} buffer")
+        rec[tag] = ("0", "")
+        rest = rest[n.end():]
+    if rest:
+        raise ValueError("trailing data in capture record")
+    return rec
+
+
+def from_log(log_path, csv_path, order="sorted"):
+    """Write a capture CSV from a raw bridge log: one row per (bridge, func), first sample kept.
+    order is 'sorted' (by bridge, func) or 'trace' (first appearance in the log)."""
     names = {}
     with (ROOT / "bridge_table.csv").open() as f:
         for r in csv.DictReader(f):
             if r["bridge_id"] and r["function_id"]:
                 names[(int(r["bridge_id"]), int(r["function_id"]))] = r["symbol"]
+    rx = log_regexes()
     rows = {}
-    for line in Path(log_path).read_text(errors="replace").splitlines():
-        m = BRIDGE_LINE.search(line)
-        if not m:
-            continue
-        key = (int(m[1]), int(m[2]))
-        if key not in rows:
-            rows[key] = {"calls": 0, "ret": m[3], "in_size": m[4] or "0",
-                         "in_hex": "" if m[5] == "NULL" else m[5],
-                         "out_size": m[6] or "0", "out_hex": "" if m[7] == "NULL" else m[7]}
-        rows[key]["calls"] += 1
+    for number, line in enumerate(Path(log_path).read_text().splitlines(), 1):
+        try:
+            rec = parse_bridge_line(line, rx)
+            if rec is None:
+                continue
+            if int(rec["ret"]) != 0:
+                raise ValueError(f"bridge ioctl returned {rec['ret']}")
+            key = (rec["bridge"], rec["func"])
+            if key not in rows:
+                rows[key] = {"calls": 0, "ret": rec["ret"], "in_size": rec["in"][0], "in_hex": rec["in"][1],
+                             "out_size": rec["out"][0], "out_hex": rec["out"][1]}
+            elif (int(rows[key]["in_size"]), int(rows[key]["out_size"])) != (int(rec["in"][0]), int(rec["out"][0])):
+                raise ValueError(f"in/out size changed for bridge/func {key}")
+            rows[key]["calls"] += 1
+        except ValueError as exc:
+            raise ValueError(f"{log_path}:{number}: {exc}") from exc
+    if not rows:
+        raise ValueError(f"{log_path}: empty capture (no bridge records)")
     unknown = [k for k in rows if k not in names]
     if unknown:
         raise SystemExit(f"no symbol in bridge_table.csv for bridge/func {unknown}")
     with (ROOT / csv_path).open("w", newline="") as f:
         w = csv.writer(f)
-        w.writerow(["bridge", "func", "symbol", "calls", "ret", "in_size", "in_hex", "out_size", "out_hex"])
-        for (b, fn), r in sorted(rows.items()):
+        w.writerow(CAPTURE_COLUMNS)
+        items = sorted(rows.items()) if order == "sorted" else rows.items()
+        for (b, fn), r in items:
             w.writerow([b, fn, names[(b, fn)], r["calls"], r["ret"], r["in_size"], r["in_hex"], r["out_size"], r["out_hex"]])
     print(f"wrote {csv_path}: {len(rows)} calls from {log_path}")
 
@@ -245,24 +346,68 @@ def output_fields(insns, after_call, out_base):
     return fields
 
 
+def load_captures():
+    """Keep the first sample for rendering, but retain every phase's row for verification."""
+    cap, samples = {}, {}
+    rx = log_regexes()
+    for capture in CAPTURES:
+        with (ROOT / capture).open(newline="") as f:
+            reader = csv.DictReader(f, strict=True)
+            if reader.fieldnames != CAPTURE_COLUMNS:
+                raise ValueError(f"{capture}: invalid capture columns")
+            keys, symbols = set(), set()
+            for r in reader:
+                location = f"{capture}:{reader.line_num}"
+                try:
+                    if None in r or any(value is None for value in r.values()):
+                        raise ValueError("invalid capture columns")
+                    key = (integer(r["bridge"], "bridge"), integer(r["func"], "func"))
+                    if integer(r["calls"], "calls") == 0:
+                        raise ValueError("calls must be positive")
+                    if integer(r["ret"], "ret", signed=True) != 0:
+                        raise ValueError(f"bridge ioctl returned {r['ret']}")
+                    for tag in ("in", "out"):
+                        validate_buffer(r[f"{tag}_size"], r[f"{tag}_hex"], tag, rx)
+                    name = r["symbol"]
+                    if not name or name.strip() != name:
+                        raise ValueError("invalid wrapper symbol")
+                    if key in keys or name in symbols:
+                        raise ValueError(f"duplicate capture row for {name} / {key}")
+                    keys.add(key)
+                    symbols.add(name)
+                    cap.setdefault(name, r)
+                    samples.setdefault(name, []).append((location, r))
+                except ValueError as exc:
+                    raise ValueError(f"{location}: {exc}") from exc
+            if not keys:
+                raise ValueError(f"{capture}: empty capture (no rows)")
+    return cap, samples
+
+
 def main():
     insns = load_insns()
     syms = load_syms()
-    cap = {}
-    # Each capture CSV contributes its calls; a symbol seen in both keeps the first sample.
-    for capture in CAPTURES:
-        with (ROOT / capture).open() as f:
-            for r in csv.DictReader(f):
-                cap.setdefault(r["symbol"], r)
-    rows = []
+    cap, samples = load_captures()
+    rows, checked, failures = [], set(), []
     for i, (start, name) in enumerate(syms):
         if name not in cap:
             continue
         end = syms[i + 1][0] if i + 1 < len(syms) else start + 0x400
+        if name in checked:
+            raise ValueError(f"duplicate vendor wrapper symbol: {name}")
+        checked.add(name)
         call, stores, after = analyse(start, end, insns)
         if call is None:
-            print("NO CALL SITE:", name)
-            continue
+            raise ValueError(f"NO CALL SITE: {name}")
+        for location, captured in samples[name]:
+            if (call["bridge"], call["func"]) != (int(captured["bridge"]), int(captured["func"])):
+                failures.append(f"{location}: {name}: bridge/func mismatch")
+            for tag in ("in", "out"):
+                if call[f"{tag}_size"] != int(captured[f"{tag}_size"]):
+                    failures.append(
+                        f"{location}: {name}: {tag} size mismatch "
+                        f"(code {call[f'{tag}_size']}, captured {captured[f'{tag}_size']})"
+                    )
         c = cap[name]
         base = call["in_base"][1] if call["in_base"][0] == "sp" else None
         size = call["in_size"] or 0
@@ -281,6 +426,11 @@ def main():
             "in_fields": in_fields,
             "out_fields": sorted(set(output_fields(insns, after, call["out_base"]))),
         })
+    missing = set(cap) - checked
+    if missing:
+        failures.append(f"no vendor wrapper for captured symbols: {', '.join(sorted(missing))}")
+    if failures:
+        raise ValueError("verification failed:\n" + "\n".join(failures))
     for r in rows:
         print(r["symbol"], r["bridge"], r["func"], "in", r["in_size_code"], r["in_size_captured"],
               "out", r["out_size_code"], r["out_size_captured"])
@@ -288,17 +438,8 @@ def main():
             print("   in  ", f, "sample=", sample(r["in_hex"], f[0], f[1]))
         for f in r["out_fields"]:
             print("   out ", f, "sample=", sample(r["out_hex"], f[0], f[1]))
-    failures = []
-    for r in rows:
-        c = cap[r["symbol"]]
-        if (r["bridge"], r["func"]) != (int(c["bridge"]), int(c["func"])):
-            failures.append((r["symbol"], "bridge/func"))
-        if r["in_size_code"] != int(c["in_size"]):
-            failures.append((r["symbol"], "in size"))
-        if r["out_size_code"] != int(c["out_size"]):
-            failures.append((r["symbol"], "out size"))
-    print("checked", len(rows), "functions; failures:", failures or "none")
     write_reference(rows)
+    print("checked", len(rows), "functions; failures: none")
     return rows
 
 
@@ -338,6 +479,8 @@ Submission cross-check: the `CreateTransferContext` output at out+0 is `0x29`, a
 Dispatch cross-check: the `RGXKickCDM` input at offset 8 carries `0x3d`, the compute context handle
 that `BridgeRGXCreateComputeContext` returns at out+0 in the bring-up capture.
 
+Device runs (5 dispatch runs on hardware, all passing): the kick's output field at offset 8 counts up by one per run, so it is a sequence number, not a fixed value. The input bytes that vary between runs are address-like slots at offsets 32, 40, 48 and 64. Slots 32, 48 and 64 are user-space addresses. Slot 40 has an upper byte of 0xb4, so it is recorded as address-like only.
+
 Capture CSVs are regenerated from raw bridge logs with `python decode_layouts.py --from-log <log> <csv>`.
 
 To regenerate outside this repo, point `PVR_VENDOR` at a directory holding `srv_um.dis`
@@ -369,9 +512,15 @@ def write_reference(rows):
 
 
 if __name__ == "__main__":
-    if sys.argv[1:2] == ["--from-log"]:
-        if len(sys.argv) != 4:
-            raise SystemExit("usage: decode_layouts.py --from-log <bridge.log> <capture.csv>")
-        from_log(sys.argv[2], sys.argv[3])
-    else:
-        main()
+    try:
+        if sys.argv[1:2] == ["--from-log"]:
+            order = sys.argv[4] if len(sys.argv) == 5 else "sorted"
+            if len(sys.argv) not in (4, 5) or order not in ("sorted", "trace"):
+                raise SystemExit("usage: decode_layouts.py --from-log <bridge.log> <capture.csv> [sorted|trace]")
+            from_log(sys.argv[2], sys.argv[3], order)
+        elif sys.argv[1:]:
+            raise SystemExit("usage: decode_layouts.py [--from-log <bridge.log> <capture.csv> [sorted|trace]]")
+        else:
+            main()
+    except (OSError, ValueError, csv.Error) as exc:
+        raise SystemExit(f"decode_layouts: {exc}") from exc

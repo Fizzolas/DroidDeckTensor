@@ -138,6 +138,7 @@ internal fun GpuDriversPanel(s: GpuDriversState, a: GpuDriversActions, onAdvance
             }
             if (s.auto) AutoCard(s)
             else {
+                if (s.autoStatus.isNotEmpty()) Text(s.autoStatus, fontSize = 13.sp, color = colors.onBackground, modifier = Modifier.padding(top = 8.dp))
                 val shown = s.pairs.filter { it.suits || showAll }
                 if (shown.isEmpty()) Text(
                     if (s.checking) stringResource(R.string.gpu_checking) else stringResource(R.string.gpu_none_listed),

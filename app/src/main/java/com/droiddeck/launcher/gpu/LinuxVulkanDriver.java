@@ -17,7 +17,8 @@ import java.util.List;
  * these are glibc processes, that one is bionic.
  *
  * <p>"" (the default) means the driver the runtime was built with, at
- * {@code usr/lib/libvulkan_freedreno.so} inside it - nothing is set and nothing is touched.
+ * {@code usr/lib/libvulkan_freedreno.so} inside it (Turnip, on the KGSL backend an Adreno needs;
+ * a Mali needs a PanVK there instead) - nothing is set and nothing is touched.
  * Otherwise the value is an imported driver's id ({@link LinuxVulkanDriverManager}), and the
  * session is handed that driver's ICD manifest in {@code BL_VK_DRIVER}: the session script points
  * the Vulkan loader at it with {@code VK_DRIVER_FILES} after checking both the manifest and the
@@ -32,9 +33,10 @@ public final class LinuxVulkanDriver {
 
     public static final String HELP_TEXT =
             "The driver the Steam client, the games it launches and the desktop's programs render on, "
-            + "inside the Linux runtime. Imported \"-Linux\" Turnip zips only: these are Linux processes "
-            + "and cannot load an Android or Wayland driver. Frames still reach the screen through the "
-            + "display driver below. Takes effect at the next session start.";
+            + "inside the Linux runtime. Imported \"-Linux\" zips only (a glibc Vulkan driver: Turnip on "
+            + "an Adreno, PanVK on a Mali): these are Linux processes and cannot load an Android or "
+            + "Wayland driver. Frames still reach the screen through the display driver below. Takes "
+            + "effect at the next session start.";
 
     private LinuxVulkanDriver() {}
 

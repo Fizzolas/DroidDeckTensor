@@ -34,6 +34,8 @@ Submission cross-check: the `CreateTransferContext` output at out+0 is `0x29`, a
 Dispatch cross-check: the `RGXKickCDM` input at offset 8 carries `0x3d`, the compute context handle
 that `BridgeRGXCreateComputeContext` returns at out+0 in the bring-up capture.
 
+Device runs (5 dispatch runs on hardware, all passing): the kick's output field at offset 8 counts up by one per run, so it is a sequence number, not a fixed value. The input bytes that vary between runs are address-like slots at offsets 32, 40, 48 and 64. Slots 32, 48 and 64 are user-space addresses. Slot 40 has an upper byte of 0xb4, so it is recorded as address-like only.
+
 Capture CSVs are regenerated from raw bridge logs with `python decode_layouts.py --from-log <log> <csv>`.
 
 To regenerate outside this repo, point `PVR_VENDOR` at a directory holding `srv_um.dis`

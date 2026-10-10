@@ -2,6 +2,7 @@ package com.droiddeck.launcher.session
 
 import android.content.Context
 import android.util.Log
+import com.droiddeck.launcher.gpu.GpuInfo
 import com.droiddeck.launcher.wayland.WaylandCompositor
 import java.io.File
 
@@ -19,7 +20,7 @@ import java.io.File
  */
 object GpuClockPin {
     private const val TAG = "GpuClockPin"
-    private const val KGSL_NODE = "/dev/kgsl-3d0"
+    private const val KGSL_NODE = GpuInfo.KGSL_NODE
 
     private const val MARKER = "gpu-clock-pinned"
 

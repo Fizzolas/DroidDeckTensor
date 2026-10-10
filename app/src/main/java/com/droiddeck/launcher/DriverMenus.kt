@@ -53,6 +53,8 @@ internal class DriverMenus(private val activity: Activity, private val ui: Handl
     var pairPercent by mutableIntStateOf(-1)
     /** What Auto last did or found, for the line under the pair in use. */
     var autoStatus by mutableStateOf("")
+    /** Why the pinned driver is not used on this GPU (TurnipDriver.refusesPinned), or "". */
+    private var pinnedRefusal by mutableStateOf("")
     /** The bundle both drivers are set to, as "DD-Turnip 0.1.0", or null when they are not one. */
     var activeBundle by mutableStateOf<String?>(null)
     private var autoCheckedThisProcess = false
@@ -61,7 +63,7 @@ internal class DriverMenus(private val activity: Activity, private val ui: Handl
         gpuName = gpu.displayName(activity), gpuFamily = gpu.family.label(activity), soc = gpu.soc, supportText = gpu.supportText(activity),
         supported = gpu.support == GpuInfo.Support.TESTED, unsupported = gpu.support == GpuInfo.Support.UNSUPPORTED,
         auto = mode == SessionPrefs.GPU_DRIVERS_AUTO, pairs = pairRows, busy = pairBusy, percent = pairPercent,
-        autoStatus = autoStatus, releaseStatus = releaseStatus.ifEmpty { activity.getString(R.string.drivers_not_checked) }, checking = releaseChecking,
+        autoStatus = listOf(autoStatus, pinnedRefusal).filter { it.isNotEmpty() }.joinToString(" "), releaseStatus = releaseStatus.ifEmpty { activity.getString(R.string.drivers_not_checked) }, checking = releaseChecking,
         linuxRows = linuxRows, linuxSelected = linuxSelected, androidRows = androidRows, androidSelected = androidSelected,
         linuxDownloads = linuxDownloads, androidDownloads = androidDownloads, canRestoreBundled = canRestoreBundled,
         activeBundle = activeBundle,
@@ -102,6 +104,14 @@ internal class DriverMenus(private val activity: Activity, private val ui: Handl
         }
         canRestoreBundled = td.hiddenBundled().isNotEmpty()
         androidSelected = SessionPrefs.androidDriver(activity)
+        val pinned = androidSelected
+        // Each direction of the refusal says which vendor the pinned build is for: an Adreno build
+        // pinned on a Mali, or the Mali build pinned on an Adreno (a restored backup, a downgrade).
+        pinnedRefusal = when {
+            !TurnipDriver.refusesPinned(gpu, pinned) -> ""
+            TurnipDriver.isMaliBuild(pinned) -> activity.getString(R.string.drivers_pinned_not_mali, td.displayName(pinned))
+            else -> activity.getString(R.string.drivers_pinned_not_adreno, td.displayName(pinned))
+        }
         activeBundle = DriverBundle.active(activity)?.label
         refreshReleaseRows()
         refreshPairs()
@@ -155,7 +165,7 @@ internal class DriverMenus(private val activity: Activity, private val ui: Handl
         if (!force && autoCheckedThisProcess) return
         autoCheckedThisProcess = true
         if (DriverPairs.recommendedKey(gpu, emptyList()) == null) {
-            autoStatus = activity.getString(R.string.drivers_none_to_set, gpu.supportText(activity).lowercase())
+            autoStatus = activity.getString(R.string.drivers_none_to_set, gpu.supportText(activity))
             return
         }
         releaseChecking = true

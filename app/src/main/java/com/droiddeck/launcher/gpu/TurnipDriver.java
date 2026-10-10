@@ -25,11 +25,21 @@ import java.util.zip.ZipEntry;
 import java.util.zip.ZipInputStream;
 
 /**
- * The Vulkan driver the in-app compositor runs on. It has to be Turnip: the system Adreno driver
- * does not implement VK_EXT_image_drm_format_modifier, so importing the dma-bufs gamescope hands
- * over fails and the session renders nothing. Two builds ship in the apk, one per Adreno
- * generation, and the GPU decides which is unpacked - unless the user has imported an AdrenoTools
- * zip of their own and chosen it, which then wins.
+ * The Vulkan driver the in-app compositor runs on, and it has to be one built for this device's own
+ * stack: on an Adreno a Turnip - the system Adreno driver does not implement
+ * VK_EXT_image_drm_format_modifier, so importing the dma-bufs gamescope hands over fails and the
+ * session renders nothing - and on a Mali Arm's PanVK on kbase. Two Turnips ship in the apk, one per
+ * Adreno generation, and the GPU decides which is unpacked - unless the user has imported an
+ * AdrenoTools zip of their own and chosen it, which then wins.
+ *
+ * <p>On a Mali - a Google Tensor phone, Arm's kbase instead of KGSL - an Adreno Turnip has no KGSL to
+ * hook, so the pick is Arm's own driver ({@link #DRIVER_MALI_G715}) or, while no build carries one,
+ * null: the compositor then falls back to the phone's own system Vulkan driver rather than being
+ * handed a driver for a GPU the phone does not have. A GPU of neither vendor gets nothing.
+ *
+ * <p>An id is only ever offered when the apk actually carries its archive ({@link #carried}), so a
+ * driver this build would have to bundle and does not degrades to the system driver with the missing
+ * archive named in the log, instead of failing when a session starts.
  *
  * <p>The guest's own Turnip is a different copy entirely - a glibc build inside the rootfs, or an
  * imported one ({@link LinuxVulkanDriverManager}). This one is the bionic build the app process
@@ -49,8 +59,25 @@ public final class TurnipDriver {
     private static final String DRIVER_A7XX = "turnip25.1.0";
     /** Adreno 8xx (8 Elite, e.g. a Fold 8's A830). */
     private static final String DRIVER_A8XX = "turnip-sdk36";
-    /** The two the apk carries; never removable, unpacked on demand. */
-    public static final List<String> BUNDLED = Collections.unmodifiableList(Arrays.asList(DRIVER_A7XX, DRIVER_A8XX));
+    /**
+     * Arm's Valhall - a Google Tensor's Mali-G715 - drawn by Mesa's PanVK on the kbase kernel
+     * driver, packaged like a Turnip (bionic, the AdrenoTools layout). The id is the contract with
+     * the archive that would carry it: {@code graphics_driver/adrenotools-panvk-g715.tzst}.
+     *
+     * <p><b>No build carries that archive yet</b> (see the Tensor work doc: the driver is the
+     * project's critical path), so {@link #carried} is false for it and nothing offers it - a Mali
+     * session still gets the system Vulkan driver, and the missing archive is named in the log.
+     * Dropping the archive into {@code assets/graphics_driver/} is all it takes to arm this pick.
+     */
+    static final String DRIVER_MALI_G715 = "panvk-g715";
+    /**
+     * The builds this app bundles by id: the two Adreno Turnips, and the Mali PanVK. Never
+     * removable and unpacked on demand; which of them a given apk really has is its own archive's
+     * business, and only {@link #carried} decides that.
+     */
+    public static final List<String> BUNDLED = Collections.unmodifiableList(Arrays.asList(DRIVER_A7XX, DRIVER_A8XX, DRIVER_MALI_G715));
+    /** Where the bundled drivers' archives live in the apk, as {@code adrenotools-<id>.tzst}. */
+    private static final String ASSET_DIR = "graphics_driver/";
     /** Overrides the pick, for a device we cannot reach: a7xx, a8xx or system. */
     private static final String OVERRIDE_FILE = "Download/droiddeck-driver";
     /** Bundled drivers the user deleted: hidden from the list, their unpacked copy removed. */
@@ -61,8 +88,9 @@ public final class TurnipDriver {
 
     public static final String HELP_TEXT =
             "The driver the app's compositor puts frames on the screen with - the last step of every "
-            + "session, Steam or desktop. AdrenoTools zips only (vulkan.adXXXX.so): a \"-Linux\" Turnip "
-            + "belongs in the Linux runtime list above and is refused here. The compositor loads its "
+            + "session, Steam or desktop. AdrenoTools zips only (vulkan.adXXXX.so on an Adreno, a bionic "
+            + "PanVK on a Mali): a \"-Linux\" driver belongs in the Linux runtime list above and is "
+            + "refused here. The compositor loads its "
             + "driver once per app process, so a change takes effect after the app is fully closed and "
             + "started again.";
 
@@ -116,15 +144,39 @@ public final class TurnipDriver {
     }
 
     /**
-     * The bundled drivers the list shows: {@link #BUNDLED} minus the ones the user deleted. A deleted
-     * one still lives in the apk and Auto still unpacks it on a GPU that needs it, so deleting can
-     * never leave a device without a driver; it only leaves the list.
+     * The bundled drivers the list shows: {@link #BUNDLED} minus the ones the user deleted and the
+     * ones this apk carries no archive for. A deleted one still lives in the apk and Auto still
+     * unpacks it on a GPU that needs it, so deleting can never leave a device without a driver; it
+     * only leaves the list.
      */
     public List<String> visibleBundled() {
         java.util.Set<String> hidden = hiddenBundled();
         ArrayList<String> out = new ArrayList<>();
-        for (String id : BUNDLED) if (!hidden.contains(id)) out.add(id);
+        for (String id : BUNDLED) if (!hidden.contains(id) && carried(id)) out.add(id);
         return out;
+    }
+
+    /**
+     * Whether this apk carries a bundled driver's archive. It is the only thing that decides if a
+     * build can be offered: an id without an archive is never listed, never picked and never
+     * unpacked, so a driver that would have to be built (the Mali PanVK) degrades to the phone's
+     * system Vulkan driver - with the missing archive named here - rather than failing at session
+     * start or being offered as a driver that is not there.
+     */
+    boolean carried(String driverId) {
+        try (InputStream in = context.getAssets().open(ASSET_DIR + "adrenotools-" + driverId + ".tzst")) {
+            return in != null;
+        } catch (IOException e) {
+            return false;
+        }
+    }
+
+    /** A pick the apk carries no archive for is no pick at all: the blocker, said once, in the log. */
+    private String carriedPick(String pick) {
+        if (pick == null || carried(pick)) return pick;
+        Log.w(TAG, "this apk carries no " + ASSET_DIR + "adrenotools-" + pick
+                + ".tzst: no bundled driver for this GPU, so the compositor gets the system Vulkan driver");
+        return null;
     }
 
     public java.util.Set<String> hiddenBundled() {
@@ -282,9 +334,10 @@ public final class TurnipDriver {
     }
 
     /**
-     * Unpacks the driver this device needs and returns its id, or null to fall back to the system
-     * Vulkan loader (which means a black session on Adreno, but is better than refusing to start
-     * on a GPU neither build covers).
+     * Unpacks the driver this device needs and returns its id, or null when the app has no build for
+     * this GPU - which hands the compositor the phone's own system Vulkan driver (a black session on
+     * an Adreno, where the dma-buf import the compositor needs is missing) rather than a driver for a
+     * GPU the phone does not have, and never an archive the apk does not carry.
      */
     public String install() {
         String id = choose();
@@ -316,8 +369,14 @@ public final class TurnipDriver {
         String chosen = SessionPrefs.androidDriver(context);
         if (chosen != null && !chosen.isEmpty()) {
             if (BUNDLED.contains(chosen)) {
+                GpuInfo gpu = GpuInfo.detect();
+                if (refusesPinned(gpu, chosen)) {
+                    Log.w(TAG, "driver pinned by the user, " + chosen + ", is built for the other GPU vendor "
+                            + "and this is " + gpu.getFamily().getVendor() + ": the compositor gets the system Vulkan driver");
+                    return null;
+                }
                 Log.i(TAG, "driver pinned by the user: " + chosen);
-                return chosen;
+                return carriedPick(bundledDriverFor(gpu, chosen, android.os.Build.VERSION.SDK_INT));
             }
             if (isInstalled(chosen)) {
                 Log.i(TAG, "imported driver chosen by the user: " + chosen);
@@ -331,18 +390,80 @@ public final class TurnipDriver {
     private String chooseByDevice() {
         File override = new File(Environment.getExternalStorageDirectory(), OVERRIDE_FILE);
         String forced = override.isFile() ? FileUtils.readString(override) : null;
+        String requested = null;
         if (forced != null) {
             forced = forced.trim().toLowerCase(java.util.Locale.US);
             Log.i(TAG, "driver forced by " + override + ": " + forced);
             if (forced.startsWith("system")) return null;
-            if (forced.startsWith("a8")) return DRIVER_A8XX;
-            if (forced.startsWith("a7")) return DRIVER_A7XX;
+            if (forced.startsWith("a8")) requested = DRIVER_A8XX;
+            else if (forced.startsWith("a7")) requested = DRIVER_A7XX;
+            else if (forced.startsWith("panvk") || forced.startsWith("mali")) requested = DRIVER_MALI_G715;
         }
-        String model = gpuModel();
-        Log.i(TAG, "gpu model: " + (model == null ? "unknown" : model));
-        if (model != null) {
+        GpuInfo gpu = GpuInfo.detect();
+        Log.i(TAG, "gpu model: " + (gpu.getKgslName().isEmpty() ? "unknown" : gpu.getKgslName()));
+        String pick = carriedPick(bundledDriverFor(gpu, requested, android.os.Build.VERSION.SDK_INT));
+        if (pick == null) {
+            Log.i(TAG, "no bundled driver applies to " + gpu.getFamily().getVendor() + "/" + gpu.getFamily().getLabel()
+                    + ": the compositor gets the system Vulkan driver");
+        }
+        return pick;
+    }
+
+    /**
+     * True when a bundled build the user pinned cannot run on this GPU: the pin names a build for the
+     * other vendor - an Adreno Turnip on a Mali, or the Mali build on an Adreno - and would be handed
+     * to a GPU it was not built for. The menu shows this reason; {@link #choose()} then picks nothing,
+     * as {@link #bundledDriverFor} does for such a GPU. A pin that is not a bundled build at all (an
+     * import, a missing one) is left alone.
+     */
+    public static boolean refusesPinned(GpuInfo gpu, String pinned) {
+        if (pinned == null || !BUNDLED.contains(pinned)) return false;
+        return buildVendor(pinned) != gpu.getFamily().getVendor();
+    }
+
+    /** True for the bundled builds built for Arm's kbase stack (a Mali), false for the Adreno Turnips. */
+    public static boolean isMaliBuild(String driverId) {
+        return DRIVER_MALI_G715.equals(driverId);
+    }
+
+    /** The vendor a bundled build was built for: Arm's kbase stack, or Qualcomm's KGSL. */
+    private static GpuInfo.Vendor buildVendor(String driverId) {
+        return isMaliBuild(driverId) ? GpuInfo.Vendor.MALI : GpuInfo.Vendor.ADRENO;
+    }
+
+    /**
+     * The bundled driver this GPU needs, or null when the app has none to give it.
+     *
+     * <p>Which build works is a property of the device's graphics stack, not of its performance:
+     * AdrenoTools loads a Turnip by hooking KGSL, so an Adreno needs one of the two Turnips; a Mali
+     * (a Google Tensor phone) has no KGSL to hook and needs PanVK on kbase instead; and a GPU of
+     * neither vendor gets nothing. Picking by generation alone - as this once did - handed
+     * AdrenoTools a driver for a GPU the phone does not have. Null means "no driver of ours", which
+     * {@link #install()} passes on as the phone's system Vulkan loader.
+     *
+     * <p>{@code requested} is a bundled id the user pinned or the Downloads override asked for, or
+     * null. It is honoured only for the vendor it was built for: a Turnip asked for on a Mali, or the
+     * Mali build asked for on an Adreno, is refused here too, so no path that names a bundled build
+     * can hand a GPU a driver built for another stack.
+     *
+     * <p>Package-visible and free of Context, properties and file reads - the GPU is passed in as
+     * {@link GpuInfo} - so the decision can be tested without a device.
+     */
+    static String bundledDriverFor(GpuInfo gpu, String requested, int sdk) {
+        // Arm's stack: PanVK's own build for the generation, and only that. A Mali the app cannot
+        // place gets nothing rather than a driver built for a generation it may not be.
+        if (gpu.getFamily().getVendor() == GpuInfo.Vendor.MALI) {
+            if (requested != null && buildVendor(requested) != GpuInfo.Vendor.MALI) return null;
+            return gpu.getFamily() == GpuInfo.Family.MALI_G715 ? DRIVER_MALI_G715 : null;
+        }
+        if (gpu.getFamily().getVendor() != GpuInfo.Vendor.ADRENO) return null;
+        if (requested != null && BUNDLED.contains(requested)) {
+            return buildVendor(requested) == GpuInfo.Vendor.ADRENO ? requested : null;
+        }
+        String gpuModel = gpu.getKgslName();
+        if (gpuModel != null && !gpuModel.isEmpty()) {
             // "Adreno750", "adreno_830" - the generation is the first digit of the three.
-            java.util.regex.Matcher m = java.util.regex.Pattern.compile("(\\d)\\d\\d").matcher(model);
+            java.util.regex.Matcher m = java.util.regex.Pattern.compile("(\\d)\\d\\d").matcher(gpuModel);
             if (m.find()) {
                 char generation = m.group(1).charAt(0);
                 if (generation >= '8') return DRIVER_A8XX;
@@ -350,17 +471,7 @@ public final class TurnipDriver {
             }
         }
         // Nothing to go on: Android 16 shipped with the 8 Elite, so treat a new device as 8xx.
-        return android.os.Build.VERSION.SDK_INT >= 36 ? DRIVER_A8XX : DRIVER_A7XX;
+        return sdk >= 36 ? DRIVER_A8XX : DRIVER_A7XX;
     }
 
-    /** KGSL names the GPU here, and this file is world-readable where /dev/kgsl-3d0 is not. */
-    private static String gpuModel() {
-        for (String path : new String[]{
-                "/sys/class/kgsl/kgsl-3d0/gpu_model",
-                "/sys/class/kgsl/kgsl-3d0/gpu_chipid"}) {
-            String value = FileUtils.readString(new File(path));
-            if (value != null && !value.trim().isEmpty()) return value.trim();
-        }
-        return null;
-    }
 }

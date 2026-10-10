@@ -22,4 +22,14 @@ class SocNamesTest {
         assertEquals("Snapdragon 8 Gen 3 family (SG8350P)", SocNames.label("SG8350P", "pineapple"))
         assertEquals("XYZ123", SocNames.label("XYZ123", ""))
     }
+
+    @Test fun tensorsAreNamedAsChipsNotFamilies() {
+        assertEquals("Tensor G1", SocNames.name("GS101", "gs101"))
+        assertEquals("Tensor G2", SocNames.name("", "gs201"))
+        assertEquals("Tensor G3", SocNames.name("", "zuma"))
+        assertEquals("Tensor G4", SocNames.name("", "zumapro"))
+        assertEquals("Tensor G4 (GS401)", SocNames.label("GS401", "zumapro"))
+        // A platform the table does not know still gets no name: nothing is inferred from digits.
+        assertNull(SocNames.name("XYZ999", "nowhere"))
+    }
 }

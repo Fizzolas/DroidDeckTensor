@@ -23,8 +23,8 @@ import java.util.zip.ZipEntry;
 import java.util.zip.ZipInputStream;
 
 /**
- * Imported LINUX Vulkan drivers: glibc Turnip ICDs ({@code Turnip-<tag>[-variant]-Linux.zip} from
- * Banners-Turnip) for the runtime - the gamescope session that runs Valve's native ARM64 Steam
+ * Imported LINUX Vulkan drivers: glibc Vulkan ICDs for the runtime - the gamescope session that
+ * runs Valve's native ARM64 Steam
  * client, and the labwc desktop beside it. This is the driver that DRAWS there: the client's own UI
  * (OpenGL through the runtime's Zink), every game the client launches (D3D through Proton's
  * DXVK/VKD3D) and everything on the desktop. Putting the frame on the screen stays the Android
@@ -37,9 +37,9 @@ import java.util.zip.ZipInputStream;
  * <p>Layout (under the app's files dir, which the session sees by its full host path):
  * <pre>
  *   files/linux_vulkan_drivers/&lt;id&gt;/
- *       libvulkan_freedreno.so   the driver
+ *       libvulkan_&lt;vendor&gt;.so   the driver, under the name its zip gave it (Turnip, PanVK, ...)
  *       icd.json                 generated Vulkan ICD manifest; library_path = the .so's ABSOLUTE path
- *       meta.json                name / driverVersion / minGlibc, our own schema
+ *       meta.json                name / driverVersion / sourceLibraryName / minGlibc, our own schema
  * </pre>
  * The session gets {@code icd.json}'s path in {@code BL_VK_DRIVER} and exports it as
  * {@code VK_DRIVER_FILES}, so nothing inside the runtime is modified and the choice is reversible.
@@ -49,7 +49,17 @@ import java.util.zip.ZipInputStream;
 public class LinuxVulkanDriverManager {
     private static final String TAG = "LinuxVulkanDriver";
     public static final String DIR_NAME = "linux_vulkan_drivers";
+    /**
+     * The library name an install from before the zip's own name was kept carries (the Turnip name
+     * every such zip uses); a driver is found by {@link #libraryName} through this and its meta.
+     */
     public static final String LIB_NAME = "libvulkan_freedreno.so";
+    /**
+     * What a glibc Vulkan driver's library is called, whatever vendor built it: Turnip names it
+     * {@code libvulkan_freedreno.so}, PanVK {@code libvulkan_panvk.so}. Naming the vendor here was
+     * what kept a Mali's driver out of the runtime list (see the Tensor work doc, item 8).
+     */
+    private static final String LIB_PREFIX = "libvulkan_";
     public static final String ICD_NAME = "icd.json";
     public static final String META_NAME = "meta.json";
 
@@ -66,11 +76,27 @@ public class LinuxVulkanDriverManager {
         return new File(rootDir, id);
     }
 
-    /** Installed = has the .so AND the generated manifest (a half-extracted dir is never offered). */
+    /** Installed = has the library AND the generated manifest (a half-extracted dir is never offered). */
     public boolean isInstalled(String id) {
         if (id == null || id.isEmpty() || id.contains("/") || id.contains("..")) return false;
+        return libraryName(id) != null && new File(getDriverDir(id), ICD_NAME).isFile();
+    }
+
+    /**
+     * The library a driver's directory holds, or null when it holds none: the name its own meta
+     * recorded (a PanVK keeps {@code libvulkan_panvk.so}, a Turnip {@code libvulkan_freedreno.so}),
+     * {@link #LIB_NAME} for an install from before that name was kept, or any
+     * {@code libvulkan_*.so} as a last resort.
+     */
+    public String libraryName(String id) {
+        if (id == null || id.isEmpty() || id.contains("/") || id.contains("..")) return null;
         File dir = getDriverDir(id);
-        return new File(dir, LIB_NAME).isFile() && new File(dir, ICD_NAME).isFile();
+        JSONObject meta = readMeta(id);
+        String recorded = meta != null ? meta.optString("sourceLibraryName", "") : "";
+        if (!recorded.isEmpty() && new File(dir, recorded).isFile()) return recorded;
+        if (new File(dir, LIB_NAME).isFile()) return LIB_NAME;
+        File[] libraries = dir.listFiles((d, name) -> name.startsWith(LIB_PREFIX) && name.endsWith(".so"));
+        return libraries != null && libraries.length > 0 ? libraries[0].getName() : null;
     }
 
     /** Absolute path of the driver's ICD manifest, or null when the id isn't installed. */
@@ -141,10 +167,12 @@ public class LinuxVulkanDriverManager {
                     // Flatten: only the base name matters, and it also defeats zip-slip paths.
                     String base = new File(entry.getName()).getName();
                     if (base.isEmpty()) continue;
-                    if (base.startsWith("libvulkan_freedreno") && base.endsWith(".so")) {
-                        if (soName != null) Log.w(TAG, "zip has several libvulkan_freedreno*.so; using the first (" + soName + ")");
+                    if (base.startsWith(LIB_PREFIX) && base.endsWith(".so")) {
+                        if (soName != null) Log.w(TAG, "zip has several " + LIB_PREFIX + "*.so; using the first (" + soName + ")");
                         else {
-                            Files.copy(zis, new File(tmpDir, LIB_NAME).toPath(), StandardCopyOption.REPLACE_EXISTING);
+                            // Kept under the name the zip gave it: the library is the vendor's, and
+                            // the manifest written below points at it by that name.
+                            Files.copy(zis, new File(tmpDir, base).toPath(), StandardCopyOption.REPLACE_EXISTING);
                             soName = base;
                         }
                     } else if (base.equals(META_NAME)) {
@@ -154,8 +182,8 @@ public class LinuxVulkanDriverManager {
                             Log.w(TAG, "meta.json unreadable, ignoring: " + e.getMessage());
                         }
                     }
-                    // The zip's own freedreno_icd.aarch64.json is dropped on purpose: its
-                    // library_path is relative to itself, and adopt() writes an absolute one.
+                    // The zip's own ICD manifest is dropped on purpose: its library_path is
+                    // relative to itself, and adopt() writes an absolute one.
                 }
             }
             String id = adopt(tmpDir, soName, zipMeta, displayName);
@@ -175,16 +203,15 @@ public class LinuxVulkanDriverManager {
     }
 
     /**
-     * Check a staged driver ({@link #LIB_NAME} in {@code tmpDir}, copied from {@code soName} in
-     * the zip), write its manifest and meta.json, and move it in. Returns the id; the caller
-     * deletes {@code tmpDir} when this throws.
+     * Check a staged driver ({@code soName} in {@code tmpDir}), write its manifest and meta.json,
+     * and move it in. Returns the id; the caller deletes {@code tmpDir} when this throws.
      */
     String adopt(File tmpDir, String soName, JSONObject zipMeta, String displayName) throws IOException {
         try {
             if (soName == null) {
                 throw new IllegalArgumentException(context.getString(R.string.lvd_no_library));
             }
-            File so = new File(tmpDir, LIB_NAME);
+            File so = new File(tmpDir, soName);
             if (!isAarch64Elf(so)) {
                 throw new IllegalArgumentException(context.getString(R.string.lvd_not_aarch64, soName));
             }
@@ -214,7 +241,7 @@ public class LinuxVulkanDriverManager {
             JSONObject icd = new JSONObject();
             icd.put("file_format_version", "1.0.0");
             JSONObject icdBody = new JSONObject();
-            icdBody.put("library_path", new File(dir, LIB_NAME).getAbsolutePath());
+            icdBody.put("library_path", new File(dir, soName).getAbsolutePath());
             icdBody.put("api_version", "1.1.274");
             icd.put("ICD", icdBody);
             if (!FileUtils.writeString(new File(tmpDir, ICD_NAME), icd.toString(2))) throw new IOException("cannot write icd.json");

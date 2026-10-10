@@ -28,7 +28,6 @@ class DriverPairsTest {
     @Test
     fun onlyTestedHardwareCountsAsSupported() {
         assertEquals(GpuInfo.Support.TESTED, gpu(650).support)
-        assertEquals("Supported", gpu(650).supportText)
         assertEquals(
             GpuInfo.Support.UNTESTED,
             GpuInfo("Adreno 650", 650, Family.ADRENO_UNKNOWN, "", false).support,
@@ -37,7 +36,6 @@ class DriverPairsTest {
         assertEquals(GpuInfo.Support.TESTED, gpu(825).support)
         assertEquals(GpuInfo.Support.UNTESTED, gpu(610).support)
         assertEquals(GpuInfo.Support.UNTESTED, gpu(660).support)
-        assertEquals("Outside tested hardware (Adreno 650, 725 and newer): it may not run", gpu(660).supportText)
         assertEquals(GpuInfo.Support.UNTESTED, gpu(720).support)
         assertEquals(GpuInfo.Support.UNSUPPORTED, gpu(0, adreno = false).support)
     }
@@ -113,5 +111,25 @@ class DriverPairsTest {
         assertEquals("other 8xx keep WinNative", DriverPairs.WN_BALANCED, DriverPairs.recommendedKey(gpu(830), pairs))
         assertEquals(DriverPairs.WN_BALANCED, DriverPairs.recommendedKey(gpu(825), pairs))
         assertEquals(DriverPairs.BANNER, DriverPairs.recommendedKey(gpu(740), pairs))
+    }
+
+    @Test
+    fun aMaliIsOfferedNoAdrenoPair() {
+        val mali = GpuInfo("Mali-G715", 0, Family.MALI_G715, "Tensor G4", false)
+        val unknown = GpuInfo("Mali", 0, Family.MALI_UNKNOWN, "", false)
+        assertNull(DriverPairs.recommendedKey(mali, emptyList()))
+        assertNull(DriverPairs.recommendedKey(unknown, emptyList()))
+        // The driver page filters its list by suits(), and every pair it lists is a Turnip, so on a
+        // Mali it comes up empty rather than offering a driver that could not load.
+        val pairs = DriverPairs.from(TurnipReleases.Check(
+            listOf(
+                asset("Turnip-r4.zip", "r4", false, DriverPairs.BANNER),
+                asset("Turnip-r4-Linux.zip", "r4", true, DriverPairs.BANNER),
+            ),
+            emptyList(), emptyList(), 0L,
+        ))
+        assertNull(DriverPairs.recommendedKey(mali, pairs))
+        assertFalse(pairs.single().suits(mali))
+        assertFalse(pairs.single().suits(unknown))
     }
 }

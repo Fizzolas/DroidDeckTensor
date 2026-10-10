@@ -100,8 +100,10 @@ object DriverBundle {
 
             val linuxStage = lm.newStagingDir()
             val linuxId = try {
-                val library = linuxDir.listFiles()?.firstOrNull { it.isFile && it.name.startsWith("libvulkan_freedreno") && it.name.endsWith(".so") }
-                library?.copyTo(File(linuxStage, LinuxVulkanDriverManager.LIB_NAME))
+                // Whatever vendor built it - Turnip or PanVK: the manager keeps the library under
+                // the name the zip gave it, and writes a manifest pointing at that name.
+                val library = linuxDir.listFiles()?.firstOrNull { it.isFile && it.name.startsWith("libvulkan_") && it.name.endsWith(".so") }
+                library?.copyTo(File(linuxStage, library.name))
                 val meta = File(linuxDir, LinuxVulkanDriverManager.META_NAME).takeIf { it.isFile }
                     ?.let { runCatching { JSONObject(FileUtils.readString(it)) }.getOrNull() }
                 lm.adopt(linuxStage, library?.name, meta, manifest.name)

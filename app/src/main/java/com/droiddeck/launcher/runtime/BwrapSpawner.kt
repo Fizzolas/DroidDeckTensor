@@ -9,6 +9,7 @@ import android.util.Base64
 import android.util.Log
 import com.droiddeck.launcher.core.FileUtils
 import com.droiddeck.launcher.core.HostProcess
+import com.droiddeck.launcher.gpu.GpuInfo
 import com.droiddeck.launcher.session.SessionPrefs
 import org.json.JSONObject
 import java.io.DataInputStream
@@ -221,33 +222,40 @@ object BwrapSpawner {
     private const val GPU_DIR = "/run/droiddeck-gpu"
 
     /**
-     * The GPU, for an app that is given /dev. Flathub's Mesa has Turnip, but built for the DRM
-     * kernel driver: Adreno on Android is KGSL, so apps fell back to drawing on the CPU. The
-     * runtime's own Turnip has the KGSL backend and needs nothing the Freedesktop runtime lacks
-     * but three libraries, which come with it; Mesa's GL then runs on it through Zink. An app's
-     * own choice of driver (VK_ICD_FILENAMES, MESA_LOADER_DRIVER_OVERRIDE) is left alone.
+     * The GPU, for an app that is given /dev. Flathub's Mesa is built for the DRM kernel driver and
+     * an Android GPU is not one - Adreno is KGSL, a Mali is kbase - so apps fell back to drawing on
+     * the CPU. The runtime's own driver, the one built for this device, needs nothing the
+     * Freedesktop runtime lacks but three libraries, which come with it; Mesa's GL then runs on it
+     * through Zink. An app's own choice of driver (VK_ICD_FILENAMES, MESA_LOADER_DRIVER_OVERRIDE) is
+     * left alone.
      */
     private fun gpu(rootfs: String, root: File, env: MutableMap<String, String>): List<Bind>? {
         val lib = File(rootfs, "usr/lib")
-        val driver = File(lib, "libvulkan_freedreno.so")
-        if (!driver.isFile || !File("/dev/kgsl-3d0").exists()) return null
+        // The runtime's own driver, and the device node it opens: a Turnip with the KGSL backend on
+        // an Adreno (/dev/kgsl-3d0), Arm's PanVK on a Mali (/dev/mali0). Each is named by its
+        // vendor, and the two are not interchangeable.
+        val mali = GpuInfo.isMali()
+        val library = LinuxRuntime.runtimeVulkanLibrary(mali)
+        val icdName = LinuxRuntime.runtimeVulkanVendor(mali) + "_icd.json"
+        val driver = File(lib, library)
+        if (!driver.isFile || !File(if (mali) GpuInfo.MALI_NODE else GpuInfo.KGSL_NODE).exists()) return null
         if (env.containsKey("VK_ICD_FILENAMES") || env.containsKey("VK_DRIVER_FILES")) return null
         // A window on the desktop while labwc composites with pixman gets shared-memory buffers
         // only; Zink cannot present there, so such an app keeps Flathub's own Mesa (llvmpipe).
         // From the desktop, games go through droiddeck-gpu's gamescope and do get the GPU.
         if (env["WLR_RENDERER"] == "pixman" && env["GAMESCOPE_WAYLAND_DISPLAY"] == null) return null
         val binds = ArrayList<Bind>()
-        for (name in listOf("libvulkan_freedreno.so", "libdisplay-info.so.3", "libSPIRV-Tools.so", "libSPIRV-Tools-opt.so")) {
+        for (name in listOf(library, "libdisplay-info.so.3", "libSPIRV-Tools.so", "libSPIRV-Tools-opt.so")) {
             val f = File(lib, name)
             if (!f.exists()) { Log.w(TAG, "gpu: the runtime has no $name; apps draw on the CPU"); return null }
             binds.add(Bind(f.canonicalPath, "$GPU_DIR/$name"))
         }
         // Beside the sandbox root, in the sandbox's own directory: removed with it.
-        val icd = File(root.parentFile, "freedreno_icd.json")
-        icd.writeText("{\"file_format_version\": \"1.0.0\", \"ICD\": {\"library_path\": \"$GPU_DIR/libvulkan_freedreno.so\", \"api_version\": \"1.4.0\"}}\n")
-        binds.add(Bind(icd.path, "$GPU_DIR/freedreno_icd.json"))
-        env["VK_DRIVER_FILES"] = "$GPU_DIR/freedreno_icd.json"
-        env["VK_ICD_FILENAMES"] = "$GPU_DIR/freedreno_icd.json"
+        val icd = File(root.parentFile, icdName)
+        icd.writeText("{\"file_format_version\": \"1.0.0\", \"ICD\": {\"library_path\": \"$GPU_DIR/$library\", \"api_version\": \"1.4.0\"}}\n")
+        binds.add(Bind(icd.path, "$GPU_DIR/$icdName"))
+        env["VK_DRIVER_FILES"] = "$GPU_DIR/$icdName"
+        env["VK_ICD_FILENAMES"] = "$GPU_DIR/$icdName"
         if (!env.containsKey("MESA_LOADER_DRIVER_OVERRIDE") && !env.containsKey("GALLIUM_DRIVER")) {
             env["MESA_LOADER_DRIVER_OVERRIDE"] = "zink"
             env["GALLIUM_DRIVER"] = "zink"

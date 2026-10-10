@@ -1,6 +1,8 @@
 package com.droiddeck.launcher.gpu
 
+import android.content.Context
 import android.os.Build
+import com.droiddeck.launcher.R
 
 /**
  * Which chip this is, as a person would say it. Handhelds often leave Android's SoC model blank
@@ -35,9 +37,14 @@ object SocNames {
             .firstOrNull { it.isNotEmpty() && !Regex("(?i)^msm_\\d").containsMatchIn(it) }.orEmpty()
     }
 
-    /** "Snapdragon 8 Gen 2", "Snapdragon 8 Gen 3 family", or null when neither the model nor the platform is known. */
+    /**
+     * "Snapdragon 8 Gen 2", "Snapdragon 8 Gen 3 family", "Tensor G4", or null when neither the model
+     * nor the platform is known. A Tensor platform names the chip itself rather than a family: one
+     * platform is one chip, where Qualcomm's are shared across several.
+     */
     fun name(model: String, platform: String = GpuInfo.systemProperty("ro.board.platform")): String? =
-        MODELS[model.uppercase()] ?: PLATFORMS[platform.lowercase()]?.let { "$it family" }
+        MODELS[model.uppercase()] ?: GpuInfo.TENSOR_PLATFORMS[platform.lowercase()]?.chip
+            ?: PLATFORMS[platform.lowercase()]?.let { "$it family" }
 
     /** For the GPU card: "Snapdragon 8 Gen 2 (QCS8550)", the bare model, or "". */
     fun label(model: String = model(), platform: String = GpuInfo.systemProperty("ro.board.platform")): String {
@@ -47,5 +54,14 @@ object SocNames {
             name != null -> name
             else -> model
         }
+    }
+
+    /**
+     * The chip as the device itself names it, for the card that explains a refusal: "SM8650 (kalama)",
+     * or the board's hardware name when the phone does not give a chip model.
+     */
+    fun deviceName(context: Context): String {
+        val soc = if (Build.VERSION.SDK_INT >= 31) Build.SOC_MODEL.takeIf { it.isNotBlank() && it != Build.UNKNOWN } else null
+        return soc?.let { "$it (${Build.HARDWARE})" } ?: Build.HARDWARE.ifBlank { context.getString(R.string.gpu_this_gpu) }
     }
 }

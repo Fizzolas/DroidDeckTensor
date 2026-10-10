@@ -94,6 +94,10 @@ object DriverPairs {
      */
     fun recommendedKey(gpu: GpuInfo, pairs: List<DriverPair>): String? = when (gpu.family) {
         Family.NOT_ADRENO -> null
+        // Nothing here is built for Arm's kbase stack: every pair in this list is a Turnip. A Mali GPU
+        // gets no pair at all rather than an Adreno driver that could not load, and the driver page's
+        // own list stays empty on one - its Mali counterpart is a separate driver, not a pair of these.
+        Family.MALI_G715, Family.MALI_G78, Family.MALI_UNKNOWN -> null
         Family.A8XX -> if (gpu.model == 840) newestDdTurnip(pairs) ?: WN_BALANCED else WN_BALANCED
         Family.A7XX_LOW -> BANNER_710
         Family.A7XX -> if (gpu.oneUi8Gen2) BANNER_ONEUI else BANNER

@@ -6,6 +6,7 @@ import android.system.ErrnoException;
 import android.system.Os;
 import android.system.StructStat;
 import android.system.StructUtsname;
+import com.droiddeck.launcher.gpu.GpuInfo;
 import com.droiddeck.launcher.session.SessionPrefs;
 
 
@@ -33,7 +34,7 @@ public final class LinuxRuntime {
     public static final String MODE_RUN = "run";
     /** Shortcut extra naming which of the modes above a Linux entry launches. */
     public static final String EXTRA_LINUX_MODE = "linux_mode";
-    private static final String KGSL_DEVICE = "/dev/kgsl-3d0";
+    private static final String KGSL_DEVICE = GpuInfo.KGSL_NODE;
     /**
      * Where the guest sees a command's XDG_RUNTIME_DIR. A Unix socket's path must fit in 108 bytes,
      * and libwayland checks the guest's path before proot ever sees it: with the app on an SD card
@@ -99,15 +100,43 @@ public final class LinuxRuntime {
                 && prootLoader(context).isFile();
     }
 
-    /** The Vulkan ICD manifest the rootfs ships for the device GPU, or null when it has none. */
+    /** The Vulkan ICD manifest the rootfs ships for this device's GPU, or null when it has none. */
     public static File vulkanIcd(Context context) {
+        return vulkanIcd(context, GpuInfo.isMali());
+    }
+
+    /**
+     * As above, with the vendor as a parameter so the choice is testable without a device. The
+     * manifest is picked by the device's own stack - a Turnip manifest on an Adreno, a PanVK one on
+     * a Mali - and any manifest is better than none, so an unrecognised set still resolves to the
+     * first. A Mali runtime that ships only freedreno (as every one does until PanVK is built into
+     * it) resolves to that, and the session fails the way it does today rather than silently
+     * pretending to have a driver.
+     */
+    static File vulkanIcd(Context context, boolean mali) {
         File icdDir = new File(rootDir(context), "usr/share/vulkan/icd.d");
         File[] manifests = icdDir.listFiles((dir, name) -> name.endsWith(".json"));
         if (manifests == null) return null;
+        String vendor = runtimeVulkanVendor(mali);
         for (File manifest : manifests) {
-            if (manifest.getName().contains("freedreno")) return manifest;
+            if (manifest.getName().toLowerCase(java.util.Locale.ROOT).contains(vendor)) return manifest;
         }
         return manifests.length > 0 ? manifests[0] : null;
+    }
+
+    /**
+     * What the runtime's own Vulkan driver is called there, and what its ICD manifest is named
+     * after, for this device's GPU: Arm's PanVK on a Mali, Mesa's Turnip ({@code freedreno}) on an
+     * Adreno. One owner, because more than one place has to agree on it - the ICD discovery here and
+     * the Flatpak sandbox's GPU plan ({@code BwrapSpawner.gpu}).
+     */
+    public static String runtimeVulkanVendor(boolean mali) {
+        return mali ? "panvk" : "freedreno";
+    }
+
+    /** The runtime's own Vulkan library for that vendor, as it is named under {@code usr/lib}. */
+    public static String runtimeVulkanLibrary(boolean mali) {
+        return "libvulkan_" + runtimeVulkanVendor(mali) + ".so";
     }
 
     /**
@@ -309,7 +338,7 @@ public final class LinuxRuntime {
             Files.write(new File(drm, "dev").toPath(),
                     (major + ":" + minor + "\n").getBytes(StandardCharsets.UTF_8));
             Files.write(new File(device, "uevent").toPath(),
-                    "DRIVER=kgsl-3d0\nMODALIAS=platform:kgsl-3d0\n".getBytes(StandardCharsets.UTF_8));
+                    ("DRIVER=" + GpuInfo.KGSL_NAME + "\nMODALIAS=platform:" + GpuInfo.KGSL_NAME + "\n").getBytes(StandardCharsets.UTF_8));
             File subsystem = new File(device, "subsystem");
             if (!Files.isSymbolicLink(subsystem.toPath())) {
                 Os.symlink("/sys/bus/platform", subsystem.getPath());
@@ -372,12 +401,12 @@ public final class LinuxRuntime {
 
     /** The file the GPU's temperature reads from, or null where the app may read none. */
     public static String gpuTempSource() {
-        String kgsl = "/sys/class/kgsl/kgsl-3d0/";
+        String kgsl = GpuInfo.KGSL_DIR + "/";
         return firstReadable(kgsl + "temp", kgsl + "devfreq/temp", thermalZone("gpu"));
     }
 
     private static String gpuLoadSource() {
-        String kgsl = "/sys/class/kgsl/kgsl-3d0/";
+        String kgsl = GpuInfo.KGSL_DIR + "/";
         return firstReadable(kgsl + "gpu_busy_percentage", kgsl + "devfreq/gpu_load");
     }
 
@@ -388,7 +417,7 @@ public final class LinuxRuntime {
      * Snapdragon generations.
      */
     private static void bindAdrenoStats(List<String> cmd, List<String> extraBinds) {
-        String kgsl = "/sys/class/kgsl/kgsl-3d0/";
+        String kgsl = GpuInfo.KGSL_DIR + "/";
         String gpuTemp = gpuTempSource();
         String[][] stats = {
                 {gpuLoadSource(), "/sys/kernel/debug/dri/0/perf_now"},
