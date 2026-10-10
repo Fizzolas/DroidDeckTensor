@@ -249,11 +249,14 @@ static VkResult wsi_acquire_next_image(VkDevice device, VkSwapchainKHR sw, uint6
 
 /* ---- present: dmabuf fd -> wl_buffer -> attach -> commit ------------------------ */
 
-static VkResult wsi_queue_present(const VkPresentInfoKHR *pi) {
+static VkResult wsi_queue_present(VkQueue queue, const VkPresentInfoKHR *pi) {
+    (void)queue;
     for (uint32_t i = 0; i < pi->swapchainCount; i++) {
         struct wsi_swapchain *sc = (struct wsi_swapchain *)pi->pSwapchains[i];
         uint32_t idx = pi->pImageIndices[i];
         struct wsi_surface *surf = sc->surface;
+        WSI_LOG("present: sc=%p surf=%p dmabuf=%p idx=%u fd=%d", (void *)sc, (void *)surf,
+                surf ? (void *)surf->dmabuf : NULL, idx, sc->images[idx].fd);
         if (!surf->dmabuf || sc->images[idx].fd < 0) { if (pi->pResults) pi->pResults[i] = VK_ERROR_SURFACE_LOST_KHR; continue; }
         struct zwp_linux_buffer_params_v1 *params = zwp_linux_dmabuf_v1_create_params(surf->dmabuf);
         zwp_linux_buffer_params_v1_add(params, sc->images[idx].fd, 0, 0, sc->width * 4, 0, 0);

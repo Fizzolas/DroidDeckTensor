@@ -65,8 +65,10 @@ static int icd_load(void);   /* defined below; used by pvr_icd_resolve */
 
 /* Resolve a dynamic Vulkan entrypoint through the HAL. The WSI (its own translation unit) uses this
  * instead of referencing the global vkGetDeviceProcAddr, which an ICD must not have undefined. */
+static void *icd_gdpa(VkDevice device, const char *pName);   /* forward */
 __attribute__((visibility("default")))
 void *pvr_icd_resolve(void *instance, const char *name) {
+    if (!strcmp(name, "vkGetDeviceProcAddr")) return (void *)icd_gdpa;
     if (!g_gipa && icd_load() != 0) return NULL;
     return g_gipa((VkInstance)instance, name);
 }
@@ -95,6 +97,44 @@ static int icd_load(void) {
 
 /* Device entrypoints: ours (the WSI) first, then the HAL's. The loader consults this to decide
  * whether VK_KHR_swapchain is supported, so vkCreateSwapchainKHR/vkQueuePresentKHR must be here. */
+/* VkDeviceCreateInfo, spelled out so we can rewrite the extension list in place. */
+typedef struct {
+    uint32_t sType; const void *pNext; uint32_t flags;
+    uint32_t queueCreateInfoCount; const void *pQueueCreateInfos;
+    uint32_t enabledLayerCount; const char *const *ppEnabledLayerNames;
+    uint32_t enabledExtensionCount; const char *const *ppEnabledExtensionNames;
+    const void *pEnabledFeatures;
+} DeviceCreateInfo;
+
+/* vkCreateDevice: our WSI provides the swapchain, not the HAL. The HAL's own swapchain is
+ * Android-surface based and fails to initialise in a glibc guest, so we must not enable
+ * VK_KHR_swapchain on the HAL device -- keep it for the app (our vkCreateSwapchainKHR serves it)
+ * and drop it on the way to the HAL. */
+static VkResult icd_create_device(void *pd, const void *ci, const void *alloc, void **out) {
+    if (!g_gipa && icd_load() != 0) return VK_ERROR_INITIALIZATION_FAILED;
+    VkResult (*hal)(void *, const void *, const void *, void **) =
+        (VkResult (*)(void *, const void *, const void *, void **))g_gipa(g_instance, "vkCreateDevice");
+    if (!hal) return VK_ERROR_INITIALIZATION_FAILED;
+    const DeviceCreateInfo *in = (const DeviceCreateInfo *)ci;
+    uint32_t n = in->enabledExtensionCount;
+    const char *const *names = in->ppEnabledExtensionNames;
+    /* Our WSI needs the external-memory handles on the HAL device to export swapchain dma-bufs. */
+    static const char *const need[] = { "VK_KHR_external_memory_fd", "VK_EXT_external_memory_dma_buf" };
+    int have[2] = { 0, 0 };
+    for (uint32_t i = 0; i < n; i++)
+        for (int k = 0; k < 2; k++) if (!strcmp(names[i], need[k])) have[k] = 1;
+    const char **kept = (const char **)malloc(sizeof(char *) * (n + 2));
+    uint32_t kn = 0;
+    for (uint32_t i = 0; i < n; i++) if (strcmp(names[i], "VK_KHR_swapchain")) kept[kn++] = names[i];
+    for (int k = 0; k < 2; k++) if (!have[k]) kept[kn++] = need[k];
+    DeviceCreateInfo copy = *in;
+    copy.enabledExtensionCount = kn;
+    copy.ppEnabledExtensionNames = kept;
+    VkResult r = hal(pd, &copy, alloc, out);
+    free(kept);
+    return r;
+}
+
 static void *icd_gdpa(VkDevice device, const char *pName) {
     void *wsi = pvr_wsi_proc(pName);
     if (wsi) return wsi;
@@ -115,6 +155,17 @@ static const char *const ICD_DEVICE_EXTENSIONS[] = {
 static int icd_has_our_device_ext(const char *name) {
     for (int i = 0; i < ICD_NUM_DEVICE_EXTENSIONS; i++) if (!strcmp(name, ICD_DEVICE_EXTENSIONS[i])) return 1;
     return 0;
+}
+
+/* The loader fetches a physical-device proc address through this and caches what it returns; if it
+ * gets the HAL's copy it never sees the WSI extensions. So ours answers for the enumeration. */
+static VkResult icd_enum_device_ext(void *pd, const char *layer, uint32_t *count, void *props);
+static void *icd_gpdpa(void *pd, const char *pName) {
+    if (!strcmp(pName, "vkEnumerateDeviceExtensionProperties")) return (void *)icd_enum_device_ext;
+    if (!g_gipa && icd_load() != 0) return NULL;
+    void *(*hal)(void *, const char *) =
+        (void *(*)(void *, const char *))g_gipa(g_instance, "vkGetPhysicalDeviceProcAddr");
+    return hal ? hal(pd, pName) : NULL;
 }
 
 static VkResult icd_enum_device_ext(void *pd, const char *layer, uint32_t *count, void *props) {
@@ -235,6 +286,8 @@ void *vk_icdGetInstanceProcAddr(VkInstance instance, const char *pName) {
     void *wsi = pvr_wsi_proc(pName);
     if (wsi) return wsi;
     if (!strcmp(pName, "vkGetDeviceProcAddr")) return (void *)icd_gdpa;
+    if (!strcmp(pName, "vkGetPhysicalDeviceProcAddr")) return (void *)icd_gpdpa;
+    if (!strcmp(pName, "vkCreateDevice")) return (void *)icd_create_device;
     if (!strcmp(pName, "vkEnumerateDeviceExtensionProperties")) return (void *)icd_enum_device_ext;
     if (!strcmp(pName, "vkEnumerateInstanceExtensionProperties")) return (void *)icd_enum_instance_ext;
     if (!strcmp(pName, "vkCreateInstance")) return (void *)icd_create_instance;

@@ -194,8 +194,10 @@ int main(void) {
     CHECK(MQW(q));
     printf("rendered into swapchain image 0\n");
 
+    fprintf(stderr, "client: acquiring next image...\n");
     uint32_t idx = 0;
-    P(vkAcquireNextImageKHR)(dev, sc, UINT64_MAX, VK_NULL_HANDLE, VK_NULL_HANDLE, &idx);
+    VkResult ar = P(vkAcquireNextImageKHR)(dev, sc, UINT64_MAX, VK_NULL_HANDLE, VK_NULL_HANDLE, &idx);
+    fprintf(stderr, "client: acquire -> %d idx=%u\n", ar, idx);
     VkPresentInfoKHR pi = { VK_STRUCTURE_TYPE_PRESENT_INFO_KHR };
     VkResult pr[1] = { VK_SUCCESS };
     pi.swapchainCount = 1; pi.pSwapchains = &sc; pi.pImageIndices = &idx; pi.pResults = pr;
