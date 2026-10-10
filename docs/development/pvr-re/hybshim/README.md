@@ -122,3 +122,15 @@ It needs a live X server — there is no `Xvfb` in the runtime and Xwayland need
 with an XDG shell, so proving it means a real session (or a fuller test compositor). Caveat to watch:
 the X11 path assumes the swapchain format is B8G8R8A8 (the XRGB Pixmap's channel order); the format
 list offers it first, so the client picks it.
+
+## Patches carried beyond the build fixes
+
+* `patches/0001-android-linker-init-needs-the-protected-data-guard.patch` — **required for a working
+  session.** `android_linker_init` (libhybris's own entry point, the one actually used) writes
+  `g_default_namespace` and its search-path list, `add_vdso` and `init_default_namespaces`, all of
+  which live on `LinkerBlockAllocator` pages that `ProtectedDataGuard` leaves `PROT_READ` outside a
+  guard - but only `linker_main` constructs a guard, so this path wrote into a read-only page and the
+  process died with SIGSEGV. Measured on the device: `str x21, [x19, #0x18]` in
+  `parse_LD_LIBRARY_PATH` etc., `mprotect(page, 0x64000, PROT_READ)` from `protect_all`, and
+  `ProtectedDataGuard::ref_count_ == 0` at the fault. Without this, a session's client dies as soon as
+  it brings up its window.

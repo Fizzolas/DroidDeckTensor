@@ -746,3 +746,49 @@ read-only call on the same page.
 unbalanced `ref_count_` - it is. That is the next measurement, and it is a libhybris-side change either
 way (`docs/development/pvr-re/hybshim/README.md`, rebuilt by `build_hybris.sh`), not an ICD, gamescope
 or Steam change.
+
+## 18. The missing guard, fixed - and the fault after it (2026-10-10)
+
+§17 asked which of two it was. It is the first, measured: **`ProtectedDataGuard::ref_count_` is 0 at the
+fault**, so no guard is in scope, and the store lands on a page the guard has left `PROT_READ`. The
+source says the same thing:
+
+```cpp
+static ElfW(Addr) linker_main(...) {
+  ProtectedDataGuard guard;          // present
+
+extern "C" void android_linker_init(...) {
+                                     // absent
+  parse_LD_LIBRARY_PATH(ldpath_env);  // stores into g_default_namespace's search-path list
+  parse_LD_PRELOAD(ldpreload_env);
+  add_vdso();                         // allocates into the block allocator
+  init_default_namespaces(...);
+```
+
+`android_linker_init` is libhybris's own entry point - the one a session actually takes - and it writes
+linker data without the guard that `linker_main` has. That is the whole bug.
+
+**The fix** is the guard, and it is carried as
+`docs/development/pvr-re/hybshim/patches/0001-android-linker-init-needs-the-protected-data-guard.patch`.
+
+**It works.** With the patched `q.so` deployed the old fault is gone - `si_addr` is no longer on a
+protected linker page, and the instruction-fetch-through-`x16` into that page with it.
+
+**A different crash follows it, at the HAL boundary.** The next fault is an **instruction fetch to
+unmapped memory**:
+
+```
+si_addr == pc == 0x71bc2fbd9c     (in no mapping - a gap between q.so's data and the ICD's)
+lr      -> /vendor/lib64/hw/vulkan.powervr.so  +0x151f10
+x16     -> /vendor/lib64/hw/vulkan.powervr.so  +0x26cf8
+```
+
+So the call goes into the PowerVR HAL (`lr` and the `x16` GOT slot are both inside it) and lands on
+nothing. Different layer entirely: a call made into the bionic HAL through the libhybris bridge whose
+target is not mapped. It is **not** characterized further - it needs the vendor blob's symbols, which
+the app cannot read, and it is a separate measurement.
+
+**Provenance caveat on the fix test:** the patched `q.so` was copied into the app's extracted driver
+directory for the test. That directory is rebuilt from the apk's asset whenever the version stamp
+changes, so the result stands as a measurement but the patch still has to be built into the shipped
+asset - i.e. into `q.so` as `build_hybris.sh` produces it - for a session to pick it up on its own.

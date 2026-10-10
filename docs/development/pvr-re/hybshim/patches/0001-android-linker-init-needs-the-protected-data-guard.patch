@@ -1,0 +1,31 @@
+android_linker_init: take the ProtectedDataGuard linker_main already takes
+
+The linker's namespace and soinfo data lives on LinkerBlockAllocator pages, which
+ProtectedDataGuard leaves PROT_READ outside a guard and PROT_READ|PROT_WRITE inside one.
+libhybris's own entry point, android_linker_init, writes to that data - parse_LD_LIBRARY_PATH
+stores g_default_namespace's search-path list, parse_LD_PRELOAD, add_vdso and
+init_default_namespaces all touch it - but, unlike linker_main, it never constructs a guard.
+
+Measured on a Pixel 10 Pro XL (Tensor G5), Steam's client under Steam Runtime, with a crash
+catcher and an mprotect interposer loaded together into the client:
+
+  si_addr = <page>+0x28        the store `str x21, [x19, #0x18]` in parse_LD_LIBRARY_PATH
+  mprotect(<page>, 0x64000, PROT_READ)   caller q.so+0x63f7c = LinkerBlockAllocator::protect_all
+  ProtectedDataGuard::ref_count_ == 0    at the fault: no guard in scope, pages protected
+
+0x64000 is kAllocateSize (PAGE_SIZE * 100) at 4096-byte pages, i.e. exactly the allocator page.
+So the guard is simply missing from the path that writes, which is what this adds.
+
+--- a/hybris/common/q/linker_main.cpp
++++ b/hybris/common/q/linker_main.cpp
+@@ -807,6 +807,14 @@ extern "C" void android_linker_init(int sdk_version, void* (*get_hooked_symbol)(c
+ #endif
++  // The pages this function writes to - g_default_namespace and its search-path list - live on the
++  // linker block allocator, which is left PROT_READ outside a guard. linker_main() has this guard;
++  // this entry point did not, so parse_LD_LIBRARY_PATH below stored into a read-only page and the
++  // process took SIGSEGV (measured: ProtectedDataGuard::ref_count_ == 0 at the fault).
++  ProtectedDataGuard guard;
++
+   // Get a few environment variables.
+   const char* LD_DEBUG = getenv("HYBRIS_LD_DEBUG");
+   if (LD_DEBUG != nullptr) {
