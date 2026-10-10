@@ -27,6 +27,7 @@ import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.graphics.toArgb
 import com.droiddeck.launcher.gpu.FrameGen
+import com.droiddeck.launcher.gpu.GpuInfo
 import com.droiddeck.launcher.gpu.TurnipDriver
 import com.droiddeck.launcher.gpu.Lossless
 import com.droiddeck.launcher.runtime.LinuxRuntime
@@ -793,9 +794,15 @@ class MainActivity : ComponentActivity() {
                     onDismiss = { showRoms = false },
                 )
                 showNonAdreno?.let { release ->
+                    // A PowerVR is not refused for want of an Adreno: it draws with the PowerVR driver
+                    // the app bundles, so it gets its own wording instead of "DroidDeck needs an Adreno".
+                    val powervr = GpuInfo.detect().family.vendor == GpuInfo.Vendor.POWERVR
                     ConfirmDialog(
-                        title = androidx.compose.ui.res.stringResource(R.string.main_non_adreno_title),
-                        text = androidx.compose.ui.res.stringResource(R.string.main_non_adreno_text, com.droiddeck.launcher.gpu.SocNames.deviceName(this@MainActivity), release.size / 1e6),
+                        title = androidx.compose.ui.res.stringResource(if (powervr) R.string.main_powervr_title else R.string.main_non_adreno_title),
+                        text = if (powervr)
+                            androidx.compose.ui.res.stringResource(R.string.main_powervr_text, com.droiddeck.launcher.gpu.SocNames.deviceName(this@MainActivity), release.size / 1e6)
+                        else
+                            androidx.compose.ui.res.stringResource(R.string.main_non_adreno_text, com.droiddeck.launcher.gpu.SocNames.deviceName(this@MainActivity), release.size / 1e6),
                         confirm = androidx.compose.ui.res.stringResource(R.string.main_install_anyway),
                         onConfirm = { showNonAdreno = null; install(release) },
                         onDismiss = { showNonAdreno = null },

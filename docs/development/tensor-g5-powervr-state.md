@@ -216,3 +216,13 @@ several bundled native libraries (`libwayland-server.so`, `libdeviceinfo.so`, `l
 blocker today, but a future Play requirement and a real fix: link the NDK targets with
 `-Wl,-z,max-page-size=16384` and rebuild the prebuilt libraries. It is unrelated to PowerVR and
 affects the app as a whole.
+
+### App-UI wording on a PowerVR (noted and fixed, 2026-10-10)
+
+Seen on the device: clicking **Setup -> Linux runtime -> Install** on the Pixel 10 showed the
+*"Not an Adreno GPU"* dialog. That is the one part of the change-map item 2 that was left undone —
+the detection and the Setup card correct, the download dialog still Adreno-centric. A PowerVR now
+gets its own title (*"PowerVR GPU (Tensor G5)"*) and wording (*"… can drive it with the bundled
+PowerVR driver, but PowerVR support is experimental and untested"*) instead of "DroidDeck needs an
+Adreno". The English string is the source; the other 8 locales fall back to it until translated
+(the same debt `gpuinfo_powervr_experimental` carries).

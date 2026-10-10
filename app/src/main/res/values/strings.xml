@@ -1098,6 +1098,10 @@
     <string name="main_adb_copied">ADB command copied</string>
     <string name="main_pick_roms">Choose the ROMs folder</string>
     <string name="main_non_adreno_title">Not an Adreno GPU</string>
+    <string name="main_powervr_title">PowerVR GPU (Tensor G5)</string>
+    <!-- A PowerVR draws with the PowerVR driver the app bundles, not with Turnip; the wording says so
+         rather than "DroidDeck needs an Adreno", which is what this dialog said before. -->
+    <string name="main_powervr_text">%1$s has an Imagination PowerVR GPU. DroidDeck can drive it with the bundled PowerVR driver, but PowerVR support is experimental and untested. Download: %2$.0f MB.</string>
     <!-- %1$s is the GPU's name, %2$.0f the download size in MB -->
     <string name="main_non_adreno_text">%1$s is not an Adreno GPU. DroidDeck\'s Turnip driver needs the Adreno KGSL device, so Steam here has no GPU device to draw on. Download: %2$.0f MB.</string>
     <string name="main_install_anyway">Install anyway</string>
