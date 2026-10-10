@@ -1,0 +1,5 @@
+Binary analysis: stripped ARM64 ELF (no symbols visible via nm)
+Dependencies: libc.so, libion.so, libsync.so (bionic)
+Kernel interface: /dev/pvrsrvkm, /sys/class/pvr_sync
+Approach needed: disassemble with objdump, trace Vulkan entry points manually
+Alternative: libhybris LD_PRELOAD shim for bionic-glibc bridge

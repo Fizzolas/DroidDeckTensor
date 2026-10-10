@@ -1,0 +1,32 @@
+=== DEVICE PROBE — Pixel 10 Pro XL (mustang) ===
+Date: 2026-10-10
+Status: DEVICE ATTACHED AND RESPONSIVE
+
+GPU:
+- Platform: /sys/devices/platform/powervr (present)
+- Misc: /sys/class/misc/pvr_sync (present)
+- Driver: /vendor/lib64/hw/vulkan.powervr.so (bionic, v1.634.2906)
+- GPU0: 34f00000.gpu0 (present)
+- Architecture: IMG DXT-48-1536 (PowerVR G5 / Furian / Volcanic)
+
+MEMORY:
+- Total: 15,948,992 kB (~15.9 GB)
+- Free: ~640 MB
+- Available: ~4,495 MB
+- Swap: 7,974,492 kB total, 1,430,196 kB free
+
+MEMORY CYCLE TEST:
+- Observed: Device responds, memory stable
+- GPU driver loaded successfully on Android (bionic)
+- No memory corruption detected
+
+REGISTRY:
+- No kernel-level GPU registry exposed (security / architecture design)
+- Driver uses /dev/pvrsrvkm and pvr_sync interface
+- Driver is bionic (links libc.so, not glibc libc.so.6)
+
+CONCLUSION:
+- Device works on Android (bionic) — confirmed
+- Driver loads — confirmed
+- Glibc bridge needs Linux/glibc build environment
+- The bionic/glibc binary mismatch is the actual wall
