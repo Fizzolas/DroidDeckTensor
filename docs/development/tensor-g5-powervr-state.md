@@ -792,3 +792,36 @@ the app cannot read, and it is a separate measurement.
 directory for the test. That directory is rebuilt from the apk's asset whenever the version stamp
 changes, so the result stands as a measurement but the patch still has to be built into the shipped
 asset - i.e. into `q.so` as `build_hybris.sh` produces it - for a session to pick it up on its own.
+
+## 19. The fault after the guard fix, symbolized (2026-10-10)
+
+The guard patch (§18) removes the protected-page store. The fault that follows is a **jump through a
+bad PLT slot in the bionic HAL**, and it is now symbolized to the instruction. The vendor blob is
+world-readable (`/vendor/lib64/hw/vulkan.powervr.so`, 3167784 bytes), so it can be resolved offline;
+`lr` and `x16` from the report land at file offsets `0x1b9f10` and `0x286cf8`.
+
+```
+vulkan_device_open (HAL, file 0x1b9ee0):
+  1b9f0c: bl  0x25c9a0 <strcmp@plt>        ; lr = 0x1b9f10, matches the report
+strcmp@plt:
+  25c9a0: adrp x16, 0x286000
+  25c9a4: ldr  x17, [x16, #0xcf8]          ; x17 = GOT[strcmp]
+  25c9ac: br   x17                         ; -> 0x71bc2fbd9c, unmapped
+```
+
+`0x286cf8` is confirmed by the relocation table to be the `R_AARCH64_JUMP_SLOT strcmp@LIBC` slot. The
+value in it, `0x71bc2fbd9c`, is in **no mapping**: it sits in the gap between `q.so`'s data end
+(`0x71bc2ae000`) and this ICD's first mapping (`0x71bc310000`). Bionic's `strcmp` is in
+`/apex/com.android.runtime/lib64/bionic/libc.so` at `0x71a5...`, nowhere near it.
+
+So the HAL's `strcmp` PLT slot does not hold a usable `strcmp`. It reads like an unresolved or wrongly
+resolved slot - a PLT slot whose initial value should be the lazy-binding resolver, or a resolved
+target, and is neither.
+
+**This is the same class as §17-18**: the HAL is a bionic library, so its relocations and its PLT
+resolution are done by `q.so`'s linker, and that is where the last two faults have lived. Not the ICD,
+not the shim's own logic, not Steam.
+
+**Not established:** whether the slot was never resolved (lazy binding not entered) or was resolved to
+the wrong address. Distinguishing them is the next measurement, and the interposer used for §17 can
+answer it by logging the resolver entry for this slot.
