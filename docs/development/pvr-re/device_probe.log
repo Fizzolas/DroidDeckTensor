@@ -1,3 +1,10 @@
+> **⚠ SUPERSEDED — several claims in this file are false. Do not build on them.**
+> Verified on hardware 2026-10-10; see `docs/development/tensor-g5-powervr-state.md` for the corrected
+> ground truth. Known errors here: the blob size/`stripped`/`objdump blocked` claims, the reported
+> driver version, the `/dev/pvrsrvkm` and `/sys/class/pvr_sync` paths, and the "no
+> `VK_EXT_image_drm_format_modifier`" claim. The real blob lives at `D:/GUH/device-blob/vulkan.powervr.so`
+> (the copy in `extracted/` is corrupt). This file is kept for history only.
+
 === DEVICE PROBE — Pixel 10 Pro XL (mustang) ===
 Date: 2026-10-10
 Status: DEVICE ATTACHED AND RESPONSIVE
