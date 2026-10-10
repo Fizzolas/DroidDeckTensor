@@ -100,3 +100,25 @@ SPIR-V through `libusc`), dispatches `data[i] = i*3+7`, waits for the queue, rea
   on screen*: bundle the ICD + shim into the guest runtime, and (for D3D titles) the same for DXVK.
   X11 WSI (gamescope Xwayland) is still only Wayland here; gralloc/AHB and /dev/pvr_sync are not
   wired yet, but neither is needed for the Wayland path the guest's gamescope uses.
+
+## X11 (XCB/Xlib) WSI — implemented, present path unverified
+
+Steam is an X11 client under gamescope's Xwayland, so it presents through `vkCreateXcbSurfaceKHR`.
+`pvr_wsi.c` now carries both platforms behind one surface kind; the image is the same exportable
+dma-buf and only the present step differs:
+
+* Wayland: `wl_buffer` via `zwp_linux_dmabuf_v1` (proven).
+* X11: the dma-buf is handed to Xwayland as a DRI3 Pixmap (`xcb_dri3_pixmap_from_buffers`) and shown
+  with `xcb_present_pixmap`. The runtime's Xwayland is 24.1.13 and speaks DRI3 + Present
+  (`xwayland-present.c`), so the mechanism is the one it uses.
+
+Advertised: `VK_KHR_xcb_surface`, `VK_KHR_xlib_surface` (plus the existing surface/wayland). The ICD
+now DT_NEEDs `libxcb`/`libxcb-dri3`/`libxcb-present`/`libX11`/`libX11-xcb`, all of which the runtime
+rootfs already ships under `usr/lib` — nothing new is bundled.
+
+**Verified:** compute (256/256) and the Wayland present still pass with the rebuilt ICD; the X11 code
+compiles, its entrypoints are dispatched, no regression. **Not verified:** the X11 present itself.
+It needs a live X server — there is no `Xvfb` in the runtime and Xwayland needs a Wayland compositor
+with an XDG shell, so proving it means a real session (or a fuller test compositor). Caveat to watch:
+the X11 path assumes the swapchain format is B8G8R8A8 (the XRGB Pixmap's channel order); the format
+list offers it first, so the client picks it.
