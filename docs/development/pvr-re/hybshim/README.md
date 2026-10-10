@@ -96,6 +96,7 @@ SPIR-V through `libusc`), dispatches `data[i] = i*3+7`, waits for the queue, rea
   path, mixes two linkers and segfaults in `prelink_image`. The linker DSO is dlopen'd at runtime.
 * glibc's stack canary and bionic's `__stack_chk_guard` differ; `libhybris.so` must export the guard
   (it does) or teardown trips `__stack_chk_fail`. Harnesses should `_exit()` after their proof.
-* GPU execution works (compute). The remaining work is the surface path: **WSI** (create a swapchain),
-  gralloc/AHB → dma-buf export for the swapchain images, and `/dev/pvr_sync` fence translation for
-  the guest's Wayland/X11 presentation. Then `vkcube` inside the guest, then Steam, then a game.
+* The present path works (Wayland WSI, dma-buf swapchain, present). Remaining for a game to *render
+  on screen*: bundle the ICD + shim into the guest runtime, and (for D3D titles) the same for DXVK.
+  X11 WSI (gamescope Xwayland) is still only Wayland here; gralloc/AHB and /dev/pvr_sync are not
+  wired yet, but neither is needed for the Wayland path the guest's gamescope uses.
