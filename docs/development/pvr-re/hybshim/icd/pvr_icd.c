@@ -299,6 +299,9 @@ static VkResult icd_create_instance(const void *ci, const void *alloc, VkInstanc
     const InstanceCreateInfo *in = (const InstanceCreateInfo *)ci;
     uint32_t n = in->enabledExtensionCount;
     const char *const *names = in->ppEnabledExtensionNames;
+    fprintf(stderr, "pvr_icd: vkCreateInstance %u ext:", n);
+    for (uint32_t i = 0; i < n; i++) fprintf(stderr, " %s", names[i]);
+    fputc(10, stderr);
     VkInstance created = NULL;   /* only published once the HAL returned success */
     VkResult r;
     if (n == 0) {
@@ -310,6 +313,9 @@ static VkResult icd_create_instance(const void *ci, const void *alloc, VkInstanc
         InstanceCreateInfo copy = *in;
         copy.enabledExtensionCount = kn;
         copy.ppEnabledExtensionNames = kept;
+        fprintf(stderr, "pvr_icd: -> HAL with %u ext:", kn);
+        for (uint32_t i = 0; i < kn; i++) fprintf(stderr, " %s", kept[i]);
+        fputc(10, stderr);
         r = hal_create(&copy, alloc, &created);
         free(kept);
     }
