@@ -50,6 +50,18 @@ static void *(*g_create)(const void *, const void *, VkInstance *);
 
 static void icd_log(const char *m) { fprintf(stderr, "pvr_icd: %s\n", m); }
 
+/* The Wayland WSI this ICD carries (the HAL only does Android surfaces). */
+extern void *pvr_wsi_proc(const char *name);
+static int icd_load(void);   /* defined below; used by pvr_icd_resolve */
+
+/* Resolve a dynamic Vulkan entrypoint through the HAL. The WSI (its own translation unit) uses this
+ * instead of referencing the global vkGetDeviceProcAddr, which an ICD must not have undefined. */
+__attribute__((visibility("default")))
+void *pvr_icd_resolve(void *instance, const char *name) {
+    if (!g_gipa && icd_load() != 0) return NULL;
+    return g_gipa((VkInstance)instance, name);
+}
+
 /* Load the bionic HAL once. Returns 0 on success. */
 static int icd_load(void) {
     if (g_gipa) return 0;
@@ -83,8 +95,11 @@ int vk_icdNegotiateLoaderICDInterfaceVersion(uint32_t *version) {
 __attribute__((visibility("default")))
 void *vk_icdGetInstanceProcAddr(VkInstance instance, const char *pName) {
     if (!pName) return NULL;
+    /* The WSI (surface/swapchain/present) is ours, because the HAL has only Android surfaces. */
+    void *wsi = pvr_wsi_proc(pName);
+    if (wsi) return wsi;
     if (!g_gipa) { if (icd_load() != 0) return NULL; }
-    /* The loader resolves global + instance procs through here; the HAL knows both forms. */
+    /* Everything else is the HAL: it resolves global + instance procs through this one call. */
     return g_gipa(instance, pName);
 }
 
