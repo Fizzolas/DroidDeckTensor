@@ -82,9 +82,13 @@ Manifest for the guest (`VK_ICD_FILENAMES`):
 
 **Proven (2026-10-10):** the real glibc Vulkan loader (`libvulkan.so.1`) discovers this ICD and
 drives the GPU — `vkCreateInstance` → 1 device `PowerVR D-Series DXT-48-1536 MC1`, 1 queue family
-(GRAPHICS, 2 queues), **and `vkCreateDevice` → 0**. See `probes/vk_loader_test.c`. In DroidDeck terms
+(GRAPHICS, 2 queues), `vkCreateDevice` → 0. See `probes/vk_loader_test.c`. In DroidDeck terms
 the guest would ship `libvulkan_powervr.so` (built by this repo) + the two shim DSOs + the manifest,
 and `LinuxVulkanDriverManager` / `BwrapSpawner` already look for exactly that name.
+
+**And the GPU executes:** `probes/vk_compute_test.c` builds a compute pipeline (the driver compiles the
+SPIR-V through `libusc`), dispatches `data[i] = i*3+7`, waits for the queue, reads back and verifies —
+**256/256 correct**. So the bionic driver does real GPU work under glibc, not just enumeration.
 
 ## Known remaining work
 
@@ -92,6 +96,6 @@ and `LinuxVulkanDriverManager` / `BwrapSpawner` already look for exactly that na
   path, mixes two linkers and segfaults in `prelink_image`. The linker DSO is dlopen'd at runtime.
 * glibc's stack canary and bionic's `__stack_chk_guard` differ; `libhybris.so` must export the guard
   (it does) or teardown trips `__stack_chk_fail`. Harnesses should `_exit()` after their proof.
-* Device creation works; the remaining work is the surface path: **WSI** (create a swapchain),
+* GPU execution works (compute). The remaining work is the surface path: **WSI** (create a swapchain),
   gralloc/AHB → dma-buf export for the swapchain images, and `/dev/pvr_sync` fence translation for
   the guest's Wayland/X11 presentation. Then `vkcube` inside the guest, then Steam, then a game.
