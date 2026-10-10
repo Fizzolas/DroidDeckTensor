@@ -168,22 +168,25 @@ public class LinuxVulkanDriverManager {
                     String base = new File(entry.getName()).getName();
                     if (base.isEmpty()) continue;
                     if (base.startsWith(LIB_PREFIX) && base.endsWith(".so")) {
-                        if (soName != null) Log.w(TAG, "zip has several " + LIB_PREFIX + "*.so; using the first (" + soName + ")");
-                        else {
-                            // Kept under the name the zip gave it: the library is the vendor's, and
-                            // the manifest written below points at it by that name.
-                            Files.copy(zis, new File(tmpDir, base).toPath(), StandardCopyOption.REPLACE_EXISTING);
-                            soName = base;
-                        }
+                        // The primary library is the first libvulkan_*.so; the manifest points at it.
+                        if (soName == null) soName = base;
+                        else Log.w(TAG, "zip has several " + LIB_PREFIX + "*.so; using the first (" + soName + ")");
                     } else if (base.equals(META_NAME)) {
                         try {
                             zipMeta = new JSONObject(new String(readAll(zis), StandardCharsets.UTF_8));
                         } catch (Exception e) {
                             Log.w(TAG, "meta.json unreadable, ignoring: " + e.getMessage());
                         }
+                        continue;
+                    } else if (base.equals(ICD_NAME) || base.endsWith(".json")) {
+                        // The zip's own ICD manifest is dropped: its library_path is relative to
+                        // itself, and adopt() writes an absolute one.
+                        continue;
                     }
-                    // The zip's own ICD manifest is dropped on purpose: its library_path is
-                    // relative to itself, and adopt() writes an absolute one.
+                    // Every other file is kept: a glibc driver may need support libraries beside it
+                    // (a shim layer, a client library), and it finds them relative to itself. Flatten
+                    // to the base name to defeat zip-slip paths.
+                    Files.copy(zis, new File(tmpDir, base).toPath(), StandardCopyOption.REPLACE_EXISTING);
                 }
             }
             String id = adopt(tmpDir, soName, zipMeta, displayName);

@@ -1,2 +1,5 @@
 icd/libvulkan_powervr.so
 build/
+dist/*.so
+dist/*.so.0
+dist/*.zip
