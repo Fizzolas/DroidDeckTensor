@@ -693,3 +693,56 @@ is reachable without an Android SDK.
 **Also kept:** the interposer itself (`crashcatch2.so` in this session's scratch work) is the only
 debugger this guest has had, and it is what turned "it segfaults" into an address, an instruction and a
 function. It is worth keeping for any future fault in the guest.
+
+## 17. Why the crash happens: the linker's own pages are read-only when it writes to them (2026-10-10)
+
+§16 named the layer and got two things wrong. Both are corrected here; what follows is measured by
+**direct correlation within a single run**, not inferred from disassembly.
+
+**Method.** Two `LD_PRELOAD` shims loaded together into the client: the `sigaction`-interposing crash
+catcher, and an `mprotect` interposer that logs every call with its range, requested protection, and
+the caller's return address (captured as the interposer's *first* instruction - reading `x30` after
+`dlsym`/`open` returns garbage, which is what made an earlier attempt report an unmapped caller). One
+run then yields the fault and the history of the page it faults on.
+
+**The correlation, from one run:**
+
+```
+si_addr = 0x7b2998c028            (the store that faults)
+  mprotect addr=0x7b2998c000 len=0x64000 prot=3  caller=q.so+0x63f7c   (make RW)
+  mprotect addr=0x7b2998c000 len=0x64000 prot=1  caller=q.so+0x63f7c   (make READ-ONLY)
+```
+
+`prot=1` is `PROT_READ`. `q.so+0x63f7c` is the `mprotect` inside `LinkerBlockAllocator::protect_all`
+(`0x63f54`), which is called 11 times - all from `ProtectedDataGuard`'s constructor, `protect_data`
+and destructor. The page is a linker block-allocator page: `[anon:linker_alloc]`, and
+`kAllocateSize = PAGE_SIZE * 100` (`linker_block_allocator.cpp:40`) = `0x64000` at the guest's 4096
+byte pages, which is exactly the range protected.
+
+**So the cause is:** `str x21, [x19, #0x18]` inside **`parse_LD_LIBRARY_PATH`** stores into
+`g_default_namespace`'s search-path list, and that namespace object lives on a linker block-allocator
+page that `ProtectedDataGuard` has put in **read-only** state. The linker is writing to its own
+protected data. The invariant upstream relies on is the guard's: the pages are
+`PROT_READ | PROT_WRITE` while a guard is in scope and `PROT_READ` outside it (`ref_count_` 0 -> 1
+un-protects, 1 -> 0 re-protects). Here the write happens while they are `PROT_READ`, so either no
+guard covers this path or `ref_count_` is unbalanced and a destructor re-protected them early.
+
+**Two corrections to §16**, both my errors:
+
+* the function is **`parse_LD_LIBRARY_PATH`**, not `init_default_namespaces`. §16's offset came from
+  the section-table delta; the runtime map (`r-xp 00042000`) is what resolves it, giving vaddr
+  `0x6c17c` rather than `0x5c17c`.
+* **`ProtectedDataGuard` is live, not dead code.** §16 concluded "0 call sites, never runs" from a
+  `grep` for a direct `bl` to `protect_all`'s address; the calls go through the **PLT**
+  (`protect_all@plt` at `0xc5330`), which that grep did not match. The correlation above shows the
+  guard ran and did protect the page.
+
+**Why it is intermittent.** The protection is a state, not a constant: it depends on which guards are
+in scope when `android_linker_init` runs. That matches what was seen - most sessions reach the
+client's window and die there, and one run produced the crash with the log showing both the RW and the
+read-only call on the same page.
+
+**What is still not established:** which of the two - a missing guard around this path, or an
+unbalanced `ref_count_` - it is. That is the next measurement, and it is a libhybris-side change either
+way (`docs/development/pvr-re/hybshim/README.md`, rebuilt by `build_hybris.sh`), not an ICD, gamescope
+or Steam change.
