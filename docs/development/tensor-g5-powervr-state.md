@@ -636,3 +636,60 @@ was deprioritised for looking non-fatal; the signal for the second was a log lin
 disappeared and did not. When a shim's precondition is a property of the GPU family, adding a family
 means auditing every shim keyed to the old one - and when a change is supposed to alter what the guest
 logs, count the lines rather than trusting the install.
+
+## 16. The crash, located: a write to a protected page inside the libhybris linker (2026-10-10)
+
+§11-12 could not name the fault. It is named now, and it is **not in Steam, X11 or zink** - it is in
+**our own bionic bridge**.
+
+**How it was caught.** The guest has no `gdb` or `strace`, and Android routes cores to debuggerd, so a
+small `LD_PRELOAD` catcher was written that interposes `sigaction()` itself: the client installs
+breakpad's handler about a second after start, which replaces any handler an LD_PRELOAD constructor had
+put in place, so the interposer has to wrap that later call rather than race it. It was validated first
+against a five-line program that installs its own SIGSEGV handler and then crashes - the report came out
+of that, so the mechanism was known to work before a session was spent on it. `LD_PRELOAD` is the
+delivery route because `SessionFiles` rewrites `/etc/ld.so.preload` at every session start.
+
+**The measurement.** `comm=steam`, 127 KB report. Resolved against `/proc/self/maps`:
+
+```
+si_addr 0x7b582dc028  [anon:linker_alloc] r--p   <- the bad access, a READ-ONLY page
+pc      0x7b583ac17c  q.so (the emulated bionic linker)
+lr      0x7b583ac128  q.so
+x19     0x7b582dc010  [anon:linker_alloc] r--p
+```
+
+`si_addr == x19 + 0x18`, and the faulting word is `f9000e75` = **`str x21, [x19, #0x18]`**. So it is a
+**store into a read-only linker page**. The same region holds the GOT slot `x16` uses for the call, and
+the call's target sits between `init_default_namespaces` (q.so `0x5b430`) and `get_exported_namespace`
+(`0x5c7ac`) - i.e. **inside `init_default_namespaces`**. The stack passes through `libhybris.so`,
+**`libvulkan_powervr.so` (our ICD)** and `libvulkan.so.1.4.357` (the loader), so the path is the guest
+Vulkan loader driving our ICD, which drives the bionic HAL through libhybris - exactly the seam this
+project built.
+
+**What that means.** This is bionic's `ProtectedDataGuard` machinery, which mprotects the linker's own
+allocators and restores them on scope exit:
+
+```cpp
+void ProtectedDataGuard::protect_data(int protection) {
+  g_soinfo_allocator.protect_all(protection);
+  g_namespace_allocator.protect_all(protection);        // <- the page this write lands in
+  g_namespace_list_allocator.protect_all(protection);
+}
+```
+
+and libhybris's own `linker_block_allocator.h` says it *"provides mprotect services to the user."* So a
+namespace object is being written while the allocator's pages are read-only. **The bionic linker's
+self-protection is not holding under the libhybris emulation** - the guard is either not active where
+this write happens, or its nesting is unbalanced, or the allocator's `protect_all` does not cover the
+region the namespace was actually allocated from. Which of those it is has **not** been established; what
+is established is the address, the instruction, the function and the layer.
+
+**Where the next move is.** It is a libhybris-side fix, in the emulated linker's protection handling -
+not in the ICD, not in gamescope, not in Steam. The build recipe and the patches already carried are in
+`docs/development/pvr-re/hybshim/README.md`, and `build_hybris.sh` rebuilds both DSOs with zig, so this
+is reachable without an Android SDK.
+
+**Also kept:** the interposer itself (`crashcatch2.so` in this session's scratch work) is the only
+debugger this guest has had, and it is what turned "it segfaults" into an address, an instruction and a
+function. It is worth keeping for any future fault in the guest.
