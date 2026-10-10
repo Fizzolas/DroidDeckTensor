@@ -1,5 +1,6 @@
+# Built artifacts: the ICD/shim DSOs and the packaged zip (built by build_hybris.sh + dist/package.sh)
+dist/*
+!dist/meta.json
+!dist/package.sh
 icd/libvulkan_powervr.so
 build/
-dist/*.so
-dist/*.so.0
-dist/*.zip
