@@ -101,17 +101,24 @@ public class LinuxVulkanDriverManager {
     /**
      * Install a bundled driver (its archive in the apk) into the drivers directory if it is not
      * there yet, and return its id. Returns null when the apk carries no such archive. Idempotent:
-     * a present install is left alone, and no meta.json means it is (re)installed, so an app update
-     * replaces the driver. The bundled driver is only ever installed on request - never
-     * auto-selected - so "Auto" and an Adreno device are untouched.
+     * a complete install is left alone, so a call from the panel and one from a session start do not
+     * collide. A driver whose files are incomplete (a previous extract was interrupted) is
+     * re-extracted, which is what an app update relies on.
+     *
+     * <p>Thread-safe: this unpacks ~12 MB and is reached both from {@code refreshDrivers} (background)
+     * and {@code SessionService.effectiveLinuxDriver} (session start), so the delete+extract is
+     * serialized on the manager's lock or two threads could tear the same install. The bundled driver
+     * is only ever installed on request - never auto-selected - so "Auto" and an Adreno are untouched.
      */
-    public String installBundled(String id) {
+    public synchronized String installBundled(String id) {
         if (id == null || id.isEmpty() || id.contains("/") || id.contains("..")) return null;
         if (!carried(id)) {
             Log.w(TAG, "this apk carries no " + ASSET_DIR + id + ASSET_SUFFIX + "; bundled driver unavailable");
             return null;
         }
         File dir = getDriverDir(id);
+        // A present, merely incomplete package is never trusted (see isInstalled): a half-written
+        // icd.json or a missing library is re-extracted rather than offered to a session.
         if (new File(dir, META_NAME).isFile() && isInstalled(id)) return id;
         FileUtils.delete(dir);
         if (!dir.mkdirs()) { Log.e(TAG, "cannot create " + dir); return null; }

@@ -156,9 +156,12 @@ struct wsi_swapchain {
     uint32_t count, next;
     int32_t width, height;
     uint32_t drm_format;
+    uint32_t stride;   /* the image's real row pitch, from vkGetImageSubresourceLayout */
     struct wsi_swapchain_image images[3];
     PFN_vkCreateImage CreateImage; PFN_vkGetImageMemoryRequirements GetImageMemoryRequirements;
+    PFN_vkGetImageSubresourceLayout GetImageSubresourceLayout;
     PFN_vkAllocateMemory AllocateMemory; PFN_vkBindImageMemory BindImageMemory;
+    PFN_vkFreeMemory FreeMemory; PFN_vkDestroyImage DestroyImage;
     PFN_vkGetMemoryFdKHR GetMemoryFdKHR; PFN_vkGetPhysicalDeviceMemoryProperties GetPhysDevMemProps;
     VkPhysicalDeviceMemoryProperties memProps;
 };
@@ -185,8 +188,11 @@ static VkResult wsi_create_swapchain(VkDevice device, const VkSwapchainCreateInf
     sc->count = ci->minImageCount > 3 ? 3 : (ci->minImageCount < 2 ? 2 : ci->minImageCount);
     sc->CreateImage = (PFN_vkCreateImage)dev_proc(device, "vkCreateImage");
     sc->GetImageMemoryRequirements = (PFN_vkGetImageMemoryRequirements)dev_proc(device, "vkGetImageMemoryRequirements");
+    sc->GetImageSubresourceLayout = (PFN_vkGetImageSubresourceLayout)dev_proc(device, "vkGetImageSubresourceLayout");
     sc->AllocateMemory = (PFN_vkAllocateMemory)dev_proc(device, "vkAllocateMemory");
     sc->BindImageMemory = (PFN_vkBindImageMemory)dev_proc(device, "vkBindImageMemory");
+    sc->FreeMemory = (PFN_vkFreeMemory)dev_proc(device, "vkFreeMemory");
+    sc->DestroyImage = (PFN_vkDestroyImage)dev_proc(device, "vkDestroyImage");
     sc->GetMemoryFdKHR = (PFN_vkGetMemoryFdKHR)dev_proc(device, "vkGetMemoryFdKHR");
     (void)sc->GetPhysDevMemProps;
 
@@ -198,9 +204,10 @@ static VkResult wsi_create_swapchain(VkDevice device, const VkSwapchainCreateInf
     ici.mipLevels = 1; ici.arrayLayers = 1; ici.samples = VK_SAMPLE_COUNT_1_BIT;
     ici.tiling = VK_IMAGE_TILING_LINEAR; ici.usage = ci->imageUsage | VK_IMAGE_USAGE_TRANSFER_DST_BIT;
     ici.sharingMode = VK_SHARING_MODE_EXCLUSIVE; ici.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+    uint32_t made = 0;
     for (uint32_t i = 0; i < sc->count; i++) {
         VkResult r = sc->CreateImage(device, &ici, alloc, &sc->images[i].image);
-        if (r != VK_SUCCESS) { WSI_LOG("vkCreateImage failed %d", r); return r; }
+        if (r != VK_SUCCESS) { WSI_LOG("vkCreateImage failed %d", r); goto fail; }
         VkMemoryRequirements mr; sc->GetImageMemoryRequirements(device, sc->images[i].image, &mr);
         VkExportMemoryAllocateInfo expo = { VK_STRUCTURE_TYPE_EXPORT_MEMORY_ALLOCATE_INFO };
         expo.handleTypes = VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT;
@@ -208,24 +215,55 @@ static VkResult wsi_create_swapchain(VkDevice device, const VkSwapchainCreateInf
         ded.pNext = &expo; ded.image = sc->images[i].image;
         VkMemoryAllocateInfo mai = { VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO };
         mai.pNext = &ded; mai.allocationSize = mr.size; mai.memoryTypeIndex = 0;
+        /* The first type the image allows. memoryTypeBits already restricts to types valid for an
+         * exportable LINEAR colour image, and this is the selection the dma-buf probes proved
+         * exportable on the device. (A host-visible preference needs the physical device, which is
+         * not reachable from a VkDevice swapchain create; the vulkaninfo/format dump has the detail.) */
         for (uint32_t t = 0; t < 32; t++) if (mr.memoryTypeBits & (1u << t)) { mai.memoryTypeIndex = t; break; }
         r = sc->AllocateMemory(device, &mai, alloc, &sc->images[i].mem);
-        if (r != VK_SUCCESS) { WSI_LOG("vkAllocateMemory failed %d", r); return r; }
+        if (r != VK_SUCCESS) { WSI_LOG("vkAllocateMemory failed %d", r); goto fail; }
         r = sc->BindImageMemory(device, sc->images[i].image, sc->images[i].mem, 0);
-        if (r != VK_SUCCESS) return r;
+        if (r != VK_SUCCESS) goto fail;
+        /* The real pitch, not width*4: a linear image may be padded, and the wl_buffer must be told
+         * the pitch the driver actually used or the compositor reads the wrong rows. */
+        VkImageSubresourceLayers sl = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 };
+        VkSubresourceLayout layout; memset(&layout, 0, sizeof(layout));
+        if (sc->GetImageSubresourceLayout) sc->GetImageSubresourceLayout(device, sc->images[i].image, &sl, &layout);
+        sc->stride = (uint32_t)(layout.rowPitch > 0 ? layout.rowPitch : (uint32_t)(sc->width * 4));
         VkMemoryGetFdInfoKHR gfi = { VK_STRUCTURE_TYPE_MEMORY_GET_FD_INFO_KHR };
         gfi.memory = sc->images[i].mem; gfi.handleType = VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT;
-        if (sc->GetMemoryFdKHR) sc->GetMemoryFdKHR(device, &gfi, &sc->images[i].fd); else sc->images[i].fd = -1;
+        sc->images[i].fd = -1;
+        if (sc->GetMemoryFdKHR) sc->GetMemoryFdKHR(device, &gfi, &sc->images[i].fd);
+        made = i + 1;
     }
-    WSI_LOG("swapchain: %u images %dx%d fmt %d (fd0=%d)", sc->count, sc->width, sc->height, ci->imageFormat, sc->images[0].fd);
+    WSI_LOG("swapchain: %u images %dx%d stride %u fmt %d (fd0=%d)", sc->count, sc->width, sc->height,
+            sc->stride, ci->imageFormat, sc->images[0].fd);
     *out = (VkSwapchainKHR)sc;
     return VK_SUCCESS;
+fail:
+    /* Destroy what was made, so a failure to build the swapchain does not leak images, memory and fds. */
+    for (uint32_t i = 0; i < made; i++) {
+        if (sc->images[i].fd >= 0) { close(sc->images[i].fd); sc->images[i].fd = -1; }
+        if (sc->images[i].image) sc->DestroyImage(device, sc->images[i].image, alloc);
+        if (sc->images[i].mem) sc->FreeMemory(device, sc->images[i].mem, alloc);
+    }
+    free(sc);
+    return VK_ERROR_INITIALIZATION_FAILED;
 }
 
 static void wsi_destroy_swapchain(VkDevice device, VkSwapchainKHR sw, const VkAllocationCallbacks *alloc) {
-    (void)device; (void)alloc;
     struct wsi_swapchain *sc = (struct wsi_swapchain *)sw;
-    if (sc) free(sc);
+    if (!sc) return;
+    /* The compositor may still hold a wl_buffer on a presented image; drop our reference without
+     * waiting, then release everything we own. fds, images and memory are closed/destroyed so a
+     * swapchain teardown does not leak one per resize. */
+    for (uint32_t i = 0; i < sc->count; i++) {
+        if (sc->images[i].buffer) { wl_buffer_destroy(sc->images[i].buffer); sc->images[i].buffer = NULL; }
+        if (sc->images[i].fd >= 0) { close(sc->images[i].fd); sc->images[i].fd = -1; }
+        if (sc->images[i].image && sc->DestroyImage) sc->DestroyImage(device, sc->images[i].image, alloc);
+        if (sc->images[i].mem && sc->FreeMemory) sc->FreeMemory(device, sc->images[i].mem, alloc);
+    }
+    free(sc);
 }
 
 static VkResult wsi_get_swapchain_images(VkDevice device, VkSwapchainKHR sw, uint32_t *count, VkImage *images) {
@@ -254,12 +292,14 @@ static VkResult wsi_queue_present(VkQueue queue, const VkPresentInfoKHR *pi) {
     for (uint32_t i = 0; i < pi->swapchainCount; i++) {
         struct wsi_swapchain *sc = (struct wsi_swapchain *)pi->pSwapchains[i];
         uint32_t idx = pi->pImageIndices[i];
+        if (!sc || idx >= sc->count) { if (pi->pResults) pi->pResults[i] = VK_ERROR_SURFACE_LOST_KHR; continue; }
         struct wsi_surface *surf = sc->surface;
-        WSI_LOG("present: sc=%p surf=%p dmabuf=%p idx=%u fd=%d", (void *)sc, (void *)surf,
-                surf ? (void *)surf->dmabuf : NULL, idx, sc->images[idx].fd);
         if (!surf->dmabuf || sc->images[idx].fd < 0) { if (pi->pResults) pi->pResults[i] = VK_ERROR_SURFACE_LOST_KHR; continue; }
+        /* A buffer for this image that the compositor has not released yet: drop our reference
+         * (destroying it also frees the binding the release listener would have) so the slot is ours. */
+        if (sc->images[idx].buffer) { wl_buffer_destroy(sc->images[idx].buffer); sc->images[idx].buffer = NULL; }
         struct zwp_linux_buffer_params_v1 *params = zwp_linux_dmabuf_v1_create_params(surf->dmabuf);
-        zwp_linux_buffer_params_v1_add(params, sc->images[idx].fd, 0, 0, sc->width * 4, 0, 0);
+        zwp_linux_buffer_params_v1_add(params, sc->images[idx].fd, 0, 0, sc->stride, 0, 0);
         struct wl_buffer *buf = zwp_linux_buffer_params_v1_create_immed(params, sc->width, sc->height, sc->drm_format, 0 /* LINEAR modifier */);
         zwp_linux_buffer_params_v1_destroy(params);
         if (!buf) { if (pi->pResults) pi->pResults[i] = VK_ERROR_OUT_OF_HOST_MEMORY; continue; }
@@ -270,8 +310,8 @@ static VkResult wsi_queue_present(VkQueue queue, const VkPresentInfoKHR *pi) {
         wl_surface_damage_buffer(surf->surface, 0, 0, sc->width, sc->height);
         wl_surface_commit(surf->surface);
         wl_display_flush(surf->display);
+        if (pi->pResults) pi->pResults[i] = VK_SUCCESS;
     }
-    if (pi->pResults) for (uint32_t i = 0; i < pi->swapchainCount; i++) if (pi->pResults[i] == VK_SUCCESS) pi->pResults[i] = VK_SUCCESS;
     return VK_SUCCESS;
 }
 

@@ -271,26 +271,32 @@ typedef struct {
 } InstanceCreateInfo;
 static VkResult icd_create_instance(const void *ci, const void *alloc, VkInstance *out) {
     if (!g_gipa && icd_load() != 0) return VK_ERROR_INITIALIZATION_FAILED;
-    const InstanceCreateInfo *in = (const InstanceCreateInfo *)ci;
     VkResult (*hal_create)(const void *, const void *, VkInstance *) =
         (VkResult (*)(const void *, const void *, VkInstance *))g_gipa(NULL, "vkCreateInstance");
+    if (!hal_create) return VK_ERROR_INITIALIZATION_FAILED;
+    const InstanceCreateInfo *in = (const InstanceCreateInfo *)ci;
     uint32_t n = in->enabledExtensionCount;
     const char *const *names = in->ppEnabledExtensionNames;
+    VkInstance created = NULL;   /* only published once the HAL returned success */
+    VkResult r;
     if (n == 0) {
-        VkResult r = hal_create(ci, alloc, &g_instance);
-        if (out) *out = g_instance;
-        return r;
+        r = hal_create(ci, alloc, &created);
+    } else {
+        const char **kept = (const char **)malloc(sizeof(char *) * n);
+        uint32_t kn = 0;
+        for (uint32_t i = 0; i < n; i++) if (!icd_is_our_extension(names[i])) kept[kn++] = names[i];
+        InstanceCreateInfo copy = *in;
+        copy.enabledExtensionCount = kn;
+        copy.ppEnabledExtensionNames = kept;
+        r = hal_create(&copy, alloc, &created);
+        free(kept);
     }
-    const char **kept = (const char **)malloc(sizeof(char *) * n);
-    uint32_t kn = 0;
-    for (uint32_t i = 0; i < n; i++) if (!icd_is_our_extension(names[i])) kept[kn++] = names[i];
-    InstanceCreateInfo copy = *in;
-    copy.enabledExtensionCount = kn;
-    copy.ppEnabledExtensionNames = kept;
-    VkResult r = hal_create(&copy, alloc, &g_instance);
-    free(kept);
-    if (out) *out = g_instance;
-    return r;
+    if (r != VK_SUCCESS) return r;
+    /* g_instance is the handle device procs are resolved against; a failed create must not leave a
+     * stale one, and *out must not be handed a garbage handle. */
+    g_instance = created;
+    if (out) *out = created;
+    return VK_SUCCESS;
 }
 
 __attribute__((visibility("default")))

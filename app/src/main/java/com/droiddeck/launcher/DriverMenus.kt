@@ -73,9 +73,11 @@ internal class DriverMenus(private val activity: Activity, private val ui: Handl
 
     fun refreshDrivers() {
         val lm = LinuxVulkanDriverManager(activity)
-        // On a GPU the runtime has no glibc driver for (a PowerVR/Tensor G5), install the shim the
-        // apk carries, so it is listed and selectable - and so a session has something to draw with.
-        LinuxVulkanDriverManager.bundledIdFor(gpu)?.let { lm.installBundled(it) }
+        // On a GPU the runtime has no glibc driver for (a PowerVR/Tensor G5), install the shim the apk
+        // carries so it is listed and selectable. Off the UI thread: this unpacks ~12 MB, and
+        // refreshDrivers is called from openComponents() on the main thread - unpacking there janks
+        // (or ANRs) the first open of the panel. installBundled is idempotent, so a repeat is cheap.
+        LinuxVulkanDriverManager.bundledIdFor(gpu)?.let { id -> Thread { lm.installBundled(id) }.start() }
         fun origin(id: String) = if (TurnipReleases.isDownloaded(activity, id)) DriverRow.DOWNLOADED else DriverRow.IMPORTED
         val bundles = DriverBundle.all(activity)
         fun bundleRow(id: String, linux: Boolean) = bundles.firstOrNull { (if (linux) it.linuxId else it.androidId) == id }?.let {

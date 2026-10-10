@@ -245,6 +245,15 @@ public final class LinuxRuntime {
         bind(cmd, "/dev");
         bind(cmd, "/proc");
         bind(cmd, "/sys");
+        // A PowerVR guest draws with the vendor's bionic Vulkan HAL, which the shim ICD opens at its
+        // Android path (/vendor/lib64/hw/vulkan.powervr.so and its deps). Those trees are not in the
+        // rootfs, so without them the ICD finds no device. Bound only on a PowerVR: an Adreno or Mali
+        // session uses the runtime's own glibc driver and needs none of this.
+        if (GpuInfo.detect().getFamily().getVendor() == GpuInfo.Vendor.POWERVR) {
+            for (String tree : new String[] { "/vendor", "/system", "/apex" }) {
+                if (new File(tree).isDirectory()) bind(cmd, tree);
+            }
+        }
         bind(cmd, "/dev/urandom:/dev/random");
         bind(cmd, "/proc/self/fd:/dev/fd");
         bind(cmd, "/proc/self/fd/0:/dev/stdin");

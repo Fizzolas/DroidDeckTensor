@@ -126,16 +126,19 @@ int main(void) {
     printf("features: robustBufferAccess=%u textureCompressionETC2=%u textureCompressionASTC_LDR=%u textureCompressionBC=%u\n",
            feat.f[0] & 1, (feat.f[0] >> 20) & 1, (feat.f[0] >> 21) & 1, (feat.f[0] >> 22) & 1);
 
+    /* Values from vulkan_core.h. VK_FORMAT_BC1_RGBA.. is 133, not 131 (BC1_RGB); ETC2 alpha is 151,
+     * not 147 (the no-alpha variant). The "SAMPLED" verdict tests the SAMPLED_IMAGE feature bit
+     * (0x1) — the thing DXVK/D3D needs — not merely "some feature is set". */
     struct { const char *name; int fmt; } fmts[] = {
-        { "BC1_RGBA_UNORM", 131 }, { "BC2_UNORM", 135 }, { "BC3_UNORM", 137 }, { "BC7_UNORM", 145 },
-        { "ETC2_R8G8B8A8_UNORM", 147 }, { "ASTC_4x4_UNORM", 157 }, { "R8G8B8A8_UNORM", 37 },
+        { "BC1_RGB_UNORM", 131 }, { "BC1_RGBA_UNORM", 133 }, { "BC2_UNORM", 135 }, { "BC3_UNORM", 137 },
+        { "BC7_UNORM", 145 }, { "ETC2_R8G8B8A8_UNORM", 151 }, { "ASTC_4x4_UNORM", 157 }, { "R8G8B8A8_UNORM", 37 },
     };
     for (unsigned i = 0; i < sizeof(fmts) / sizeof(*fmts); i++) {
         VkFormatProperties fp; memset(&fp, 0, sizeof(fp));
         if (getFmtProps) getFmtProps(pd, fmts[i].fmt, &fp);
         printf("  fmt %-22s linear=0x%08x optimal=0x%08x buffer=0x%08x%s\n", fmts[i].name,
                fp.linearTilingFeatures, fp.optimalTilingFeatures, fp.bufferFeatures,
-               fp.optimalTilingFeatures ? "  <-- SAMPLED" : "");
+               (fp.optimalTilingFeatures & 0x1u) ? "  <-- SAMPLED_IMAGE" : "");
     }
 
     /* The extensions DroidDeck's compositor and DXVK need, straight from the HAL. */
