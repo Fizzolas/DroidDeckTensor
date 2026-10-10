@@ -1,3 +1,4 @@
+#define _GNU_SOURCE 1
 /*
  * pvr_icd.c — a glibc Vulkan ICD that drives the bionic PowerVR Vulkan HAL through libhybris.
  *
@@ -62,6 +63,26 @@ static void icd_log(const char *m) { fprintf(stderr, "pvr_icd: %s\n", m); }
 /* The Wayland WSI this ICD carries (the HAL only does Android surfaces). */
 extern void *pvr_wsi_proc(const char *name);
 static int icd_load(void);   /* defined below; used by pvr_icd_resolve */
+
+/* Self-configuration: the guest session runs with a clean environment (env -i), so this ICD points
+ * the libhybris layer at its own directory (found from this object's path) if the caller has not. */
+__attribute__((constructor)) static void pvr_icd_ctor(void) {
+    Dl_info info;
+    static char dir[4096], linker[4096];
+    if (!getenv("HYBRIS_LD_LIBRARY_PATH"))
+        setenv("HYBRIS_LD_LIBRARY_PATH",
+               "/system/lib64:/vendor/lib64:/system/lib64/hw:/vendor/lib64/hw", 1);
+    if (!getenv("HYBRIS_LINKER_DIR") && dladdr((void *)pvr_icd_ctor, &info) && info.dli_fname) {
+        snprintf(dir, sizeof(dir), "%s", info.dli_fname);
+        char *slash = strrchr(dir, '/');
+        if (slash) {
+            *slash = 0;
+            snprintf(linker, sizeof(linker), "%s", dir);
+            setenv("HYBRIS_LINKER_DIR", linker, 1);
+            fprintf(stderr, "pvr_icd: HYBRIS_LINKER_DIR=%s\n", linker);
+        }
+    }
+}
 
 /* Resolve a dynamic Vulkan entrypoint through the HAL. The WSI (its own translation unit) uses this
  * instead of referencing the global vkGetDeviceProcAddr, which an ICD must not have undefined. */
@@ -275,7 +296,7 @@ static VkResult icd_create_instance(const void *ci, const void *alloc, VkInstanc
 __attribute__((visibility("default")))
 int vk_icdNegotiateLoaderICDInterfaceVersion(uint32_t *version) {
     /* We implement up to loader interface 5; the loader caps to what we report. */
-    if (version && *version > 3) *version = 3;
+    if (version && *version > 5) *version = 5;
     icd_load();
     return VK_SUCCESS;
 }

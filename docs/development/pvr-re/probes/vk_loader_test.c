@@ -15,12 +15,28 @@
 #include <execinfo.h>
 #include <dlfcn.h>
 
-static void on_alarm(int sig) {
-    (void)sig;
-    void *bt[64];
-    int n = backtrace(bt, 64);
-    write(2, "\n*** vkCreateDevice hang - main-thread backtrace ***\n", 53);
-    backtrace_symbols_fd(bt, n, 2);
+#include <ucontext.h>
+/* Print the interrupted PC and which DSO mapping it lands in (no unwinding: safe here). */
+static void on_alarm(int sig, siginfo_t *si, void *uc) {
+    (void)sig; (void)si;
+    ucontext_t *u = (ucontext_t *)uc;
+    uintptr_t pc = (uintptr_t)u->uc_mcontext.pc;
+    uintptr_t lr = (uintptr_t)u->uc_mcontext.regs[30], sp = (uintptr_t)u->uc_mcontext.sp;
+    char b[512];
+    int n = snprintf(b, sizeof(b), "\n*** HANG main: pc=%p lr=%p sp=%p\n", (void *)pc, (void *)lr, (void *)sp);
+    write(2, b, n);
+    /* find the mapping containing pc */
+    FILE *m = fopen("/proc/self/maps", "r");
+    if (m) {
+        char line[512];
+        while (fgets(line, sizeof(line), m)) {
+            unsigned long a, z;
+            if (sscanf(line, "%lx-%lx", &a, &z) == 2 && pc >= a && pc < z) {
+                n = snprintf(b, sizeof(b), "*** PC in: %s", line); write(2, b, n); break;
+            }
+        }
+        fclose(m);
+    }
     _exit(124);
 }
 
@@ -85,7 +101,9 @@ int main(void) {
             memset(&dci, 0, sizeof(dci)); dci.sType = 3; dci.qfc = 1; dci.pqci = &qci;
             VkResult (*createDevice)(VkPhysicalDevice, const void *, const void *, void **) = (void *)gipa(inst, "vkCreateDevice");
             void *dev = NULL;
-            signal(SIGALRM, on_alarm); alarm(25);
+            struct sigaction sa; memset(&sa, 0, sizeof(sa));
+            sa.sa_sigaction = on_alarm; sa.sa_flags = SA_SIGINFO;
+            sigaction(SIGALRM, &sa, NULL); alarm(25);
             VkResult dr = createDevice ? createDevice(pd, &dci, NULL, &dev) : -1;
             alarm(0);
             printf("vkCreateDevice(graphics family %d) -> %d device=%p\n", graphics, dr, dev);
