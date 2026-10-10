@@ -191,3 +191,28 @@ vendor / library / GPU node / driver name follow the device's stack instead of a
 Still absent, by design until a driver exists: any bundled PowerVR driver, any PowerVR guest ICD, and
 the real compositor present path for this device. `README.md` should keep saying PowerVR is not yet
 supported until §4's path yields a working driver.
+
+---
+
+## 7. The built APK, on the device (2026-10-10)
+
+Verified on the attached Pixel 10 Pro XL (Android 17), not just in a harness:
+
+* The app assembles and installs, and reports the device as
+  **"PowerVR D-Series: experimental: PowerVR support is new and untested"** (amber, not refused) —
+  the detection, family name and wording from the app work land correctly on hardware.
+* Opening the Components page installs the bundled guest driver the apk carries
+  (`assets/linux_driver/powervr-g5x.tzst`) into `files/linux_vulkan_drivers/powervr-g5x/`: the ICD,
+  `libhybris.so`, `q.so`, `libwayland-client.so.0`, `libffi.so.8`, plus a generated `icd.json`
+  (absolute `library_path`, api 1.4.0) and `meta.json` (name "PowerVR (Tensor G5)", 1.4.317).
+  That manifest is exactly what a session hands the guest as `BL_VK_DRIVER`, which the session
+  script exports as `VK_DRIVER_FILES`/`VK_ICD_FILENAMES` — so a PowerVR session now points the
+  guest's Vulkan loader at this ICD.
+
+**Found while doing it, not fixed:** Android 17 shows the app a *16 KB page-alignment* warning —
+several bundled native libraries (`libwayland-server.so`, `libdeviceinfo.so`, `libpulse*.so`,
+`libltdl.so`, `libsndfile.so`, `libc++_shared.so`, …) are not 16 KB-aligned. The app targets SDK 28
+(deliberately, so it may `exec` a rootfs from its data dir), so this is a warning rather than a
+blocker today, but a future Play requirement and a real fix: link the NDK targets with
+`-Wl,-z,max-page-size=16384` and rebuild the prebuilt libraries. It is unrelated to PowerVR and
+affects the app as a whole.
