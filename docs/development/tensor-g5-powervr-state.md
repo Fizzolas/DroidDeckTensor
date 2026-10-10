@@ -97,13 +97,14 @@ So a session today gets a system-Vulkan compositor and a guest with **no Vulkan 
 
 ## 4. The path, ranked
 
-1. **libhybris-style bionic-in-glibc shim (recommended).** A glibc `libvulkan_powervr.so` that
-   `android_dlopen_ext`s the vendor HAL (and `libsrv_um`/`libusc`), drives it through `HMI`/`open("vk0")`
-   exactly as `pvr_hal_probe.c` does, and translates the Android bits the vendor stack touches:
-   gralloc/AHB → dma-buf, `/dev/pvr_sync` fences, and a WSI for the guest's Wayland/X11. This reuses a
-   shipping, working driver. Effort: months. Biggest risk: the proprietary
-   `libcustomer_gralloc_ddk_api.so` (binder-based), and `libsrv_um`'s debug-bridge (`PVRSRVDebugPrintf`)
-   under a foreign libc.
+1. **libhybris-style bionic-in-glibc shim (recommended — the load half is DONE).** A glibc
+   `libvulkan_powervr.so` that `android_dlopen_ext`s the vendor HAL (and `libsrv_um`/`libusc`), drives
+   it through `HMI`/`open("vk0")` exactly as `pvr_hal_probe.c` does, and translates the Android bits the
+   vendor stack touches: gralloc/AHB → dma-buf, `/dev/pvr_sync` fences, and a WSI for the guest's
+   Wayland/X11. **As of 2026-10-10 the driver-loading half is proven** (see §4a): the bionic HAL loads
+   and enumerates the GPU from a glibc process via libhybris. What remains is the ICD wrapper, the
+   gralloc/dma-buf export, the fence translation and the WSI — real work, but no longer an unknown.
+   Recipe: `pvr-re/hybshim/`.
 2. **bionic producer + dma-buf handoff.** Render guest surfaces on a bionic helper (the app already
    loads drivers via AdrenoTools) and hand dma-bufs to the guest compositor. Solves presentation, not the
    game process's own D3D→Vulkan work, so it does not by itself make a game render.
@@ -128,6 +129,27 @@ glibc aarch64 — and run against the same blob:
 So a bionic driver **cannot simply be dlopen-ed by a glibc process**: path 1 requires a real
 libhybris-style shim that loads bionic libs through an emulated Android linker (or maps their symbols
 onto glibc), not just a `dlopen`. That is the concrete work item, and the concrete risk.
+
+### 4a. And then it was built — the wall is down (2026-10-10)
+
+The libhybris shim was built and run on the device. In a **glibc** process:
+
+```
+android_dlopen_ext(/vendor/lib64/hw/vulkan.powervr.so) ... OK
+HMI: name=PowerVR D-Series Vulkan HAL author=Imagination Technologies
+open(vk0) rc=0
+vkCreateInstance -> 0
+RESULT: SUCCESS - 1 device(s): "PowerVR D-Series DXT-48-1536 MC1" api=1.4.317 vendor=0x1010
+device extensions visible through glibc: 148   (drm_format_modifier, external_memory_fd, ...)
+BC3_UNORM optimalTilingFeatures=0x0000d401  SAMPLED (DXVK DXTn OK)
+```
+
+Three consecutive runs, exit 0. So the bionic vendor driver **does** run under glibc — the trap that
+`pvr_dltest.c` showed is exactly what libhybris's emulated bionic linker (`q.so`) and libc-hook layer
+(`libhybris.so`) resolve. The build uses only `zig` (no Android SDK, no sudo); the recipe and the
+required upstream patches are in `pvr-re/hybshim/`. This reorders the path: option 1 is no longer
+"recommended but unproven" — its load half is proven, and the remaining work is the ICD/WSI/gralloc
+layer, not an unknown.
 
 The other sub-question that decides path 1 — whether the blob's kernel bridge works when the *driver*
 is driven from a foreign libc rather than loaded by one — was **not** settled here: `libsrv_um.so` is
