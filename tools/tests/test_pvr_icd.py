@@ -116,6 +116,34 @@ class DrmPropertiesAreFilledInTest(unittest.TestCase):
         self.assertIn('STYPE_DRM_PROPERTIES_EXT', entry)
 
 
+class PerCallTracingIsOffByDefault(unittest.TestCase):
+    """gamescope probes a DRM modifier once per output format per frame.
+
+    An unconditional fprintf on that path put hundreds of thousands of lines into the guest's
+    session.log and buried the errors that mattered. The fixes stay silent; the trace comes back
+    only when the guest's environment asks for it.
+    """
+
+    def test_the_retry_and_drm_dump_are_gated(self):
+        text = source(PVR_ICD_C)
+        self.assertIn('icd_debug_on', text)
+        for marker in ('DRM-modifier query fmt=', 'physical_device_drm: hasPrimary='):
+            self.assertIn(marker, text)
+        # Each of those prints must sit under the gate, not run on every call.
+        for marker in ('DRM-modifier query fmt=', 'physical_device_drm: hasPrimary='):
+            idx = text.index(marker)
+            preceding = text[max(0, idx - 400):idx]
+            self.assertIn('icd_debug_on()', preceding,
+                          '%r must be inside an icd_debug_on() branch' % marker)
+
+    def test_the_gate_is_driven_by_an_environment_variable(self):
+        text = source(PVR_ICD_C)
+        body = re.search(r'static int icd_debug_on\(.*?\n\}', text, re.S)
+        self.assertIsNotNone(body, 'icd_debug_on not found')
+        self.assertIn('PVR_ICD_DEBUG', body.group(0))
+        self.assertIn('getenv', body.group(0))
+
+
 class AcquireCompletesSemaphoreAndFenceTest(unittest.TestCase):
     """A real renderer acquires with a semaphore and/or a fence and waits on them."""
 

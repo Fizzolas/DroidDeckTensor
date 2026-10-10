@@ -33,7 +33,9 @@ extern void *android_dlopen_ext(const char *filename, int flag, const void *info
 extern void *android_dlsym(void *handle, const char *symbol);
 extern char *android_dlerror(void);
 
-#define RTLD_NOW 2
+#ifndef RTLD_NOW
+#define RTLD_NOW 2   /* bionic's value; the host includes often define their own */
+#endif
 #define VK_SUCCESS 0
 #define VK_ERROR_INITIALIZATION_FAILED (-3)
 #define VK_INCOMPLETE 5
@@ -66,6 +68,16 @@ static const char *const ICD_INSTANCE_EXTENSIONS[] = {
 #define ICD_NUM_INSTANCE_EXTENSIONS 4
 
 static void icd_log(const char *m) { fprintf(stderr, "pvr_icd: %s\n", m); }
+
+/* Per-call tracing, off unless asked for. gamescope probes a DRM modifier once per output format per
+ * frame, so an unconditional line here buried the session log under hundreds of thousands of them and
+ * made the guest's own errors hard to find. The fixes themselves stay silent: a retry that succeeds is
+ * the expected path now, not news. `PVR_ICD_DEBUG=1` in the guest's environment turns it back on. */
+static int icd_debug_on(void) {
+    static int on = -1;
+    if (on < 0) { const char *v = getenv("PVR_ICD_DEBUG"); on = (v && *v && *v != '0'); }
+    return on;
+}
 
 /* The Wayland WSI this ICD carries (the HAL only does Android surfaces). */
 extern void *pvr_wsi_proc(const char *name);
@@ -462,8 +474,9 @@ static VkResult icd_get_phys_dev_img_fmt_props2(void *pd, void *info, void *out)
     retry.flags = i->flags & ~VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT_;
 
     VkResult r2 = hal(pd, &retry, out);
-    fprintf(stderr, "pvr_icd: DRM-modifier query fmt=0x%x usage=0x%x with MUTABLE_FORMAT -> %d; "
-                    "retried without it -> %d\n", i->format, i->usage, r, r2);
+    if (icd_debug_on())
+        fprintf(stderr, "pvr_icd: DRM-modifier query fmt=0x%x usage=0x%x with MUTABLE_FORMAT -> %d; "
+                        "retried without it -> %d\n", i->format, i->usage, r, r2);
     return (r2 == VK_SUCCESS) ? r2 : r;   /* still unsupported: keep the original answer */
 }
 
@@ -483,8 +496,9 @@ static void icd_get_phys_dev_props2(void *pd, void *props2) {
         d->primaryMajor = pmaj; d->primaryMinor = pmin;
         d->hasRender = 1;
         d->renderMajor = rmaj; d->renderMinor = rmin;
-        fprintf(stderr, "pvr_icd: physical_device_drm: hasPrimary=%d primary=%lld:%lld render=%lld:%lld\n",
-                has_primary, (long long)pmaj, (long long)pmin, (long long)rmaj, (long long)rmin);
+        if (icd_debug_on())
+            fprintf(stderr, "pvr_icd: physical_device_drm: hasPrimary=%d primary=%lld:%lld render=%lld:%lld\n",
+                    has_primary, (long long)pmaj, (long long)pmin, (long long)rmaj, (long long)rmin);
     }
 }
 

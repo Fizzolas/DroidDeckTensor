@@ -492,3 +492,76 @@ refused; this trampoline is):
 ```
 adb shell 'am start -n com.droiddeck.launcher/.agent.AgentStartActivity --es request eyJtb2RlIjoic3RlYW0ifQ=='
 ```
+
+## 12. Chasing the client's signal 11: what holds, and what does not (2026-10-10)
+
+§11 left the client's crash unexplained, and said the next step was a backtrace. There is no `gdb`,
+`strace` or core file in the guest, so a small `LD_PRELOAD` catcher was written instead: it catches the
+fatal signal in-process and writes the registers, a stack scan and `/proc/self/maps`. **Its results are
+recorded here with their caveats, because the catcher turned out to be able to cause the very fault it
+was measuring.**
+
+**What holds.**
+
+* **The crash reproduces 4/4** on the same build: sessions 44, 45, 47 and 60 all end
+  `== steam exited rc=139`, always after the client makes its own 1x1 X11 surface (`xid 0x1200002`).
+  Session 60 was a plain Steam session armed only by an `ld.so.preload` line, so this is not an
+  artifact of how the session was started.
+* **The faulting process in the shimmed run was `steamsysinfo`**, by `/proc/self/comm` and by the
+  `argv0` the report recorded:
+  `/root/.local/share/Steam/steamrtarm64/steamsysinfo -steamid 0 -buildid 1791592380 -query 1
+  -out-file /tmp/steamHCIgnk`. That is Steam's own GPU-topology probe — the same one that answers
+  `PowerVR D-Series DXT-48-1536 MC1` through the ICD when it works. The client spawns it during UI
+  bring-up, so a helper dying here is on the path to the UI coming up.
+* **The fault was an instruction fetch, not a load.** `pc == si_addr`, `si_addr` in no mapping, and
+  `x17` (AArch64's PLT scratch register) holding the same bad address; `lr` was in the device's bionic
+  `/system/lib64/libc++.so`. So a jump went to an unmapped address.
+
+**What does not hold.**
+
+* **The catcher changes the thing it measures.** Preloaded into every descendant, it made
+  `steamsysinfo` die where it otherwise succeeds: in §10-11's sessions `steamsysinfo -query 1` exits 0
+  and prints the GPU topology, and under the catcher it faulted. The cause is the catcher itself —
+  Steam's helpers take faults on purpose and recover, and a `SIGSEGV` handler turns a recovered fault
+  into a kill. The handler is now gated on `comm == "steam"`, and the report names the process so a
+  helper's death is never read as the client's.
+* **Three shimmed runs gave three different answers** (a `libc++`/`steamsysinfo` instruction fetch;
+  then no report at all; then no report at all). A report that cannot be reproduced is not evidence,
+  and none of these are used as the explanation of the client's crash.
+* **The `steam` process itself never produced a report**, even in the run where the catcher was armed
+  through `ld.so.preload` and the client did crash (`rc=139`, session 60). The run-mode sessions were
+  stopped during Steam's `Verifying all executable checksums` — about two minutes of heavy CPU on a
+  fresh client — which is *before* the point where the crash happens, so those runs may never have
+  reached it. Why the preload-armed session 60 produced no report is not known.
+
+**One lead worth keeping, not yet tested.** The `XRRGetOutputInfo() is not available` line appears
+exactly when the client reaches its own window and never in §10's session, which spent its whole life
+downloading the 666 MB first-run update. Whatever asks for RandR output info is on the UI bring-up
+path, and the guest's Xwayland does not answer it. Whether that is what the client then jumps off is
+**not established** — the instruction fetch had `lr` in bionic `libc++`, not in an X library, which
+argues against a direct X callback.
+
+**What would settle it** (in order, cheapest first):
+1. Give a shimmed session **three to four minutes past the client's launch** rather than stopping it
+   during the checksum verify, and read `/tmp/crash.txt` then. The catcher is comm-gated to `steam`
+   now, so a helper's fault can no longer be mistaken for the client's.
+2. `strace -f` around `droiddeck-session` if a static strace can be dropped in the guest — the last
+   syscalls before the fault would place it without needing a symbol.
+3. Install a cross-built `gdb` into the runtime image and attach to the client at the moment of the
+   fault.
+
+## 13. Two things tidied while sifting (2026-10-10)
+
+**The ICD's per-call tracing is off unless asked for.** gamescope probes a DRM modifier once per output
+format per frame, and the one-line `fprintf` on that path put hundreds of thousands of lines into the
+guest's `session.log` — enough to bury the guest's own errors, which is part of why §11's cause took so
+long to see. The retry and the `physical_device_drm` line now print only when `PVR_ICD_DEBUG` is set in
+the guest's environment; the fixes themselves are silent, since a retry that succeeds is the expected
+path now. `RTLD_NOW` is also no longer redefined when the host headers already define it.
+
+**The driver asset is now reproducible.** `app/src/main/assets/linux_driver/powervr-g5x.tzst` is built
+by `docs/development/pvr-re/hybshim/package_asset.py` with a fixed mtime, uid/gid and mode and a fixed
+entry order, so a rebuild from unchanged inputs is byte-identical. The ICD inside the shipped asset
+(`9bcabaf73caf5fc30c5cd38da7de0204ba25b3a1872f0f2298fa5b53975b16b8`) can therefore be compared against
+a fresh `build_icd.sh` output with sha256, which is how the "was the new apk actually shipped" question
+gets answered.
