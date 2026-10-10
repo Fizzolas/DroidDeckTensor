@@ -1,9 +1,19 @@
 /*
- * GEM handle emulation for the KGSL device presented as a DRM render node.
+ * GEM handle emulation for a DRM render node that has no GEM behind it.
  *
- * Compositors and Mesa validate or convert dma-bufs with PRIME ioctls on the render node; KGSL
- * has no GEM. Handles only serve as tokens to these callers, so a table of duplicated dma-buf
- * descriptors stands in for the kernel's, and every other device is left to libdrm.
+ * Compositors and Mesa validate or convert dma-bufs with PRIME ioctls on the render node, and these
+ * devices have no GEM there. Handles only serve as tokens to those callers, so a table of duplicated
+ * dma-buf descriptors stands in for the kernel's, and every other device is left to libdrm.
+ *
+ * Two kernel drivers register such a node, and a session runs on one or the other:
+ *   - KGSL, which is not a DRM node at all and is presented as one at /dev/kgsl-3d0 on an Adreno;
+ *   - the PowerVR kernel driver's render node (pvrsrvkm, OF_COMPATIBLE "img,gpu") on a Tensor G5.
+ * This was keyed to KGSL alone, so on a PowerVR node the guard never matched and the emulation never
+ * ran: Steam's client reaches Xwayland through Mesa Zink, whose DRI3/GBM path asks for a handle per
+ * buffer (drmPrimeFDToHandle <- zink_bo_get_kms_handle <- dri2_query_image <- dri_gbm), and the real
+ * ioctl fails on a driver with no GEM (drm-gem(7): "a driver that does not support gem will return
+ * ENODEV for all these ioctls"). The client then dies bringing its window up, without the X11 display
+ * setup ever getting the token it asked for.
  */
 #define _GNU_SOURCE
 #include <dlfcn.h>
@@ -38,6 +48,11 @@ static uint32_t next_handle = 1;
 static dev_t kgsl_dev;
 static int kgsl_state; /* 0 unknown, 1 known, -1 absent */
 
+/*
+ * KGSL, by its fixed path. Only this is decided by name; every other node is decided by asking it,
+ * which is what covers the PowerVR render node without assuming a node number or a sysfs path (the
+ * guest's /sys is a stand-in the app builds, so a path here would be a guess).
+ */
 static int is_kgsl(int fd) {
   struct stat st;
   pthread_mutex_lock(&lock);
@@ -47,6 +62,16 @@ static int is_kgsl(int fd) {
   }
   pthread_mutex_unlock(&lock);
   return kgsl_state > 0 && fstat(fd, &st) == 0 && S_ISCHR(st.st_mode) && st.st_rdev == kgsl_dev;
+}
+
+/*
+ * Whether the driver said it cannot do this at all, as opposed to refusing this particular request.
+ * drm-gem(7): a driver without GEM answers ENODEV to every GEM ioctl; a node that has one answers
+ * EINVAL for a handle it does not know. Both mean the handle space is not there to use, and both are
+ * safe to stand in for, because a handle is only a token to these callers.
+ */
+static int no_gem_errno(int e) {
+  return e == ENODEV || e == EINVAL || e == ENOTTY || e == EOPNOTSUPP;
 }
 
 static void *real(const char *name) {
@@ -110,9 +135,14 @@ static uint32_t alloc_handle_locked(void) {
 }
 
 int drmPrimeFDToHandle(int fd, int prime_fd, uint32_t *handle) {
+  int (*fn)(int, int, uint32_t *) = (int (*)(int, int, uint32_t *)) real("drmPrimeFDToHandle");
   if (!is_kgsl(fd)) {
-    int (*fn)(int, int, uint32_t *) = (int (*)(int, int, uint32_t *)) real("drmPrimeFDToHandle");
-    return fn ? fn(fd, prime_fd, handle) : -ENOSYS;
+    /* Ask the node first. If it has no GEM it says so for every request, and the handle is only a
+     * token to the caller, so it is answered here instead. */
+    int rc = fn ? fn(fd, prime_fd, handle) : -ENOSYS;
+    if (!fn || !no_gem_errno(errno)) {
+      return rc;
+    }
   }
   int dup_fd = fcntl(prime_fd, F_DUPFD_CLOEXEC, 0);
   if (dup_fd < 0) {
@@ -142,18 +172,25 @@ int drmPrimeFDToHandle(int fd, int prime_fd, uint32_t *handle) {
 }
 
 int drmPrimeHandleToFD(int fd, uint32_t handle, uint32_t flags, int *prime_fd) {
-  if (!is_kgsl(fd)) {
-    int (*fn)(int, uint32_t, uint32_t, int *) = (int (*)(int, uint32_t, uint32_t, int *)) real("drmPrimeHandleToFD");
-    return fn ? fn(fd, handle, flags, prime_fd) : -ENOSYS;
-  }
+  int (*fn)(int, uint32_t, uint32_t, int *) = (int (*)(int, uint32_t, uint32_t, int *)) real("drmPrimeHandleToFD");
   int ret = -EINVAL;
-  pthread_mutex_lock(&lock);
-  int index = find_handle_locked(fd, handle);
-  if (index >= 0) {
-    *prime_fd = fcntl(handle_entries[index].dma_fd, F_DUPFD_CLOEXEC, 0);
-    ret = *prime_fd < 0 ? -errno : 0;
+  int emulated = 1;
+  if (!is_kgsl(fd)) {
+    ret = fn ? fn(fd, handle, flags, prime_fd) : -ENOSYS;
+    /* A handle this table handed out is not one the kernel knows, so a real node answers EINVAL for
+     * it; anything else is the kernel's own answer and is passed straight back. */
+    emulated = !fn || no_gem_errno(errno);
   }
-  pthread_mutex_unlock(&lock);
+  if (emulated) {
+    ret = -EINVAL;
+    pthread_mutex_lock(&lock);
+    int index = find_handle_locked(fd, handle);
+    if (index >= 0) {
+      *prime_fd = fcntl(handle_entries[index].dma_fd, F_DUPFD_CLOEXEC, 0);
+      ret = *prime_fd < 0 ? -errno : 0;
+    }
+    pthread_mutex_unlock(&lock);
+  }
   return ret;
 }
 
@@ -172,9 +209,12 @@ static int release_handle(int fd, uint32_t handle) {
 }
 
 int drmCloseBufferHandle(int fd, uint32_t handle) {
+  int (*fn)(int, uint32_t) = (int (*)(int, uint32_t)) real("drmCloseBufferHandle");
   if (!is_kgsl(fd)) {
-    int (*fn)(int, uint32_t) = (int (*)(int, uint32_t)) real("drmCloseBufferHandle");
-    return fn ? fn(fd, handle) : -ENOSYS;
+    int rc = fn ? fn(fd, handle) : -ENOSYS;
+    if (!fn || !no_gem_errno(errno)) {
+      return rc;
+    }
   }
   return release_handle(fd, handle) ? 0 : -EINVAL;
 }
@@ -190,8 +230,17 @@ int drmCloseBufferHandle(int fd, uint32_t handle) {
  * judder replaying old frames in No Man's Sky on an Adreno 840 even with no handle released.
  */
 __attribute__((visibility("hidden"))) int bl_drm_gem_close(int fd, unsigned long request, void *arg, int *rc) {
-  if (request != GEM_CLOSE || !arg || !is_kgsl(fd)) {
+  if (request != GEM_CLOSE || !arg) {
     return 0;
+  }
+  /* Only an emulated handle is ours to release. A node with a real GEM keeps its own, and one with
+   * none refuses the ioctl (KGSL, by name; a PowerVR node, by the same ENODEV/EINVAL answer as the
+   * PRIME calls above). */
+  if (!is_kgsl(fd)) {
+    int (*fn)(int, unsigned long, void *) = (int (*)(int, unsigned long, void *)) real("ioctl");
+    if (!fn || fn(fd, request, arg) != 0 || !no_gem_errno(errno)) {
+      return 0;
+    }
   }
   if (release_handle(fd, ((struct gem_close *) arg)->handle)) {
     *rc = 0;

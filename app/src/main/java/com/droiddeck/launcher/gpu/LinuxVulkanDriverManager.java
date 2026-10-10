@@ -4,6 +4,7 @@ import android.content.Context;
 import android.net.Uri;
 import android.util.Log;
 
+import com.droiddeck.launcher.BuildConfig;
 import com.droiddeck.launcher.R;
 import com.droiddeck.launcher.core.FileUtils;
 import com.droiddeck.launcher.core.TarZst;
@@ -119,7 +120,14 @@ public class LinuxVulkanDriverManager {
         File dir = getDriverDir(id);
         // A present, merely incomplete package is never trusted (see isInstalled): a half-written
         // icd.json or a missing library is re-extracted rather than offered to a session.
-        if (new File(dir, META_NAME).isFile() && isInstalled(id)) return id;
+        //
+        // A complete one is only trusted when the apk that put it there is the one asking. The
+        // bundled driver IS the shim the sessions run on, so an app update that carries a new build
+        // has to reach an install that already exists - leaving the old one in place is exactly the
+        // "the new apk was not shipped" trap, where the device keeps running a build that is no
+        // longer in the tree being debugged. Nothing re-extracts it otherwise: no session start, and
+        // no panel visit, ever deletes a package that is merely present.
+        if (new File(dir, META_NAME).isFile() && isInstalled(id) && builtByThisApk(id)) return id;
         FileUtils.delete(dir);
         if (!dir.mkdirs()) { Log.e(TAG, "cannot create " + dir); return null; }
         if (!TarZst.extractAsset(context, ASSET_DIR + id + ASSET_SUFFIX, dir)) {
@@ -143,6 +151,8 @@ public class LinuxVulkanDriverManager {
             meta.put("driverVersion", "1.4.317");
             meta.put("libc", "glibc");
             meta.put("bundled", true);
+            // What lets the next apk tell this extract apart from one it should replace (builtByThisApk).
+            meta.put("installedByVersionCode", BuildConfig.VERSION_CODE);
             if (!FileUtils.writeString(new File(dir, META_NAME), meta.toString(2))) return null;
         } catch (org.json.JSONException e) {
             Log.e(TAG, "bundled manifest write failed", e);
@@ -161,6 +171,22 @@ public class LinuxVulkanDriverManager {
     public boolean isInstalled(String id) {
         if (id == null || id.isEmpty() || id.contains("/") || id.contains("..")) return false;
         return libraryName(id) != null && new File(getDriverDir(id), ICD_NAME).isFile();
+    }
+
+    /**
+     * Whether the install in {@code id}'s directory was extracted by the apk now running, rather
+     * than by an earlier one.
+     *
+     * <p>A bundled driver is the shim the sessions run on, so a new apk has to be able to replace it
+     * - and without a stamp there is nothing to compare, since the archive and the extracted tree
+     * carry no version of their own. An install from before the stamp existed reads as "not this
+     * apk" and is re-extracted once, which is the wanted direction: it converges, and it cannot
+     * leave a stale build in place.
+     */
+    private boolean builtByThisApk(String id) {
+        JSONObject meta = readMeta(id);
+        if (meta == null) return false;
+        return meta.optInt("installedByVersionCode", -1) == BuildConfig.VERSION_CODE;
     }
 
     /**
