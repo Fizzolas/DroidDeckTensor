@@ -102,7 +102,7 @@ public final class LinuxRuntime {
 
     /** The Vulkan ICD manifest the rootfs ships for this device's GPU, or null when it has none. */
     public static File vulkanIcd(Context context) {
-        return vulkanIcd(context, GpuInfo.isMali());
+        return vulkanIcd(context, GpuInfo.detect().getFamily().getVendor());
     }
 
     /**
@@ -114,12 +114,24 @@ public final class LinuxRuntime {
      * pretending to have a driver.
      */
     static File vulkanIcd(Context context, boolean mali) {
+        return vulkanIcd(context, mali ? GpuInfo.Vendor.MALI : GpuInfo.Vendor.ADRENO);
+    }
+
+    /**
+     * As above, for the device's own stack. The manifest is picked by vendor - a Turnip manifest on
+     * an Adreno, a PanVK one on a Mali, a PowerVR one on a Tensor G5 - and any manifest is better
+     * than none, so an unrecognised set still resolves to the first. A runtime that ships only
+     * another stack's driver (as every one does until a PowerVR one is built into it) resolves to
+     * that, and the session fails the way it does today rather than silently pretending to have a
+     * driver.
+     */
+    static File vulkanIcd(Context context, GpuInfo.Vendor vendor) {
         File icdDir = new File(rootDir(context), "usr/share/vulkan/icd.d");
         File[] manifests = icdDir.listFiles((dir, name) -> name.endsWith(".json"));
         if (manifests == null) return null;
-        String vendor = runtimeVulkanVendor(mali);
+        String vendorName = runtimeVulkanVendor(vendor);
         for (File manifest : manifests) {
-            if (manifest.getName().toLowerCase(java.util.Locale.ROOT).contains(vendor)) return manifest;
+            if (manifest.getName().toLowerCase(java.util.Locale.ROOT).contains(vendorName)) return manifest;
         }
         return manifests.length > 0 ? manifests[0] : null;
     }
@@ -127,16 +139,30 @@ public final class LinuxRuntime {
     /**
      * What the runtime's own Vulkan driver is called there, and what its ICD manifest is named
      * after, for this device's GPU: Arm's PanVK on a Mali, Mesa's Turnip ({@code freedreno}) on an
-     * Adreno. One owner, because more than one place has to agree on it - the ICD discovery here and
-     * the Flatpak sandbox's GPU plan ({@code BwrapSpawner.gpu}).
+     * Adreno, Imagination's PowerVR on a Tensor G5. One owner, because more than one place has to
+     * agree on it - the ICD discovery here and the Flatpak sandbox's GPU plan ({@code BwrapSpawner.gpu}).
      */
     public static String runtimeVulkanVendor(boolean mali) {
-        return mali ? "panvk" : "freedreno";
+        return runtimeVulkanVendor(mali ? GpuInfo.Vendor.MALI : GpuInfo.Vendor.ADRENO);
+    }
+
+    /** As above, for the device's stack. */
+    public static String runtimeVulkanVendor(GpuInfo.Vendor vendor) {
+        switch (vendor) {
+            case MALI: return "panvk";
+            case POWERVR: return "powervr";
+            default: return "freedreno";
+        }
     }
 
     /** The runtime's own Vulkan library for that vendor, as it is named under {@code usr/lib}. */
     public static String runtimeVulkanLibrary(boolean mali) {
-        return "libvulkan_" + runtimeVulkanVendor(mali) + ".so";
+        return runtimeVulkanLibrary(mali ? GpuInfo.Vendor.MALI : GpuInfo.Vendor.ADRENO);
+    }
+
+    /** As above, for the device's stack. */
+    public static String runtimeVulkanLibrary(GpuInfo.Vendor vendor) {
+        return "libvulkan_" + runtimeVulkanVendor(vendor) + ".so";
     }
 
     /**
@@ -311,14 +337,22 @@ public final class LinuxRuntime {
      * An app process may not open {@code /dev/dri} - the nodes exist but are labelled
      * {@code graphics_device}, which stock policy grants surfaceflinger and not us - yet libdrm and
      * everything built on it identify a GPU by its render node, and gamescope refuses to offer
-     * linux-dmabuf without one. The KGSL device Turnip actually drives ({@code gpu_device}, which we
-     * may open) stands in: it appears as a render node with the sysfs entries libdrm reads, and our
-     * Turnip build reports the same device numbers for it.
+     * linux-dmabuf without one. The GPU device the session may actually open stands in: KGSL's
+     * {@code /dev/kgsl-3d0} on an Adreno, or the DRM render node the PowerVR kernel driver registers
+     * on a Tensor G5. Either appears as a render node with the sysfs entries libdrm reads, and the
+     * driver reports the same device numbers for it.
      */
     private static void bindGpuNode(Context context, List<String> cmd) {
+        // The node the device's own GPU driver exposes, and how that driver names itself in the
+        // render node's uevent: KGSL's /dev/kgsl-3d0 on an Adreno, the DRM render node the PowerVR
+        // kernel driver (pvrsrvkm) registers on a Tensor G5.
+        boolean powervr = GpuInfo.detect().getFamily().getVendor() == GpuInfo.Vendor.POWERVR;
+        String gpuNode = powervr ? GpuInfo.POWERVR_RENDER_NODE : KGSL_DEVICE;
+        String driverName = powervr ? GpuInfo.POWERVR_DRIVER_NAME : GpuInfo.KGSL_NAME;
+        String driverDir = powervr ? GpuInfo.POWERVR_DRIVER_NAME : "msm_drm";
         StructStat st;
         try {
-            st = Os.stat(KGSL_DEVICE);
+            st = Os.stat(gpuNode);
         } catch (ErrnoException e) {
             return;
         }
@@ -338,7 +372,7 @@ public final class LinuxRuntime {
             Files.write(new File(drm, "dev").toPath(),
                     (major + ":" + minor + "\n").getBytes(StandardCharsets.UTF_8));
             Files.write(new File(device, "uevent").toPath(),
-                    ("DRIVER=" + GpuInfo.KGSL_NAME + "\nMODALIAS=platform:" + GpuInfo.KGSL_NAME + "\n").getBytes(StandardCharsets.UTF_8));
+                    ("DRIVER=" + driverName + "\nMODALIAS=platform:" + driverName + "\n").getBytes(StandardCharsets.UTF_8));
             File subsystem = new File(device, "subsystem");
             if (!Files.isSymbolicLink(subsystem.toPath())) {
                 Os.symlink("/sys/bus/platform", subsystem.getPath());
@@ -347,14 +381,14 @@ public final class LinuxRuntime {
             // on a mainline kernel, and the driver it reads the load of (bindAdrenoStats).
             File driver = new File(device, "driver");
             if (!Files.isSymbolicLink(driver.toPath())) {
-                Os.symlink("/sys/bus/platform/drivers/msm_drm", driver.getPath());
+                Os.symlink("/sys/bus/platform/drivers/" + driverDir, driver.getPath());
             }
         } catch (IOException | ErrnoException e) {
             return;
         }
         bind(cmd, new File(base, "sys").getPath() + ":/sys/dev/char");
         bind(cmd, dri.getPath() + ":/dev/dri");
-        bind(cmd, KGSL_DEVICE + ":/dev/dri/" + node);
+        bind(cmd, gpuNode + ":/dev/dri/" + node);
         bindDrmClass(base, cmd, node, major + ":" + minor);
     }
 

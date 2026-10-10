@@ -52,10 +52,22 @@ class GpuVendorTest {
 
     @Test
     fun aPhoneThatLooksLikeBothIsAnAdreno() {
-        assertEquals(Vendor.ADRENO, GpuInfo.vendorOf(adreno = true, mali = true))
-        assertEquals(Vendor.ADRENO, GpuInfo.vendorOf(adreno = true, mali = false))
-        assertEquals(Vendor.MALI, GpuInfo.vendorOf(adreno = false, mali = true))
-        assertEquals(Vendor.OTHER, GpuInfo.vendorOf(adreno = false, mali = false))
+        assertEquals(Vendor.ADRENO, GpuInfo.vendorOf(adreno = true, mali = true, powervr = true))
+        assertEquals(Vendor.ADRENO, GpuInfo.vendorOf(adreno = true, mali = false, powervr = false))
+        // Adreno wins a phone that also reports kbase or a PowerVR HAL; kbase wins over PowerVR.
+        assertEquals(Vendor.MALI, GpuInfo.vendorOf(adreno = false, mali = true, powervr = true))
+        assertEquals(Vendor.POWERVR, GpuInfo.vendorOf(adreno = false, mali = false, powervr = true))
+        assertEquals(Vendor.OTHER, GpuInfo.vendorOf(adreno = false, mali = false, powervr = false))
+    }
+
+    @Test
+    fun aTensorG5IsAPowerVrNamedAsSuch() {
+        // The GPU's own name wins, and the platform code name confirms it ("laguna" is mustang/G5).
+        assertEquals(Family.POWERVR_GXX, GpuInfo.TENSOR_PLATFORMS["laguna"]?.family)
+        assertEquals("Tensor G5", GpuInfo.TENSOR_PLATFORMS["laguna"]?.chip)
+        assertTrue(GpuInfo.isPowerVR(vulkanDriver = node(true, file = true), pvrSyncClass = node(false)))
+        assertTrue(GpuInfo.isPowerVR(vulkanDriver = node(false), pvrSyncClass = node(true)))
+        assertFalse(GpuInfo.isPowerVR(vulkanDriver = node(false), pvrSyncClass = node(false)))
     }
 
     @Test
@@ -66,6 +78,7 @@ class GpuVendorTest {
         for (family in listOf(Family.MALI_G715, Family.MALI_G78, Family.MALI_UNKNOWN)) {
             assertEquals(family.name, Vendor.MALI, family.vendor)
         }
+        assertEquals(Vendor.POWERVR, Family.POWERVR_GXX.vendor)
         assertEquals(Vendor.OTHER, Family.NOT_ADRENO.vendor)
     }
 

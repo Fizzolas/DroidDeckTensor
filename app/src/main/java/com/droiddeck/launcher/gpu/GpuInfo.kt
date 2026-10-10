@@ -49,8 +49,8 @@ data class GpuInfo(
         MALI_G78("Mali-G78"),
         /** A Mali the device does not name: kbase is there, the generation is not. */
         MALI_UNKNOWN("Mali"),
-        /** Google Tensor G5 (Pixel 10): Imagination's Furian, the GPU that is neither Adreno nor Mali. */
-        POWERVR_GXX("PowerVR G5"),
+        /** Google Tensor G5 (Pixel 10): Imagination's D-Series, the GPU that is neither Adreno nor Mali. */
+        POWERVR_GXX("PowerVR D-Series"),
         NOT_ADRENO("Not an Adreno GPU");
 
         /** Whose driver stack this family belongs to. */
@@ -85,6 +85,7 @@ data class GpuInfo(
         Support.TESTED -> R.string.gpuinfo_supported
         Support.UNTESTED -> when {
             family.vendor == Vendor.MALI -> R.string.gpuinfo_mali_experimental
+            family.vendor == Vendor.POWERVR -> R.string.gpuinfo_powervr_experimental
             family == Family.A7XX_LOW -> R.string.gpuinfo_experimental
             else -> R.string.gpuinfo_below_tested
         }
@@ -95,7 +96,8 @@ data class GpuInfo(
      * [supportText] in English, for the device report and the device info. A Mali's line is the
      * resource's own English; an Adreno's keeps the wording those reports have always carried.
      */
-    fun supportTextInEnglish(context: Context): String = if (family.vendor == Vendor.MALI) {
+    fun supportTextInEnglish(context: Context): String =
+        if (family.vendor == Vendor.MALI || family.vendor == Vendor.POWERVR) {
         supportText(context.createConfigurationContext(Configuration(context.resources.configuration).apply { locale = Locale.ENGLISH }))
     } else when (support) {
         Support.TESTED -> "Supported"
@@ -129,10 +131,12 @@ data class GpuInfo(
         private const val MALI_VULKAN_DRIVER = "/vendor/lib64/hw/vulkan.mali.so"
         /** Imagination's Vulkan HAL, at the path the PowerVR blob ships it. */
         private const val POWERVR_VULKAN_DRIVER = "/vendor/lib64/hw/vulkan.powervr.so"
-        /** Where a PowerVR driver registers itself (PVRSync / pvr_sync device class). */
-        private const val POWERVR_CLASS = "/sys/class/pvr_sync"
-        /** The PowerVR kernel interface path. */
-        private const val POWERVR_NODE = "/dev/pvrsrvkm"
+        /** Where a PowerVR driver registers itself: PVRSync's misc device class. */
+        private const val POWERVR_CLASS = "/sys/class/misc/pvr_sync"
+        /** The kernel driver a Tensor G5's GPU runs on, as its render node's {@code uevent} names it. */
+        const val POWERVR_DRIVER_NAME = "pvrsrvkm"
+        /** The render node that driver exposes - the node a PowerVR driver opens. */
+        const val POWERVR_RENDER_NODE = "/dev/dri/renderD128"
 
         /**
          * Adreno is recognised by what only Qualcomm's stack has: the KGSL node, or the vendor's own
@@ -162,7 +166,7 @@ data class GpuInfo(
         ): Boolean = kbaseDevice.exists() || kbaseClass.exists() || vulkanDriver.exists()
 
         /**
-         * PowerVR is recognised by its Vulkan HAL or the PVRSync device. A Google Tensor phone
+         * PowerVR is recognised by its Vulkan HAL or its PVRSync device class. A Google Tensor phone
          * has neither KGSL nor a Mali HAL, so on one of those this is what tells PowerVR from
          * "a GPU we cannot name".
          */
@@ -170,8 +174,8 @@ data class GpuInfo(
         @JvmOverloads
         fun isPowerVR(
             vulkanDriver: File = File(POWERVR_VULKAN_DRIVER),
-            pvrsrvkmClass: File = File(POWERVR_CLASS),
-        ): Boolean = vulkanDriver.exists() || pvrsrvkmClass.exists()
+            pvrSyncClass: File = File(POWERVR_CLASS),
+        ): Boolean = vulkanDriver.exists() || pvrSyncClass.exists()
 
         /** The vendor of a GPU, from what was actually found. Adreno wins a phone that reports both. */
         internal fun vendorOf(adreno: Boolean, mali: Boolean, powervr: Boolean): Vendor = when {
@@ -248,14 +252,16 @@ data class GpuInfo(
         internal class Tensor(val chip: String, val family: Family)
 
         /**
-         * Google's Tensor platforms, the one table that names them. Tensor G5 is deliberately absent (it is an
-         * Imagination PowerVR, not a Mali).
+         * Google's Tensor platforms, the one table that names them. Tensor G5 is here too: its GPU is
+         * an Imagination PowerVR rather than an Arm Mali, and the table carries the family so the
+         * naming and the vendor agree.
          */
         internal val TENSOR_PLATFORMS = mapOf(
             "gs101" to Tensor("Tensor G1", Family.MALI_G78),
             "gs201" to Tensor("Tensor G2", Family.MALI_G78),
             "zuma" to Tensor("Tensor G3", Family.MALI_G715),
             "zumapro" to Tensor("Tensor G4", Family.MALI_G715),
+            "laguna" to Tensor("Tensor G5", Family.POWERVR_GXX),
         )
 
         /**

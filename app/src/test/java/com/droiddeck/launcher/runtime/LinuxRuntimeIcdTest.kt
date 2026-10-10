@@ -58,6 +58,12 @@ class LinuxRuntimeIcdTest {
         assertNull(LinuxRuntime.vulkanIcd(context, false))
     }
 
+    @Test fun theManifestChosenForAPowerVrIsItsOwnStacks() {
+        manifests("freedreno_icd.aarch64.json", "panvk_icd.aarch64.json", "powervr_icd.aarch64.json")
+        assertEquals("powervr_icd.aarch64.json",
+            LinuxRuntime.vulkanIcd(context, com.droiddeck.launcher.gpu.GpuInfo.Vendor.POWERVR)?.name)
+    }
+
     @Test fun theRuntimesOwnDriverIsNamedForTheVendor() {
         // One owner for the names three places agree on: the ICD discovery, the Flatpak GPU plan and
         // the library the sandbox binds.
@@ -65,5 +71,9 @@ class LinuxRuntimeIcdTest {
         assertEquals("panvk", LinuxRuntime.runtimeVulkanVendor(true))
         assertEquals("libvulkan_freedreno.so", LinuxRuntime.runtimeVulkanLibrary(false))
         assertEquals("libvulkan_panvk.so", LinuxRuntime.runtimeVulkanLibrary(true))
+        // A Tensor G5's PowerVR gets its own name, not a Turnip it could not load.
+        assertEquals("powervr", LinuxRuntime.runtimeVulkanVendor(com.droiddeck.launcher.gpu.GpuInfo.Vendor.POWERVR))
+        assertEquals("libvulkan_powervr.so",
+            LinuxRuntime.runtimeVulkanLibrary(com.droiddeck.launcher.gpu.GpuInfo.Vendor.POWERVR))
     }
 }

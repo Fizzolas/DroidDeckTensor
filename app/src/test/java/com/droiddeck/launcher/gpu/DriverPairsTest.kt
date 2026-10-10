@@ -117,8 +117,11 @@ class DriverPairsTest {
     fun aMaliIsOfferedNoAdrenoPair() {
         val mali = GpuInfo("Mali-G715", 0, Family.MALI_G715, "Tensor G4", false)
         val unknown = GpuInfo("Mali", 0, Family.MALI_UNKNOWN, "", false)
+        // A PowerVR is offered no Turnip pair either: nothing in this list can load on it.
+        val powervr = GpuInfo("PowerVR D-Series", 0, Family.POWERVR_GXX, "Tensor G5", false)
         assertNull(DriverPairs.recommendedKey(mali, emptyList()))
         assertNull(DriverPairs.recommendedKey(unknown, emptyList()))
+        assertNull(DriverPairs.recommendedKey(powervr, emptyList()))
         // The driver page filters its list by suits(), and every pair it lists is a Turnip, so on a
         // Mali it comes up empty rather than offering a driver that could not load.
         val pairs = DriverPairs.from(TurnipReleases.Check(

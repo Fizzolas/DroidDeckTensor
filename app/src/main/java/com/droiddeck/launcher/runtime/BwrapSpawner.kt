@@ -232,13 +232,19 @@ object BwrapSpawner {
     private fun gpu(rootfs: String, root: File, env: MutableMap<String, String>): List<Bind>? {
         val lib = File(rootfs, "usr/lib")
         // The runtime's own driver, and the device node it opens: a Turnip with the KGSL backend on
-        // an Adreno (/dev/kgsl-3d0), Arm's PanVK on a Mali (/dev/mali0). Each is named by its
-        // vendor, and the two are not interchangeable.
-        val mali = GpuInfo.isMali()
-        val library = LinuxRuntime.runtimeVulkanLibrary(mali)
-        val icdName = LinuxRuntime.runtimeVulkanVendor(mali) + "_icd.json"
+        // an Adreno (/dev/kgsl-3d0), Arm's PanVK on a Mali (/dev/mali0), Imagination's PowerVR on a
+        // Tensor G5 (the DRM render node /dev/dri/renderD128). Each is named by its vendor, and the
+        // three are not interchangeable.
+        val vendor = GpuInfo.detect().family.vendor
+        val library = LinuxRuntime.runtimeVulkanLibrary(vendor)
+        val icdName = LinuxRuntime.runtimeVulkanVendor(vendor) + "_icd.json"
         val driver = File(lib, library)
-        if (!driver.isFile || !File(if (mali) GpuInfo.MALI_NODE else GpuInfo.KGSL_NODE).exists()) return null
+        val node = when (vendor) {
+            GpuInfo.Vendor.MALI -> GpuInfo.MALI_NODE
+            GpuInfo.Vendor.POWERVR -> GpuInfo.POWERVR_RENDER_NODE
+            else -> GpuInfo.KGSL_NODE
+        }
+        if (!driver.isFile || !File(node).exists()) return null
         if (env.containsKey("VK_ICD_FILENAMES") || env.containsKey("VK_DRIVER_FILES")) return null
         // A window on the desktop while labwc composites with pixman gets shared-memory buffers
         // only; Zink cannot present there, so such an app keeps Flathub's own Mesa (llvmpipe).

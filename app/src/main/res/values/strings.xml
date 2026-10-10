@@ -1823,6 +1823,7 @@
     <string name="gpuinfo_supported">Supported</string>
     <string name="gpuinfo_experimental">Experimental: its drivers are test builds</string>
     <string name="gpuinfo_mali_experimental">Experimental: Mali support is new and untested</string>
+    <string name="gpuinfo_powervr_experimental">Experimental: PowerVR support is new and untested</string>
     <string name="gpuinfo_below_tested">Below tested hardware (Adreno 725 and newer): it may not run</string>
     <string name="gpuinfo_unsupported">Not supported: DroidDeck needs an Adreno (Snapdragon) GPU</string>
 
