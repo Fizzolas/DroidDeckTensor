@@ -1534,3 +1534,70 @@ and that is what now ships. §35's process-dependence and its next step (log the
 writes the hook table's `func`) stand exactly as written - but they are now answerable, because
 "which build was that?" has an answer. The count of sessions that produced nothing measurable
 (29->45) is the cost this section is meant to stop paying.
+
+## 37. ROOT CAUSE AND FIX: libhybris.so is unloaded and reloaded, orphaning the HAL's PLT
+## (2026-10-11)
+
+§31-35 were all reading the same symptom from one process and calling it a wrong base. The build
+identity fix (§36) made the instrument trustworthy, and one same-pid measurement then settled it.
+**The address is not wrong - it is right, and then the library it points into is unmapped.**
+
+**The measurement.** Instrumenting `hookret_log` to also dump `/proc/self/maps` at the first
+resolution, in the faulting process (pid 23265), and comparing with the crash report's maps, same
+pid:
+
+```
+AT HOOK RESOLUTION   libhybris.so @ 7628820000   icd @ 76288b0000
+                     &_hybris_hook_strcmp = 762885c1b4  (= libhybris + 0x3c1b4, in its r-xp)
+AT CRASH             libhybris.so @ 7622540000   icd @ 7628850000
+                     si_addr = 762885c1b4  (= libhybris' + 0x63c1b4, NOT MAPPED)
+```
+
+`7622540000` (the crash-time base) appears **0 times** in the resolution log; `7628820000` (the
+resolution-time base) appears **0 times** in the crash maps. **`libhybris.so` is unloaded and
+re-loaded at a different base during the process's life.** The HAL holds the old copy's function
+addresses - resolved by libhybris's own linker, which is why glibc's `dlopen`/`dlclose` accounting
+cannot see that the HAL depends on libhybris - and the first call through one faults.
+
+That is what §35's "process-dependent" really was: whether the process happened to keep libhybris
+at the base it resolved against. And it explains every earlier reading: the "anonymous PROT_NONE
+region" (§26) was the old copy's r-xp segment, correct at resolution and unmapped at the crash.
+
+**The fix: `-Wl,-z,nodelete` on `libhybris.so`.** `build_hybris.sh` now links it with
+`DF_1_NODELETE`, so glibc can never unmap it while the process lives. This is principled, not a
+workaround: the HAL holds raw pointers into libhybris's code, so libhybris must outlive every user -
+exactly what `nodelete` is for.
+
+**Measured effect.** The libhybris fault is **gone**: the crash is now `si_addr=0x0`, `pc=0x0`, and
+libhybris has one mapping, not two. The process gets materially further and dies later. So this fix
+is real and it moved the wall - it is not a complete fix, and §38 is the next fault it exposed.
+
+## 38. The fault after the remap fix: a NULL call in gamescope's FROG WSI layer (2026-10-11)
+
+With libhybris pinned (session `2026-10-11-13-steam`), `steam exited rc=139` still - but a
+**different** fault, previously masked:
+
+```
+comm=steam  caught signal 11  si_addr=0x0  pc=0x0
+lr = 73655d4834 = libVkLayer_FROG_gamescope_wsi_aarch64.so + 0x14834
+```
+
+Disassembled at that offset (`BLR x3` with `x3 = [x20+0x38] = 0`):
+
+```
+14820: LDR x3,[x20,#0x38]     ; a dispatch/function pointer
+1482c: MOV x0,x19
+14830: BLR x3                 ; -> NULL
+```
+
+So the FROG layer calls a NULL entry out of a function table. It is reached right after the client
+creates its swapchain (`xid 0x1200002`) and the log shows **`Destroying swapchain` twice** for the
+same handle - the client is tearing its surface down, then calls into a table entry the layer never
+populated. It is on the client's X11/present teardown path, and it is *not* the ICD (the ICD's own
+`pvr_wsi` calls all returned). Next: what that table is and which entry is NULL - the FROG layer is
+the gamescope-side Vulkan WSI, so the entry is one of the Vulkan functions the client expects the
+layer to chain.
+
+**The two fixes so far, both measured:** §36 (build identity - so a measurement means something) and
+§37 (`nodelete` - so the HAL's PLT stops pointing at unmapped code). Neither is the last wall, but
+each moved the crash to a strictly later point, and for the first time the movements are traceable.

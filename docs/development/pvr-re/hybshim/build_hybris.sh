@@ -22,7 +22,7 @@ HF="-target aarch64-linux-gnu.2.38 -fPIC -O1 -w -D_GNU_SOURCE -D_LARGEFILE64_SOU
 $ZIG c++ $HF $LIBP -std=c++17 -c "$CO/dso_handle_counters.cpp" -o "$OUT/hk/dso_handle_counters.o"
 for f in hooks wrappers wrapper_code_generic_arm logging native_handle hooks_shm sysconf strlcpy strlcat; do $ZIG cc $HF $LIBP -c "$CO/$f.c" -o "$OUT/hk/$f.o"; done
 for f in properties cache runtime_cache; do $ZIG cc $HF $LIBP -c "$CO/legacy_properties/$f.c" -o "$OUT/hk/lp/$f.o"; done
-$ZIG c++ -target aarch64-linux-gnu.2.38 -shared -O1 "$OUT/hk"/*.o "$OUT/hk/lp"/*.o -o /tmp/libhybris.so
+$ZIG c++ -target aarch64-linux-gnu.2.38 -shared -O1 -Wl,-z,nodelete "$OUT/hk"/*.o "$OUT/hk/lp"/*.o -o /tmp/libhybris.so
 echo "built libhybris.so (Q)"
 cp /tmp/q.so /tmp/libhybris.so "$DIST/"
 echo "installed into $DIST"
