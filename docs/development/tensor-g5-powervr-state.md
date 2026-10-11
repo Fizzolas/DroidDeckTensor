@@ -1999,3 +1999,57 @@ Tensor G5) rather than creating none - the same information `cardNodeFor` was tr
 **But this is not the whole story:** CEF's GPU process also aborts on the backends that never touch a
 card node (GLX/`-cef-use-gl=desktop`, ANGLE-GL), so the card node is a necessary piece at most, not
 sufficient. It is nonetheless the most concrete, fixable gap found this session.
+
+## 47. The guest had no DRM card node: a read-only-sysfs write aborted the stand-in (2026-10-11)
+
+`LinuxRuntime.bindGpuNode` describes the GPU's card node so the session's `/dev/dri` has one - needed
+by gamescope's Wayland backend (a primary node) and, more recently relevant, by GBM, whose callers
+(Chromium's `gbm_wrapper.cc`) open a **card** node. It was silently building none.
+
+**The bug.** The card block writes `card*/dev` and `card*/uevent` into `drm.getParentFile()` =
+`device/drm/`. When the render node's device directory is the kernel's own, `realDeviceDir()` returns
+it and `device` is made a **symlink to the read-only real sysfs** - so those writes land in the
+kernel's directory and throw `AccessDeniedException`. The whole `try` block then aborts, and the one
+line that actually matters for the guest - `new File(dri, "card2").createNewFile()` - never runs:
+
+```
+app.log: drm stand-in incomplete: java.nio.file.AccessDeniedException:
+         /data/user/0/com.droiddeck.launcher/cache/drm/sys/226:128/device/drm/card2/dev
+cache/drm/dri/  ->  renderD128          (no card*)
+```
+
+The guest's *sysfs* side of the card node was fine all along (it reads `card2/dev` through the
+symlink); only the `/dev/dri/card2` device node was missing. `cardNodeFor` itself was not at fault -
+it reads `card2/dev` and gets `226:2`; the writes that followed it were.
+
+**The fix.** The sysfs writes are only needed when the tree is fabricated (`real == null`, an
+Adreno); where `real != null` the guest reads `card*/dev` through the symlink and only the device
+node is missing. Guarding the two writes on `real == null` lets `createNewFile()` run. Measured
+after (commit `7c4a1a0`): `cache/drm/dri/` holds **card2 and renderD128**, no "stand-in incomplete"
+line, and the guest can open a card node.
+
+**What it changed, measured (session 57):** CEF's GBM now gets *further* - `gbm_bo_create` succeeds
+against the card node and the failure moves to the **export**:
+
+```
+gbm_wrapper.cc(74)]  Failed to get fd for plane.              40 -> 80 (per session)
+gbm_wrapper.cc(257)] Failed to export buffer to dma_buf.
+gpu_process_host.cc(1002)] GPU process exited unexpectedly: exit_code=11   52
+```
+
+So the card node was a real prerequisite (GBM could not even open a device before), but the wall is
+now precisely **GBM export**: `gbm_bo_get_fd` is a GEM operation (`drmPrimeHandleToFD`) and the
+PowerVR node implements no GEM. The `tools/linuxfs/preload/drm.c` shim stands in for the libdrm GEM
+API, but only for handles *it* minted (from `drmPrimeFDToHandle`); a handle the node's own allocation
+produced is not in its table, so the export still fails. Closing this means either extending the
+shim to the GBM API surface (`gbm_bo_get_fd`/`gbm_bo_get_plane_fd`) or giving the node a real GEM -
+neither done here.
+
+**Also: the 1x1 is gamescope-consistent, not a bug in the ICD.** gamescope's `steamcompmgr.cpp`
+treats a 1x1 window as "pretty useless" (line 4026), skips it for focus ("Exclude windows that are
+useless (1x1)", line 5139; "If the window is 1x1 then prefer anything else", line 4153), and sizes a
+window to the output only when it is detected fullscreen (`window_is_fullscreen(focusWindow) ||
+force_windows_fullscreen`, line 4909). The client's main UI window is 1x1 because the client leaves
+it there until its renderer comes up - and its renderer is CEF, which is exactly what is crashing.
+So the 1x1 is downstream of the CEF GPU-process crash, not an independent sizing bug; §44's framing
+of it as a "gamescope surface geometry" question was wrong.
