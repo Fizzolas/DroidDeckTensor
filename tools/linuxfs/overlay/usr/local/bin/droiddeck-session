@@ -27,6 +27,10 @@ if [ -e /tmp/crashcatch.so ] || [ -e /tmp/mmwatch.so ] || [ -e /tmp/symwatch.so 
   # wrong when the HAL loaded.
   PVR_ICD_DIAG=/tmp/icd_plt.log
   export PVR_ICD_DIAG
+  # libhybris only logs when built with DEBUG and the level is raised; its default is WARN.
+  HYBRIS_LOGGING_LEVEL=debug
+  HYBRIS_LOGGING_TARGET=/tmp/hybris.log
+  export HYBRIS_LOGGING_LEVEL HYBRIS_LOGGING_TARGET
 fi
 mode=${1:-desktop}
 shift || true

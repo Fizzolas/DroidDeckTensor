@@ -1240,3 +1240,28 @@ needs the linker's relocation of the HAL's PLT logged instead, which `mmwatch`-s
 cannot reach because it happens inside q.so. Attaching to the HAL's relocation directly, or building
 `libhybris.so` with its `DEBUG` logging *and* a working `HYBRIS_LOGGING_LEVEL` (see the rig README for
 why a plain `-DDEBUG` build breaks gamescope), is the way in.
+
+## 30. Corrections: `-DDEBUG` is safe, and its logging is too noisy to use (2026-10-11)
+
+Two corrections to earlier notes, both from running it rather than reasoning about it.
+
+**`-DDEBUG` does not break gamescope.** Earlier notes (and the memory file) said an `-DDEBUG` build of
+`libhybris.so` "breaks gamescope outright". That was wrong - it was **confounded with the
+`prootNoSeccomp` setting**, which was on at the time and breaks every session regardless. Measured: a
+`-DDEBUG` build runs a session normally through `Initted Wayland`, Xwayland and Steam, and dies at the
+usual `rc=139`.
+
+**Its logging is unusable anyway.** With `HYBRIS_LOGGING_LEVEL=debug` and
+`HYBRIS_LOGGING_TARGET=/tmp/hybris.log`, one session wrote a **2.8 GB** log - every `strcmp`,
+`strlen` and `malloc` the guest calls, logged per call. The device had 57 GB free so it survived, but
+that is a hazard, not a tool, and the volume is dominated by hooks outside libhybris
+(`AIBinder_*`, `AHardwareBuffer_*`, ...) that the session log already reports on its own.
+
+What it did establish, cheaply: **libhybris's hook functions execute normally** -
+`HOOKS .../hooks.c:2643 (int _hybris_hook_strcmp(const char *, const char *)) DEBUG: s1 'arch' s2
+'arch'` - so the fault is not "the hook is broken". The HAL's PLT slot holds something else, and the
+DEBUG logging does not report what a symbol resolved to, only when a hook runs.
+
+**If a verbose build is needed again:** put `HYBRIS_LOGGING_TARGET` on the phone's external storage and
+cap it, or patch `hybris_should_log` to filter to `vulkan.powervr` - the same filter the ICD's callback
+already applies.
