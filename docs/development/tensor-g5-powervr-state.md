@@ -1839,3 +1839,163 @@ present (our WSI's X11 present runs only for the 32x32 clip windows).
 path has an honest surface size. The two remaining items are both about *what size and how the
 client presents* - gamescope's surface geometry, and the client's X11/CEF DRI3 - not the GPU path,
 which is proven end to end.
+
+## 45. The wall is CEF's GPU process: it uses GBM, and the PowerVR node has no GBM (2026-10-11)
+
+Sessions 34 and 35 were read from their artifacts (the device was reconnected and a fresh session
+run to confirm). Both are `rc=0`, no crash, ~43 s, and both end `WaitingForCredentials` in
+`steam/steamui_login.txt`. Two things in them were previously read wrong and are corrected here.
+
+**The update UI presented 21 full-res frames; the main UI never rendered.** §43-44 read the 21
+`pvr_wsi: Wayland present: 2404x1080` lines as the client presenting. They are the **update UI**
+(Steam's `-gamepadui` verification window `0x800002`, drawn via **glx** - `session.log` line 279,
+`Using update UI: glx`). It runs `Show window` -> 21 presents -> `Destroy window`. The **main
+GamepadUI** then opens `0x1200002` (`steamui_system.txt`: `Current user is not logged in` ->
+`Initializing BUI`), makes a 1x1 swapchain, and never presents. `droiddeckctl state` agrees:
+`firstFrame: false`.
+
+**Root cause: CEF's GPU process cannot allocate a buffer and segfaults.** The Steam UI is CEF
+(Chromium 126). From `steam/steamwebhelper.log` and `steam/cef_log.txt` (identical in 34 and 35):
+
+```
+steamwebhelper.log: ERROR:gbm_wrapper.cc(74)]  Failed to get fd for plane.: No such file or directory (2)   x40
+steamwebhelper.log: ERROR:gbm_wrapper.cc(257)] Failed to export buffer to dma_buf: No such file or directory (2)
+cef_log.txt: ERROR:shared_image_interface_proxy.cc(130)] Buffer handle is null. Not creating a mailbox from it.
+cef_log.txt: ERROR:one_copy_raster_buffer_provider.cc(348)] Creation of StagingBuffer's SharedImage failed.
+cef_log.txt: ERROR:gpu_process_host.cc(1002)] GPU process exited unexpectedly: exit_code=11
+cef_log.txt: WARNING:gpu_process_host.cc(1436)] The GPU process has crashed 1 time(s)
+```
+
+Measured per session: **13-14 `GPU process exited unexpectedly` and 40 `Failed to export buffer to
+dma_buf`.** CEF's GPU process drives its own buffers through **GBM** (`gbm_wrapper.cc`), and the
+PowerVR render node has **no GBM and no GEM** (§41) - `gbm_bo_create`/export fail, the resulting
+shared-image handle is null, and the GPU process takes SIGSEGV (`exit_code=11`). It is relaunched
+(from `start count: 0` to `1`) and crashes again. So the UI's renderer never comes up, which is why
+`GAMESCOPE_VIEWPORT_SUPPORTED` is unreadable and the window is 1x1.
+
+**This is a new wall, distinct from the DRI3 `BadAlloc`.** The `BadAlloc` is on 32x32 X11 windows
+(`0x2000034`, `0x1c00034`) - CEF helper windows - and is the *same* no-GEM failure seen one layer
+down. The `tools/linuxfs/preload/drm.c` shim stands in for GEM, but **only for the libdrm API**
+(`drmPrimeFDToHandle`, `drmPrimeHandleToFD`, `drmCloseBufferHandle`) and the `GEM_CLOSE` ioctl
+(`netif.c`). It does **not** interpose:
+- `PRIME_FD_TO_HANDLE` (`DRM_IOCTL_PRIME_FD_TO_HANDLE`, `_IOWR('d',0x2e,...)`) - so a caller that
+  issues the ioctl itself (CEF via libgbm/Mesa, rather than libdrm's wrapper) gets no handle; and
+- the **GBM** API (`gbm_create_device`, `gbm_bo_create`, `gbm_bo_get_fd`, ...) at all.
+
+**Where this points next (not yet done):**
+1. Interpose `PRIME_FD_TO_HANDLE` in the ioctl path the same way `GEM_CLOSE` is (a table of
+   duplicated dma-buf fds keyed by fd+handle), so a direct-ioctl caller is covered too.
+2. Interpose the GBM API (`libgbm.so.1`) so `gbm_bo_get_fd`/plane-fd calls return the dma-buf the
+   caller already has, instead of going to the (absent) kernel GBM. This is the layer CEF's
+   `gbm_wrapper.cc` actually calls.
+3. Cheaper experiment first, to bound the work: force CEF's GPU process off the GBM path and onto
+   SwiftShader/software GL. The session already launches the client with `-cef-use-gl=angle
+   -cef-use-angle=vulkan`; an A/B with a different `-cef-use-angle` backend (or CEF's
+   software/disable-gpu switches) tells us whether a frame reaches the screen with the GPU path
+   bypassed, i.e. whether GBM is the *only* thing between here and a visible login screen.
+
+**The build-identity caveat, live again (§36).** The device's installed driver is
+`libhybris.so 037c8e87 / libvulkan_powervr.so b31d4d2d / q.so ba9b7904` (its `build_id.json`,
+`builtAt 2026-10-11T13:15:54Z`), while the committed `hybshim/dist/build_id.json` is
+`libhybris.so 058bdaed / libvulkan_powervr.so 68f90ad8 / q.so ba9b7904` (`builtAt
+2026-10-11T20:35:04Z`). They differ, so **sessions 34-35 did not run the committed dist**. The ICD
+the device runs *does* carry the e60ba95 diagnostics (verified by `strings`), so the era is right,
+but before treating any of the above as "the current build", rebuild with `build_all.sh` +
+`package_asset.py`, bump `versionCode`, and re-hash the guest.
+
+## 46. CEF's GPU process crashes on every backend; the main UI window stays 1x1 (2026-10-11)
+
+§45 named CEF's GPU process (GBM, `gbm_wrapper.cc`) as the wall. This section is the A/B that tried
+to move it, and what the results say. **Nothing here got a frame; the value is the negative result
+and the method.**
+
+**The experiments** (all via `Download/droiddeck-env`, read by the session script's `BL_CEF_*`
+switches, added this session; each session otherwise identical: `rc=0`/idle, ~43 s, no crash of the
+client itself):
+
+| session | CEF config | update-UI presents | main-window 1x1 | CEF `GPU process exited` |
+|---|---|---|---|---|
+| 34/35/41 | default (`-cef-force-gpu -cef-use-angle=vulkan`) | 21 | yes | 13-28 |
+| 36 | `-cef-disable-gpu` | 21 | yes | 0 in that log (still 1x1) |
+| 37 | `-cef-use-angle=swiftshader` | 41 | yes | 20 |
+| 38 | `-cef-ozone-platform=wayland` | 21 | yes | 21 |
+| 40 | `-cef-use-angle=gl` | 21 | yes | 28 |
+| 44 | `VK_ICD_FILENAMES=.../vk_swiftshader_icd.json` (client only) | 21 | yes | 34 |
+| 46 | gamescope `--force-windows-fullscreen` | 21 | yes | 35 |
+| 50 | `-cef-use-gl=desktop` (GLX) | 21 | yes | 49 |
+
+**Two facts fall out, and they matter more than any single run:**
+
+1. **The main GamepadUI window (`0x1200002`) is 1x1 in every configuration.** No CEF or gamescope
+   flag moved it. So the 1x1 is not a CEF-GPU artefact and not the gamescope surface size - it is
+   what the client asks for, from a size it decides before it renders. The update UI's window
+   (`0x800002`) is the only one that ever gets a real size (2404x1080) and presents.
+2. **CEF's GPU process crashes on every backend** - Vulkan, ANGLE-GL, SwiftShader-ANGLE, GLX, and
+   (with `-cef-disable-gpu`) it still reports crashes. A crash common to *all* of them is not a
+   backend/GBM problem; it is something the GPU process does before or regardless of the backend
+   (its own startup: libpci/udev/PCI enumeration, shared memory, or its sandbox). The
+   `gbm_wrapper.cc`/`Buffer handle is null` lines are real but are one symptom, not the whole fault.
+
+**Method note, learned here.** `Download/droiddeck-env` is read with a **one-session lag**: a
+session that starts within a few seconds of the file being rewritten reads the *previous* contents.
+Sessions 48 and 49 proved it (48 ran the config written for it but logged session 47's). Always start
+the session at least ~5 s after writing the env, and **confirm the switch line in the new
+`session.log`** (`== steam: CEF ozone=... use-gl=...`) before trusting a result.
+
+**Where this points.** The GPU process's own output is the missing evidence, and it is not in any
+Steam log (crashpad swallows the abort; `--enable-logging=stderr` does not reach the GPU process's
+argv). The rig's catcher was extended to gate on `comm=steamwebhelper` and delivered via the app's
+`LD_PRELOAD` (not `/tmp`, whose presence would trip the script's `CRASHCATCH_ALL=1`), but it produced
+no report - the GPU process dies in a way the in-process handler does not see. The next step is a
+real debugger in the guest (none is installed) or capturing the GPU process's stderr by wrapping its
+launch. Until the GPU process's fault is known, the CEF flags are exhausted.
+
+**Also fixed in passing:** the debug rig's `crashcatch` was preloaded into every session process with
+`CRASHCATCH_ALL=1` (its `.so`s were left in `files/linuxfs/tmp/`), which the rig's own README warns
+turns recovered faults into kills - one `crash.txt` read `comm=Xwayland caught signal 11`. Removed
+for the clean baseline (session 41); it did not change the 1x1 or the CEF crash, so it was not the
+explanation, but it should not be left in the guest.
+
+**Addendum to §46 (same session).** `--in-process-gpu` (session 52) put the GPU logic in the client
+process and made a second fault visible, but it is a **teardown** crash, not the UI blocker:
+
+```
+== steam exited rc=0
+(EE) Backtrace: ... libgallium-26.2.3-arch1.1.so ... ld-linux (_dl_deallocate_tls+0x28)
+(EE) Segmentation fault at address 0xfffffffffffffff0
+Fatal server error: Caught signal 11. Server aborting
+```
+
+Xwayland crashes in Mesa's **libgallium** while tearing down (the `comm=Xwayland` crash.txt from
+earlier is the same one). It happens *after* the client exits, so it is not why the UI is 1x1 - but
+it is a real second bug, and on a device where Xwayland dying takes the session with it, it is worth
+its own look. The main window was still 1x1 with `--in-process-gpu`.
+
+**Addendum 2 to §46 - the guest has no DRM *card* node (measured).** `LinuxRuntime.bindGpuNode`
+builds the session's `/dev/dri` stand-in and adds a card node from `cardNodeFor()`, which reads
+`/sys/dev/char/226:128/device/drm/card*/dev`. On this device that read is **denied** (`app.log`:
+`drm stand-in incomplete: AccessDeniedException .../sys/226:128/device/drm/card2/dev`), so
+`cardNodeFor` returns null, the `if (card != null)` block is skipped, and the guest gets:
+
+```
+cache/drm/dri/renderD128      <- the only node
+cache/drm/sys/226:128/device  -> symlink to the real sysfs (readable)
+cache/drm/sys/240:16          <- some other node
+```
+
+i.e. **`renderD128` and no `card*`.** Everything built on libdrm's primary-node notion is affected:
+gamescope's DRM backend (§ gamescope-sdl-zero-ext, worked around in the ICD) and, relevant here,
+**GBM** - `gbm_create_device()` is given a card node by its callers, and Chromium's
+`gbm_wrapper.cc` (the source of §45's `Failed to get fd for plane`) is one of them. A guest with no
+card node is a plausible reason CEF's GBM buffer path cannot work even before GBM's absent kernel
+backend is considered.
+
+The fix is in the app, not the driver: when `cardNodeFor` cannot read the real sysfs, describe the
+card node from the numbers the device probe already knows (`primary=226:2`, `render=226:128` on this
+Tensor G5) rather than creating none - the same information `cardNodeFor` was trying to read.
+`GpuInfo`/the probe already carry the render node's device numbers, and the ICD already reports
+`hasPrimary=1 primary=226:2`, so the card minor is known without sysfs.
+
+**But this is not the whole story:** CEF's GPU process also aborts on the backends that never touch a
+card node (GLX/`-cef-use-gl=desktop`, ANGLE-GL), so the card node is a necessary piece at most, not
+sufficient. It is nonetheless the most concrete, fixable gap found this session.

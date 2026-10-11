@@ -805,7 +805,27 @@ BUSCONF
         done
       ) &
     fi
-    echo "== steam args: ${_bl_ui[*]} ${_bl_cdp[*]} ${_bl_lang[*]} -clientbeta $steam_channel -no-cef-sandbox -cef-force-gpu -cef-ozone-platform=x11 -cef-use-gl=angle -cef-use-angle=vulkan $*"
+    # CEF's GPU process drives its buffers through GBM, and this device's render node has neither GBM
+    # nor GEM, so it faults bringing the client's UI up (state doc section 45). Experiments from
+    # Download/droiddeck-env, each swapping one part of the CEF launch, so the working combination can
+    # be found without a build per attempt:
+    #   BL_CEF_OZONE=wayland   CEF on the Wayland path (the one the update UI already renders through)
+    #   BL_CEF_ANGLE=<backend> ANGLE backend (vulkan default; gl, gles, swiftshader)
+    #   BL_CEF_DISABLE_GPU=1   CEF's software path (X11 SHM, no GBM)
+    #   BL_CEF_EXTRA="..."     raw extra flags appended verbatim
+    _bl_cef_ozone=${BL_CEF_OZONE:-x11}
+    _bl_cef_gl=${BL_CEF_USE_GL:-angle}
+    _bl_cef=(-cef-force-gpu "-cef-ozone-platform=$_bl_cef_ozone" "-cef-use-gl=$_bl_cef_gl" -cef-use-angle=vulkan)
+    if [ "${BL_CEF_DISABLE_GPU:-0}" = 1 ]; then
+      _bl_cef=(-cef-disable-gpu "-cef-ozone-platform=$_bl_cef_ozone")
+    elif [ "$_bl_cef_gl" != angle ]; then
+      _bl_cef=(-cef-force-gpu "-cef-ozone-platform=$_bl_cef_ozone" "-cef-use-gl=$_bl_cef_gl")
+    elif [ -n "${BL_CEF_ANGLE:-}" ]; then
+      _bl_cef=(-cef-force-gpu "-cef-ozone-platform=$_bl_cef_ozone" -cef-use-gl=angle -cef-use-angle="${BL_CEF_ANGLE}")
+    fi
+    [ -n "${BL_CEF_EXTRA:-}" ] && read -r -a _bl_cef_extra <<<"$BL_CEF_EXTRA" && _bl_cef+=("${_bl_cef_extra[@]}")
+    echo "== steam: CEF ozone=$_bl_cef_ozone use-gl=$_bl_cef_gl angle=${BL_CEF_ANGLE:-vulkan} disable-gpu=${BL_CEF_DISABLE_GPU:-0} extra='${BL_CEF_EXTRA:-}'"
+    echo "== steam args: ${_bl_ui[*]} ${_bl_cdp[*]} ${_bl_lang[*]} -clientbeta $steam_channel -no-cef-sandbox ${_bl_cef[*]} $*"
     # An update that cannot install asks for a restart (rc=42) every time; the count is capped so a
     # session can never again loop in silence, which reads as a menu opening and closing by itself.
     steam_updates=0
@@ -859,9 +879,16 @@ BUSCONF
         droiddeck-steam-language "$HOME" "$BL_STEAM_LANGUAGE" || true
       fi
       step "starting the Steam client${BL_STEAM_UI:+ ($BL_STEAM_UI UI)}"
+      # Scoped to the client and its children only (gamescope and Xwayland are already running, so
+      # they keep the real ICD): BL_CEF_VULKAN_ICD points the client's Vulkan at another driver.
+      # Setting it to Steam's bundled SwiftShader is the experiment for the CEF GPU-process crash -
+      # a software Vulkan that never touches the PowerVR node's absent GBM (state doc section 45).
+      if [ -n "${BL_CEF_VULKAN_ICD:-}" ]; then
+        export VK_ICD_FILENAMES="$BL_CEF_VULKAN_ICD"
+        echo "== steam: VK_ICD_FILENAMES=$VK_ICD_FILENAMES (client only)"
+      fi
       "$steam_root/steamrtarm64/steam" "${_bl_ui[@]}" "${_bl_cdp[@]}" "${_bl_lang[@]}" -clientbeta "$steam_channel" \
-        -no-cef-sandbox -cef-force-gpu -cef-ozone-platform=x11 \
-        -cef-use-gl=angle -cef-use-angle=vulkan "$@"
+        -no-cef-sandbox "${_bl_cef[@]}" "$@"
       rc=$?
       echo "== steam exited rc=$rc"
       if [ -n "${BL_ADDED_GAMES:-}" ] && [ -f "$BL_ADDED_GAMES" ]; then
