@@ -2108,3 +2108,11 @@ at 205 FPS.
 **What this says about Steam.** Steam's *client UI* is the only thing still blocked, and it is blocked
 in CEF's GPU process (a Chromium component, §45-47), not in the driver or the WSI - both of which now
 carry real, correctly-rendered frames from two independent guest stacks.
+
+**Addendum 3 to §46 - four more CEF configs, all the same (2026-10-11).** After the card-node fix
+(§47), CEF's crash persists, so more of its launch was varied: `-cef-disable-gpu-sandbox
+-cef-disable-seccomp-sandbox`, `--disable-gpu-compositing`, `--single-process --no-zygote`, and
+`--in-process-gpu`. Every one: 21 update-UI presents, the main window still 1x1, ~50 GPU-process
+crashes, ~80 `gbm_wrapper` export failures. CEF's launch flags are exhausted as a lever; the fault is
+in the GPU process's buffer path (GBM export, a GEM operation the node does not implement), not in how
+it is started.
