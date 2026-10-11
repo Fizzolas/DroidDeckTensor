@@ -256,6 +256,13 @@ static VkResult wsi_surface_caps(VkPhysicalDevice pd, VkSurfaceKHR surface, VkSu
         s->width = s->height = -1;
     }
     if (s->width <= 0 || s->height <= 0) {
+        /* Rare (only an unreadable window), so logged unconditionally, once: it distinguishes "the
+         * window has no geometry yet" (this branch, app then picks its own size - Steam picks 1x1)
+         * from "the window really is 1x1", which is the difference between a WSI bug and a client
+         * choice. A Wayland surface always lands here: this WSI does not track the compositor's
+         * configure, so it has no size to report. */
+        static int logged;
+        if (!logged) { logged = 1; WSI_LOG("caps: window 0x%x kind=%d unreadable -> currentExtent UINT32_MAX (app chooses)", (unsigned)s->window, s->kind); }
         caps->currentExtent.width = UINT32_MAX;
         caps->currentExtent.height = UINT32_MAX;
     } else {
