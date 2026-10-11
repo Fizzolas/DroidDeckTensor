@@ -1004,3 +1004,30 @@ effect until it is force-stopped - and the driver refresh does not happen either
 the old process. This cost a run; `am force-stop com.droiddeck.launcher` is now part of the loop.
 
 See `docs/development/pvr-re/rig/` for the instrumentation that found all of this.
+
+## 24. What the remaining fault is, and why I stopped short of the reading (2026-10-10)
+
+After the guard fix actually shipped (§23) the fault changed to an **instruction fetch**, `si_addr == pc`,
+with `lr` inside the HAL's `vulkan_device_open` (HAL file offset `0x1b9f10`). The address is in a
+`---p` (PROT_NONE) region, and the protection is a startup map with a **zero file offset** - so the
+value that was jumped through was present at load, before anything could disturb it. It is not a
+region that was unmapped later; it never had a way to be executed.
+
+**The one reading that fits, and what is wrong with it.** An address inside the ICD's own mapped image
+is what a **PLT slot with no relocation applied** holds: a slot the loader never filled still contains
+whatever the file has there, and the file is mostly zeros, so a slot at file offset X points at
+`icd_base + X`. That would mean the HAL's imports of the interposed libc/pthread symbols are not being
+relocated - the same family as §20's 17 slots.
+
+**It is NOT established, and one measurement contradicts it.** In §20 the 17 slots resolved correctly
+into `libhybris.so` at the HAL's `open`. If the HAL's imports are handled, that reading is wrong here.
+I also do not have the PLT values for *this* run: the crash report's GOT dump is invalid, because
+`crashcatch` computed the HAL's base as `pc - 0x6c17c` - a constant from when the fault was in q.so.
+With the fault now in the ICD, that expression produced a nonsense base and the dump read the wrong
+memory. `crashcatch.c` is fixed at source (it takes each module's base from `/proc/self/maps` now) but
+**a rebuilt shim could not be produced**: WSL stopped starting partway through this session, and all
+cross-compilation goes through it.
+
+So: the remaining fault is an instruction fetch through a value that was in place at load, aimed inside
+the ICD's image, called from the HAL - and the next step is to re-run the rig to get PLT values taken
+with a base that is trustworthy. Until then the reading above is a hypothesis, not a result.

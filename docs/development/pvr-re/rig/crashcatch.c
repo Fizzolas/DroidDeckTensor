@@ -100,26 +100,66 @@ static void handler(int sig, siginfo_t *si, void *ctx) {
                 wc(10);
                 fsync_out();
             }
-            /* The linker's own guard counter: ProtectedDataGuard::ref_count_ is in q.so's bss at
-             * vaddr 0xeeea8, and the faulting instruction sits at 0x6c17c, so the DSO's base is the
-             * difference. 0 means no guard is in scope and the pages should be writable, so a fault
-             * with 0 here means the guard is missing from the path that wrote; nonzero means a guard
-             * is in scope yet the page is still read-only, i.e. ref_count_ is out of step. */
-            if (m) {
-                unsigned long long base = m->pc - 0x6c17c;
-                volatile int *rc = (volatile int *)(uintptr_t)(base + 0xeeea8);
-                w("q.so_base="); wx(base);
-                w("  ref_count_="); wd(*rc);
-                wc(10);
+            /* Where each module lives, from maps rather than from an offset into a fixed one: which
+             * module a fault is in changes as the PowerVR faults get fixed, and reading a base as
+             * "pc minus some constant" gives a plausible wrong number the moment it does. The
+             * constants below are file offsets within each module and are only applied once the
+             * module is known from maps. */
+            unsigned long long lb_base = 0, hal_base = 0, icd_base = 0;
+            {
+                int mf = open("/proc/self/maps", O_RDONLY);
+                if (mf >= 0) {
+                    static char mb[1 << 19];
+                    ssize_t n = read(mf, mb, sizeof(mb) - 1);
+                    close(mf);
+                    if (n > 0) {
+                        mb[n] = 0;
+                        for (char *q = mb; q && *q; ) {
+                            char *nl = strchr(q, 10);
+                            if (nl) *nl = 0;
+                            unsigned long long lo, off;
+                            char perms[8] = {0};
+                            if (sscanf(q, "%llx-%*x %7s %llx", &lo, perms, &off) == 3 && off == 0) {
+                                if (strstr(q, "/powervr-g5x/libhybris.so")) lb_base = lo;
+                                else if (strstr(q, "/hw/vulkan.powervr.so")) hal_base = lo;
+                                else if (strstr(q, "/powervr-g5x/libvulkan_powervr.so")) icd_base = lo;
+                            }
+                            q = nl ? nl + 1 : NULL;
+                        }
+                    }
+                }
             }
-            /* Is the bad PLT slot one slot or many? The HAL's .got.plt is at file offset 0x286ab0,
-             * 0xb00 bytes (352 slots). The HAL's base comes from the link register: at this fault x30
-             * is inside vulkan_device_open at file offset 0x1b9f10, so base = x30 - 0x1b9f10 - no maps
-             * parsing needed. Dumping every slot and counting the ones that point outside every loaded
-             * module answers "one stuck slot" vs "PLT resolution is broken generally". */
-            if (m) {
-                unsigned long long hal_base = m->regs[30] - 0x1b9f10;
-                w("hal_base="); wx(hal_base); wc(10);
+            w("libhybris_base="); wx(lb_base);
+            w("  hal_base="); wx(hal_base);
+            w("  icd_base="); wx(icd_base);
+            wc(10);
+            /* q.so's guard counter, only meaningful when q.so is the module in question. */
+            if (m && lb_base) {
+                /* q.so is a sibling of libhybris.so; find it too, offset 0xeeea8 into its image. */
+                unsigned long long qb = 0;
+                int mf = open("/proc/self/maps", O_RDONLY);
+                if (mf >= 0) {
+                    static char qb2[1 << 19];
+                    ssize_t n = read(mf, qb2, sizeof(qb2) - 1);
+                    close(mf);
+                    if (n > 0) { qb2[n] = 0;
+                        for (char *q = qb2; q && *q; ) {
+                            char *nl = strchr(q, 10); if (nl) *nl = 0;
+                            unsigned long long lo, off;
+                            if (sscanf(q, "%llx-%*x %*s %llx", &lo, &off) == 2 && off == 0 &&
+                                strstr(q, "/powervr-g5x/q.so")) { qb = lo; break; }
+                            q = nl ? nl + 1 : NULL;
+                        }
+                    }
+                }
+                if (qb) {
+                    volatile int *rc = (volatile int *)(uintptr_t)(qb + 0xeeea8);
+                    w("q.so_base="); wx(qb); w("  ref_count_="); wd(*rc); wc(10);
+                }
+            }
+            /* The HAL's PLT, for the "was it ever resolved" question. Its base is from maps, not
+             * from pc, so this stays correct whichever module the fault moves into. */
+            if (hal_base) {
                 unsigned long long *got = (unsigned long long *)(uintptr_t)(hal_base + 0x286ab0);
                 w("HAL .got.plt slots (index:value):"); wc(10);
                 for (int i = 0; i < 352; i++) {
