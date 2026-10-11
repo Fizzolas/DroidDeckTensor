@@ -564,6 +564,10 @@ static VkResult wsi_queue_present(VkQueue queue, const VkPresentInfoKHR *pi) {
         if (surf->kind == WSI_X11) {
             /* Give the image's dma-buf to Xwayland as a DRI3 Pixmap (once per image) and show it with
              * Present. buffer_from_pixmap is the X->client direction, not needed here. */
+            static int x11_logged;
+            if (!x11_logged) { x11_logged = 1;
+                WSI_LOG("X11 present: window=0x%x %dx%d stride=%u depth=%u bpp=%u fd=%d (DRI3 PixmapFromBuffers)",
+                        (unsigned)surf->window, sc->width, sc->height, sc->stride, surf->x_depth, surf->x_bpp, sc->images[idx].fd); }
             if (sc->images[idx].fd < 0) { if (pi->pResults) pi->pResults[i] = VK_ERROR_SURFACE_LOST_KHR; continue; }
             if (!sc->images[idx].pixmap) {
                 xcb_pixmap_t px = xcb_generate_id(surf->c);

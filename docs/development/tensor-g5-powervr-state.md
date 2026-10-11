@@ -1788,3 +1788,29 @@ swapchains remain and are likely the same story: a window whose size the WSI can
 **Caveat to keep in mind:** forcing LINEAR for external images changes how gamescope addresses any
 external image it creates, including its own output. The session runs clean (`rc=0`), but if output
 images look wrong later, this is the place to look.
+
+## 43. Where the frame stands: compositor import works, the last walls are X11/DRI3 and Wayland size
+## (2026-10-11)
+
+After §42 (gamescope binds our dma-buf), sessions `2026-10-11-25..27-steam` are stable: `rc=0`, no
+crash, no import error, no `vkBindImageMemory failed`, ~43 s. Two walls remain before a frame is on
+screen, both now measured rather than guessed.
+
+**1. The client's swapchains are 1x1, and they are Wayland surfaces.** The caps diagnostic
+(`pvr_wsi: caps: window 0x0 kind=0 unreadable`) shows them as `kind=0` (Wayland) with no window. A
+`wl_surface` genuinely has no size before the first buffer is committed, so `wsi_surface_caps`
+reports `UINT32_MAX` ("app chooses") and the client picks 1x1. To give it a real size the WSI must
+know the compositor's configure - either track the surface's role (`xdg_surface.configure`, which
+needs the xdg-shell globals) or use a plausible output size. `xdg-shell` tracking is the correct fix.
+
+**2. X `BadAlloc` (major opcode 147, minor 7 = DRI3 `PixmapFromBuffers`).** Our X11 present path
+*does* run and succeed - `pvr_wsi: X11 present: window=0x2000034 32x32 stride=128 depth=24 bpp=32`
+for the 32x32 windows - so the BadAlloc is a *different* DRI3 request, most likely the client/CEF's
+own X11 present (CEF is launched `-cef-ozone-platform=x11`). `Error getting buffer` (Steam) follows
+it. The next step is to identify the requesting process and whether Xwayland's DRI3 rejects it for
+the same no-GEM reason the wlroots check did (§41) - if so, the same shim covers it; if not, it is a
+pixmap-format/param mismatch in our `xcb_dri3_pixmap_from_buffers` call.
+
+**Net state of the guest:** load -> ICD -> device -> render -> export dma-buf -> **gamescope imports
+and binds it** -> Xwayland/X11 present runs. The compositor can now consume our frames; what is left
+is the client's own X11 present and the surface-size question, not the GPU path.
