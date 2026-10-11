@@ -914,3 +914,43 @@ did not answer the question here.
 was never mapped, or resolved and then unmapped. What is settled is the *shape* - a bounded set of
 interposed libc symbols, all pointing at the same unmapped region just past `q.so`, and a resolver that
 has a branch for exactly this and does not report it.
+
+## 22. The ENOSYS sessions were a setting, not damage (2026-10-10)
+
+Sessions 102-114 failed early with `Function not implemented` (ENOSYS) on `getcwd`, `mkdir /root`,
+`python3` and `std::filesystem::status`, and gamescope aborted with
+`filesystem_error: status: Function not implemented [/etc/gamescope/scripts]`. The **desktop (lxqt)
+mode failed the same way**, which made it look like a device-wide regression. It was not: it was one
+setting.
+
+**Cause.** `shared_prefs/session.xml` had `prootNoSeccomp = true`, written at 20:21. That makes
+`ProotFastPath.enabled()` false -
+
+```kotlin
+fun enabled(context: Context): Boolean =
+    SessionPrefs.prootFastPath(context) && !SessionPrefs.prootNoSeccomp(context)
+```
+
+- so `SessionFiles` stops writing `/usr/local/lib/libblfastpath.so` into `/etc/ld.so.preload`, and
+  without the fast path this kernel's filesystem syscalls come back ENOSYS. Turning the setting off
+  (`prootNoSeccomp = false`) restores the preload line and **ENOSYS goes to 0**; the session then runs
+  normally into gamescope, Xwayland and Steam's update.
+
+**The app already knows this failure by name** - `strings.xml`:
+
+> *The log shows %1$d "Function not implemented" error: proot's seccomp acceleration is failing a
+> helper on this device. Try ... → "Run proot without seccomp" ... and start again.*
+
+and `SessionActivity.sessionEndHint` detects the storm (8 or more lines) and offers the switch. Note
+the two switches point opposite ways: **"Run proot without seccomp"** *causes* this, while **"Skip
+Steam's xalia helper"** is the fix that is meant to answer it.
+
+**Correction to the temptation to blame the debugging.** The rebuilt `libhybris.so` and `q.so` were
+byte-identical to the project's `hybshim/dist/` copies for the non-DEBUG build, and restoring those
+originals did not change the ENOSYS count - it tracked the pref flip, not the libraries. The earlier
+"hand-copied a file in and broke the runtime" reading was wrong; the correlation was with the setting
+being written, not with anything under `files/linuxfs/`.
+
+**Still true and worth keeping:** `droiddeck-session` and the other `usr/local/bin/*` scripts are
+redeployed from the apk at every session start (`SessionFiles.kt`), so a guest-side edit to one lasts
+exactly one session. Instrumentation that must survive has to go through the app build.
