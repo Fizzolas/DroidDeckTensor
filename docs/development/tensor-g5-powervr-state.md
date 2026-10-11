@@ -1696,3 +1696,53 @@ means only "more than fit", per spec.
 **Net progress this session:** build identity (§36), the crash (§37-39, gone), and the modifier-path
 mitigation. The client runs to exit 0 instead of crashing; frames still do not reach the screen
 because the compositor will not import the buffer.
+
+## 41. THE IMPORT WALL WAS A STALE SHIM, not the driver (2026-10-11)
+
+§40 said the import failed for the real-size buffers even after suppressing the modifier path. The
+cause was not the driver, the format, or the modifier - **the deployed `libblsession.so` was built
+before the GEM fix (`93212b4`) and had never been rebuilt.** This is the same "measured source is not
+the shipped binary" class as §15 and §36, now in the *shim*.
+
+**The exact check, read from wlroots' source** (`types/wlr_linux_dmabuf_v1.c`, the `:219` in the
+error):
+
+```c
+static bool check_import_dmabuf(struct wlr_dmabuf_attributes *attribs, void *data) {
+    ...
+    if (drmPrimeFDToHandle(linux_dmabuf->main_device_fd, attribs->fd[i], &handle) != 0) {
+        wlr_log_errno(WLR_ERROR, "Failed to import DMA-BUF FD for plane %d", i);
+```
+
+gamescope validates every incoming buffer by calling **`drmPrimeFDToHandle`** on its main DRM device -
+a **GEM** ioctl. The PowerVR render node is `pvrsrvkm` and has no GEM, so it answers EINVAL, and
+gamescope refuses the buffer. `tools/linuxfs/preload/drm.c` exists precisely to stand in for GEM on
+such a node; its predicate was fixed for PowerVR in `93212b4`.
+
+**Measured, before and after rebuilding the shim from the current source:**
+
+```
+session 22 (old libblsession.so):  zink: failed drmPrimeFDToHandle  x many
+                                   Failed to import DMA-BUF FD for plane 0  x2
+session 23 (rebuilt shim):         zink: failed drmPrimeFDToHandle  0
+                                   Failed to import DMA-BUF FD for plane 0  0
+                                   steam exited rc=0 (clean, ~43 s)
+```
+
+**So the frame path is now unblocked at the compositor.** gamescope imports our dma-buf; the client
+no longer dies on it.
+
+**Two things this implies, both worth acting on:**
+
+1. **The app's `linuxfs` asset (which carries `libblsession.so`) was stale.** It is gitignored and
+   built by CI / `tools/build_local.sh` from `tools/linuxfs/preload/*.c`, so a fresh build picks up
+   the fix - but any device running an older install keeps the old shim, and the symptom looks
+   exactly like a driver bug. **A shim fix that is not rebuilt into the asset is not shipped.**
+2. The remaining failures are different and smaller: `Error getting buffer`, an X `BadAlloc` on
+   DRI3 (major opcode 147), and the client's swapchains still being **1x1** - see §42.
+
+**Reproduce the shim rebuild (no Docker):**
+```
+zig cc -target aarch64-linux-gnu.2.38 -shared -fPIC -O2 -pthread \
+    -o libblsession.so tools/linuxfs/preload/*.c -ldl
+```
