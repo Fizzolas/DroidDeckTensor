@@ -141,6 +141,43 @@ int main(void) {
 
     printf("\nRESULT: a BGRA8 LINEAR dma-buf imports as a plain LINEAR image\n");
 
+    /* --- step 2b: import the SAME fd into an OPTIMAL-tiling image. gamescope's renderer imports a
+     * compositor buffer with createFlags {bSampled,bTransferSrc} and neither bMappable nor bLinear,
+     * so its tiling is OPTIMAL (rendervulkan.cpp:2102), not LINEAR. If the HAL can only bind imported
+     * memory to LINEAR images, this is the "vkBindImageMemory failed" gamescope logs. --- */
+    VkExternalMemoryImageCreateInfo emiB2 = { VK_STRUCTURE_TYPE_EXTERNAL_MEMORY_IMAGE_CREATE_INFO };
+    emiB2.handleTypes = VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT;
+    VkImageCreateInfo icB2 = ic; icB2.pNext = &emiB2; icB2.tiling = VK_IMAGE_TILING_OPTIMAL;
+    icB2.usage = VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT;
+    VkImage imgB2;
+    VkResult crB2 = DEV(vkCreateImage)(dev, &icB2, NULL, &imgB2);
+    printf("import fd into an OPTIMAL-tiling image -> vkCreateImage=%d\n", crB2);
+    if (crB2 == VK_SUCCESS) {
+        VkMemoryRequirements mrB2;
+        printf("  calling vkGetImageMemoryRequirements on the OPTIMAL image...\n");
+        DEV(vkGetImageMemoryRequirements)(dev, imgB2, &mrB2);
+        printf("  -> size=%llu typeBits=0x%x\n", (unsigned long long)mrB2.size, mrB2.memoryTypeBits);
+        uint32_t mtiB2 = 0; int f2 = 0;
+        for (uint32_t i = 0; i < 32; i++)
+            if ((mrB2.memoryTypeBits & (1u << i)) && (fdp.memoryTypeBits & (1u << i))) { mtiB2 = i; f2 = 1; break; }
+        if (!f2) for (uint32_t i = 0; i < 32; i++) if (mrB2.memoryTypeBits & (1u << i)) { mtiB2 = i; break; }
+        VkImportMemoryFdInfoKHR imp2 = { VK_STRUCTURE_TYPE_IMPORT_MEMORY_FD_INFO_KHR };
+        imp2.handleType = VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT; imp2.fd = fd;
+        VkMemoryDedicatedAllocateInfo ded2 = { VK_STRUCTURE_TYPE_MEMORY_DEDICATED_ALLOCATE_INFO };
+        ded2.pNext = &imp2; ded2.image = imgB2;
+        VkMemoryAllocateInfo mai2 = { VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO };
+        mai2.pNext = &ded2; mai2.allocationSize = mrB2.size; mai2.memoryTypeIndex = mtiB2;
+        VkDeviceMemory memB2;
+        VkResult ar2 = DEV(vkAllocateMemory)(dev, &mai2, NULL, &memB2);
+        printf("  vkAllocateMemory (type %u) = %d\n", mtiB2, ar2);
+        if (ar2 == VK_SUCCESS) {
+            VkResult br2 = DEV(vkBindImageMemory)(dev, imgB2, memB2, 0);
+            printf("  vkBindImageMemory = %d\n", br2);
+            if (br2 != VK_SUCCESS) { printf("RESULT: OPTIMAL-tiling import BINDS FAIL - gamescope's error\n"); return 6; }
+            printf("RESULT: OPTIMAL-tiling import works too\n");
+        }
+    }
+
     /* --- step 3: import the SAME fd the way gamescope actually does - as a DRM-format-modifier image.
      * A compositor's Vulkan renderer does not import a LINEAR-tiling image; it imports with
      * VK_IMAGE_TILING_DRM_FORMAT_MODIFIER_EXT and names the modifier explicitly (0 = LINEAR for us).

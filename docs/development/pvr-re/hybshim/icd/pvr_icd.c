@@ -88,6 +88,7 @@ extern void pvr_wsi_register_device(VkDevice dev, uint32_t queue_family, void *q
                                     void *create_fence, void *wait_fences, void *destroy_fence,
                                     void *get_device_queue);
 static int icd_load(void);   /* defined below; used by pvr_icd_resolve */
+static VkResult icd_create_image(void *device, const void *ci, const void *alloc, void **out);  /* fwd */
 
 /* Self-configuration: the guest session runs with a clean environment (env -i), so this ICD points
  * the libhybris layer at its own directory (found from this object's path) if the caller has not. */
@@ -256,6 +257,7 @@ static void *icd_gdpa(VkDevice device, const char *pName) {
      * NULL slot in the app's dispatch table and the app calls it and faults. Off unless PVR_ICD_DIAG. */
     FILE *o = diagf();
     if (o && pName) { fprintf(o, "ICD gdpa pid=%d name=%s", (int)getpid(), pName); fflush(o); }
+    if (!strcmp(pName, "vkCreateImage")) { if (o) { fprintf(o, " -> icd_create_image\n"); fflush(o); } return (void *)icd_create_image; }
     void *wsi = pvr_wsi_proc(pName);
     if (wsi) { if (o) { fprintf(o, " -> %p (wsi)\n", wsi); fflush(o); } return wsi; }
     if (!g_gipa && icd_load() != 0) { if (o) { fprintf(o, " -> load-fail\n"); fflush(o); } return NULL; }
@@ -564,6 +566,51 @@ static VkResult icd_get_phys_dev_img_fmt_props2(void *pd, void *info, void *out)
     return (r2 == VK_SUCCESS) ? r2 : r;   /* still unsupported: keep the original answer */
 }
 
+/* vkCreateImage: the HAL only binds imported dma-buf memory to LINEAR-tiling images. Measured
+ * (probes/vk_dmabuf_import_test.c): importing a dma-buf into an OPTIMAL-tiling image - or a
+ * VK_IMAGE_TILING_DRM_FORMAT_MODIFIER_EXT image - faults inside the HAL's vkAllocateMemory/vkBindImageMemory,
+ * while the same fd binds fine to a LINEAR image. A compositor imports a client's dma-buf with
+ * createFlags {bSampled,bTransferSrc} and neither bMappable nor bLinear, so its tiling is OPTIMAL
+ * (gamescope rendervulkan.cpp:2102) - which is why gamescope logs "vkBindImageMemory failed".
+ *
+ * So an EXTERNAL dma-buf image is created LINEAR here, whatever tiling was asked for. This is safe for
+ * a LINEAR buffer: the fd describes a linear layout, and an imported image's tiling only affects how
+ * the GPU addresses it. Non-external images are untouched (their tiling is theirs to choose). */
+#define STYPE_EXTERNAL_MEMORY_IMAGE_CREATE 1000072001u
+#define VK_IMAGE_TILING_LINEAR_ 0u
+typedef struct { uint32_t sType; void *pNext; uint32_t handleTypes; } ExtMemImgCI;
+typedef struct { uint32_t sType; void *pNext; uint32_t flags; uint32_t imageType; uint32_t format;
+                 uint32_t width, height, depth; uint32_t mipLevels, arrayLayers; uint32_t samples;
+                 uint32_t tiling; uint32_t usage; uint32_t sharingMode; uint32_t queueFamilyIndexCount;
+                 const uint32_t *pQueueFamilyIndices; uint32_t initialLayout; } ImgCI;
+static VkResult icd_create_image(void *device, const void *ci, const void *alloc, void **out) {
+    if (!g_gipa && icd_load() != 0) return VK_ERROR_INITIALIZATION_FAILED;
+    /* Fetch the HAL's own vkCreateImage through the device's gdpa, or the pointer would be this
+     * function again (gipa returns the ICD's entries). */
+    void *(*dgdpa)(void *, const char *) =
+        (void *(*)(void *, const char *))g_gipa(device, "vkGetDeviceProcAddr");
+    VkResult (*hal)(void *, const void *, const void *, void **) =
+        dgdpa ? (VkResult (*)(void *, const void *, const void *, void **))dgdpa(device, "vkCreateImage") : NULL;
+    if (!hal || hal == icd_create_image) {
+        void *(*igdpa)(void *, const char *) = (void *(*)(void *, const char *))g_gipa(g_instance, "vkGetDeviceProcAddr");
+        if (igdpa) hal = (VkResult (*)(void *, const void *, const void *, void **))igdpa(device, "vkCreateImage");
+    }
+    if (!hal || hal == icd_create_image) return VK_ERROR_INITIALIZATION_FAILED;
+    const ImgCI *in = (const ImgCI *)ci;
+    int external = 0;
+    for (const VkBase *b = (const VkBase *)in->pNext; b; b = (const VkBase *)b->pNext)
+        if (b->sType == STYPE_EXTERNAL_MEMORY_IMAGE_CREATE) { external = 1; break; }
+    { FILE *o = diagf(); if (o) { fprintf(o, "ICD createImage pid=%d tiling=%u external=%d fmt=0x%x usage=0x%x\n",
+        (int)getpid(), in->tiling, external, in->format, in->usage); fflush(o); } }
+    if (external && in->tiling != VK_IMAGE_TILING_LINEAR_) {
+        ImgCI copy = *in; copy.tiling = VK_IMAGE_TILING_LINEAR_;
+        if (icd_debug_on())
+            fprintf(stderr, "pvr_icd: external image tiling %u -> LINEAR (the HAL imports only LINEAR)\n", in->tiling);
+        return hal(device, &copy, alloc, out);
+    }
+    return hal(device, ci, alloc, out);
+}
+
 static void icd_get_phys_dev_props2(void *pd, void *props2) {
     PhysDevProps2 *p2 = (PhysDevProps2 *)props2;
     if (!p2) return;
@@ -641,6 +688,9 @@ void *vk_icdGetInstanceProcAddr(VkInstance instance, const char *pName) {
     if (!strcmp(pName, "vkEnumerateDeviceExtensionProperties")) return (void *)icd_enum_device_ext;
     if (!strcmp(pName, "vkEnumerateInstanceExtensionProperties")) return (void *)icd_enum_instance_ext;
     if (!strcmp(pName, "vkCreateInstance")) return (void *)icd_create_instance;
+    /* Core device function the loader fetches through GIPA to fill its device dispatch - intercept
+     * here too, or the external-image tiling fix (icd_create_image) is bypassed. */
+    if (!strcmp(pName, "vkCreateImage")) return (void *)icd_create_image;
     /* The loader's own trampoline for vkGetPhysicalDeviceProperties2 calls whatever this returns, so
      * this is where the HAL's empty VK_EXT_physical_device_drm answer is corrected. */
     if (!strcmp(pName, "vkGetPhysicalDeviceProperties2") || !strcmp(pName, "vkGetPhysicalDeviceProperties2KHR"))

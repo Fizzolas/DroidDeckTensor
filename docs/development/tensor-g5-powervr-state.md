@@ -1746,3 +1746,45 @@ no longer dies on it.
 zig cc -target aarch64-linux-gnu.2.38 -shared -fPIC -O2 -pthread \
     -o libblsession.so tools/linuxfs/preload/*.c -ldl
 ```
+
+## 42. gamescope imports our dma-buf now: the HAL only binds imported memory LINEAR (2026-10-11)
+
+§40 left two failures: gamescope's renderer `vkBindImageMemory failed (VkResult: -1)` many times, and
+the client's X `BadAlloc` on DRI3. The first is fixed; the second is the current wall.
+
+**Root cause, isolated** (`probes/vk_dmabuf_import_test.c`, step 2b): importing a dma-buf into an
+**OPTIMAL-tiling** image faults inside the HAL's `vkAllocateMemory`/`vkBindImageMemory`, exactly as a
+`DRM_FORMAT_MODIFIER` image does (§40). The same fd binds fine to a **LINEAR** image. The HAL only
+supports LINEAR for imported dma-buf memory.
+
+**Why gamescope hit it.** A compositor imports a client's buffer with createFlags
+`{bSampled, bTransferSrc}` and neither `bMappable` nor `bLinear`, so its tiling is **OPTIMAL**
+(`rendervulkan.cpp:2102`: `tiling = (bMappable || bLinear) ? LINEAR : OPTIMAL`). With
+`VK_EXT_image_drm_format_modifier` suppressed (§40) it cannot take the modifier path either, so it
+lands on OPTIMAL - the one tiling the HAL cannot import into.
+
+**Fix, in the ICD:** `icd_create_image` rewrites an **external** image's tiling to LINEAR before the
+HAL sees it. An imported image's tiling only affects how the GPU addresses the buffer; the fd is a
+LINEAR layout either way. Non-external images are untouched. The wrapper is registered in both
+`vk_icdGetInstanceProcAddr` and `icd_gdpa` (a core function like `vkCreateImage` is fetched through
+GIPA to fill the loader's device dispatch, so GIPA is the one that matters).
+
+**Measured, session `2026-10-11-25-steam`:**
+
+```
+vkBindImageMemory failed   many -> 0
+Failed to import DMA-BUF     0
+rc=139                       0
+steam exited rc=0, ~43 s
+```
+
+**Remaining wall: `Error getting buffer` and X `BadAlloc` (major opcode 147, minor 7 =
+DRI3 PixmapFromBuffers).** That is the *client -> Xwayland* present path (our `pvr_wsi.c` X11 branch
+calls `xcb_dri3_pixmap_from_buffers`), not gamescope's Vulkan import. Xwayland's DRI3 rejects the
+pixmap; the next step is to see which fd/node Xwayland's DRI3 uses and whether the GEM shim covers
+that path (it is a different call site from wlroots' `drmPrimeFDToHandle`). The client's 1x1
+swapchains remain and are likely the same story: a window whose size the WSI cannot read yet.
+
+**Caveat to keep in mind:** forcing LINEAR for external images changes how gamescope addresses any
+external image it creates, including its own output. The session runs clean (`rc=0`), but if output
+images look wrong later, this is the place to look.
