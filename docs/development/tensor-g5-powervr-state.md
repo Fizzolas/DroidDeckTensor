@@ -1388,3 +1388,41 @@ app one.
 resolving to unmapped addresses, because the hook addresses are computed against the wrong base.**
 Every link was measured on the device, and each was found only after several earlier readings of the
 same fault were withdrawn.
+
+## 34. The base mismatch, measured exactly (2026-07-11)
+
+Instrumented the resolver to log the hook table entry and `dladdr`'s view of libhybris's own base. One
+run, one pid:
+
+```
+15607 strcmp /vendor/lib64/hw/vulkan.powervr.so -> 0x74135ec080 (hook)
+   TABLE entry=0x74136385a0 name=strcmp func=0x74135ec080 debug=0x74135ec080 libhybris_base=0x74135b0000
+comm=steam  caught signal 11  si_addr=0x74135ec080  pc=0x74135ec080
+```
+
+And the same process's `/proc/self/maps`:
+
+```
+0x740d2d0000-0x740d2fa000 r--p   .../powervr-g5x/libhybris.so     <- libhybris's REAL base
+0x7413502000-0x7413577000 r-xp   .../powervr-g5x/q.so
+0x74135e0000-0x74135e7000 r--p   .../powervr-g5x/libvulkan_powervr.so   <- the ICD
+0x74135e7000-0x74135f6000 ---p   .../powervr-g5x/libvulkan_powervr.so
+```
+
+**`0x74135b0000` - the base `dladdr` reports and the hook addresses are built from - is not mapped at
+all.** It sits in the gap between `q.so` and the ICD. libhybris is at `0x740d2d0000`. The difference is
+`0x62e0000`.
+
+So the defect, as tightly as the measurements allow: **the base used to form the hook addresses for the
+HAL's interposed imports is wrong, and `dladdr` agrees with the wrong base** - which points at the
+loader's view of where libhybris is, not at the hook table's contents (`name`, `func` and `debug_func`
+are all the same, consistent value).
+
+**The remaining question is now specific and narrow:** why does the loader's base for libhybris differ
+from its actual mapping, by `0x62e0000`. That is inside libhybris's own loader interaction
+(`hooks.c`'s `__hybris_load_linker` / `dlopen` path and what it does with the returned handle) and is
+where the fix belongs. It is not the ICD, not `q.so`'s own linker, and not the app.
+
+**Instruments:** `hookret_log` in `hybris/common/hooks.c` (filtered to `vulkan.powervr`, own file,
+no DEBUG build), plus `docs/development/pvr-re/rig/`. `build_hybris.sh` rebuilds both DSOs in one
+command, so a candidate fix is one build and one session.
