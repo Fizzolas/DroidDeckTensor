@@ -1644,3 +1644,55 @@ rather than a crash.
 **Where this stands:** four measured steps, each moving the wall strictly later - §36 build identity,
 §37 `nodelete`, §38-39 the `AcquireNextImage2KHR` slot. The client no longer crashes; it renders and
 presents, and the compositor refuses the buffer. The crash that cost sessions 29-45 is closed.
+
+## 40. The dma-buf import wall: the HAL faults on DRM-format-modifier images (2026-10-11)
+
+With the crash closed (§37-39), the client's frames reach gamescope and gamescope cannot import
+them: `wlr_linux_dmabuf_v1.c:219 Failed to import DMA-BUF FD for plane 0: Invalid argument`.
+
+**Reproduced in isolation** (`probes/vk_dmabuf_import_test.c`, exported BGRA8 LINEAR exactly as
+`pvr_wsi.c` does, then imported the way a compositor does):
+
+```
+vkGetMemoryFdPropertiesKHR -> 0  memoryTypeBits=0x6
+import fd as a plain LINEAR image        -> vkAllocateMemory=0
+import the SAME fd as a DRM_FORMAT_MODIFIER image -> vkCreateImage=0,
+    vkGetImageMemoryRequirements -> size=16384 typeBits=0x7,
+    vkAllocateMemory -> SEGFAULT
+```
+
+So the fd is valid and importable; **the HAL segfaults when the importing image uses
+`VK_IMAGE_TILING_DRM_FORMAT_MODIFIER_EXT`** - the tiling a compositor's Vulkan renderer uses. The
+HAL's `VK_EXT_image_drm_format_modifier` support is broken for this (its `vkGetImageDrmFormatModifier
+PropertiesEXT` and modifier import path are not sound).
+
+**First mitigation, shipped and measured.** The ICD now **suppresses
+`VK_EXT_image_drm_format_modifier`** from device-extension enumeration, so a compositor does not take
+the modifier path:
+
+* Before: gamescope logged `physical device supports DRM format modifiers`, imported with modifiers,
+  and the client died (`guest.exited status 1`).
+* After (session `2026-10-11-22-steam`): gamescope logs `physical device does not support DRM format
+  modifiers`, and the session **exits 0 with no crash**, running much longer.
+
+**Not yet solved - the import still fails, and the reason is not the modifier path alone.** After the
+suppression gamescope still logs two `Failed to import DMA-BUF FD ... Invalid argument`, for the
+buffers at real sizes (2404x1080 for the update UI's `xid 0x800002`, 64x24 for a client surface
+`0xe00005`). The 1x1 client swapchains (`0x1200002`, `0x1400002`) are a *consequence*: our WSI's
+`wsi_surface_caps` reads the window geometry, gets nothing for a not-yet-mapped X window, and reports
+`currentExtent = UINT32_MAX`; the client then picks 1x1.
+
+**So the remaining question is why wlroots' linux-dmabuf import rejects our fd** even without the
+modifier path. Our glibc probe imports the same fd successfully, so the difference is in how the
+*compositor* imports (EGL/GBM `EGL_EXT_image_dma_buf_import` vs Vulkan external memory, or a
+format/plane check wlroots does before the driver call). The next step is to read gamescope's
+`wlr_linux_dmabuf_v1.c:219` (its wlroots fork, not upstream) and match the check it fails.
+
+**Also fixed in this step:** `icd_enum_device_ext` returned `VK_INCOMPLETE` whenever any extension was
+filtered, which made the loader treat the enumeration as truncated and the app see
+`VK_KHR_external_memory_fd` et al. as *missing* (gamescope logged exactly that). `VK_INCOMPLETE` now
+means only "more than fit", per spec.
+
+**Net progress this session:** build identity (§36), the crash (§37-39, gone), and the modifier-path
+mitigation. The client runs to exit 0 instead of crashing; frames still do not reach the screen
+because the compositor will not import the buffer.

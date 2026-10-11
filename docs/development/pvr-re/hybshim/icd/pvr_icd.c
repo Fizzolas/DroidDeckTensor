@@ -290,31 +290,54 @@ static void *icd_gpdpa(void *pd, const char *pName) {
     return hal ? hal(pd, pName) : NULL;
 }
 
+/* Device extensions this ICD does NOT pass through, because the HAL's support is broken and
+ * advertising it makes apps take a path that faults. Measured: with VK_EXT_image_drm_format_modifier
+ * visible, gamescope's Vulkan renderer imports the WSI's dma-buf as a
+ * VK_IMAGE_TILING_DRM_FORMAT_MODIFIER_EXT image, and the HAL segfaults in vkAllocateMemory for the
+ * import (vk_dmabuf_import_test.c, step 3); the same fd imports fine as a plain LINEAR image. Without
+ * the extension the compositor falls back to the linear import, which works. */
+static int icd_ext_suppressed(const char *name) {
+    return !strcmp(name, "VK_EXT_image_drm_format_modifier");
+}
+
 static VkResult icd_enum_device_ext(void *pd, const char *layer, uint32_t *count, void *props) {
     if (!g_gipa && icd_load() != 0) return VK_ERROR_INITIALIZATION_FAILED;
     VkResult (*he)(void *, const char *, uint32_t *, void *) =
         (VkResult (*)(void *, const char *, uint32_t *, void *))g_gipa(g_instance, "vkEnumerateDeviceExtensionProperties");
     if (!he) return VK_ERROR_INITIALIZATION_FAILED;
     uint32_t hc = 0; he(pd, layer, &hc, NULL);
-    /* Only add the ones the HAL does not already report. */
-    int add[ICD_NUM_DEVICE_EXTENSIONS], nadd = 0;
     void *tmp = NULL;
     struct { char name[256]; uint32_t ver; } *arr0 = NULL;
-    if (hc) { tmp = malloc(hc * 260); he(pd, layer, &hc, tmp); arr0 = tmp;
+    if (hc) { tmp = malloc(hc * 260); he(pd, layer, &hc, tmp); arr0 = tmp; }
+    /* The HAL's list minus the suppressed ones. */
+    int add[ICD_NUM_DEVICE_EXTENSIONS], nadd = 0;
+    if (hc) {
         for (int i = 0; i < ICD_NUM_DEVICE_EXTENSIONS; i++) {
             int present = 0; for (uint32_t k = 0; k < hc; k++) if (!strcmp(arr0[k].name, ICD_DEVICE_EXTENSIONS[i])) { present = 1; break; }
             if (!present) add[nadd++] = i;
-        } }
-    else { for (int i = 0; i < ICD_NUM_DEVICE_EXTENSIONS; i++) add[nadd++] = i; }
-    if (!props) { *count = hc + nadd; free(tmp); return VK_SUCCESS; }
-    uint32_t room = *count;
-    uint32_t cap = room < hc ? room : hc;
-    VkResult r = he(pd, layer, &cap, props);
+        }
+    } else { for (int i = 0; i < ICD_NUM_DEVICE_EXTENSIONS; i++) add[nadd++] = i; }
+    if (!props) {
+        uint32_t keep = 0;
+        for (uint32_t k = 0; k < hc; k++) if (!icd_ext_suppressed(arr0[k].name)) keep++;
+        *count = keep + nadd; free(tmp); return VK_SUCCESS;
+    }
+    uint32_t room = *count, out = 0;
+    uint32_t keep = 0;
+    for (uint32_t k = 0; k < hc; k++) if (!icd_ext_suppressed(arr0[k].name)) keep++;
     struct { char name[256]; uint32_t ver; } *arr = (void *)props;
-    uint32_t out = cap;
+    for (uint32_t k = 0; k < hc && out < room; k++) {
+        if (icd_ext_suppressed(arr0[k].name)) continue;
+        memcpy(arr[out].name, arr0[k].name, sizeof(arr[out].name));
+        arr[out].ver = arr0[k].ver; out++;
+    }
     for (int i = 0; i < nadd && out < room; i++) { strncpy(arr[out].name, ICD_DEVICE_EXTENSIONS[add[i]], 255); arr[out].name[255] = 0; arr[out].ver = 1; out++; }
+    uint32_t total = keep + nadd;
     *count = out; free(tmp);
-    return (r == VK_INCOMPLETE || cap < hc) ? VK_INCOMPLETE : VK_SUCCESS;
+    /* VK_INCOMPLETE means "more extensions exist than fit" - NOT "one was filtered out". Reporting it
+     * when the list did fit makes the loader treat the enumeration as truncated and the app see the
+     * extensions as missing (measured: gamescope reported VK_KHR_external_memory_fd et al. missing). */
+    return (out < total) ? VK_INCOMPLETE : VK_SUCCESS;
 }
 
 /* Append the extensions this ICD provides to whatever the HAL reports, so the loader lets an app
