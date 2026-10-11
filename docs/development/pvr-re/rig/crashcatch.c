@@ -110,7 +110,11 @@ static void handler(int sig, siginfo_t *si, void *ctx) {
                 int mf = open("/proc/self/maps", O_RDONLY);
                 if (mf >= 0) {
                     static char mb[1 << 19];
-                    ssize_t n = read(mf, mb, sizeof(mb) - 1);
+                    /* Read to the end: procfs answers a large read in short chunks, so a single
+                     * read() gets only the first few mappings and the later modules are missed. */
+                    ssize_t n = 0, r;
+                    while (n < (ssize_t)sizeof(mb) - 1 &&
+                           (r = read(mf, mb + n, sizeof(mb) - 1 - n)) > 0) n += r;
                     close(mf);
                     if (n > 0) {
                         mb[n] = 0;
@@ -140,7 +144,9 @@ static void handler(int sig, siginfo_t *si, void *ctx) {
                 int mf = open("/proc/self/maps", O_RDONLY);
                 if (mf >= 0) {
                     static char qb2[1 << 19];
-                    ssize_t n = read(mf, qb2, sizeof(qb2) - 1);
+                    ssize_t n = 0, r;
+                    while (n < (ssize_t)sizeof(qb2) - 1 &&
+                           (r = read(mf, qb2 + n, sizeof(qb2) - 1 - n)) > 0) n += r;
                     close(mf);
                     if (n > 0) { qb2[n] = 0;
                         for (char *q = qb2; q && *q; ) {

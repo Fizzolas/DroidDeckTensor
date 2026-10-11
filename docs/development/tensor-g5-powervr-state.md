@@ -1031,3 +1031,49 @@ cross-compilation goes through it.
 So: the remaining fault is an instruction fetch through a value that was in place at load, aimed inside
 the ICD's image, called from the HAL - and the next step is to re-run the rig to get PLT values taken
 with a base that is trustworthy. Until then the reading above is a hypothesis, not a result.
+
+## 25. Pinned: the HAL's interposed-symbol PLT slots point into the ICD (2026-10-10)
+
+With `crashcatch` fixed to take each module's base from `/proc/self/maps` (it had used `pc - 0x6c17c`, a
+constant from when the fault was in q.so, and read the wrong memory once the fault moved), the HAL's
+PLT was dumped with trustworthy bases, three runs in a row:
+
+```
+run 3  ICD base 0x7618680000   slot 73 value - ICD = 0xbd9c
+run 4  ICD base 0x73ac190000   si_addr        - ICD = 0xbd9c   (no PLT dump - maps parse short-read)
+run 5  ICD base 0x7b9cad0000   slot 73 value - ICD = 0xbd9c
+```
+
+**Exactly 17 of the HAL's 352 PLT slots hold an address inside our ICD** (base `0x7b9cad0000`):
+
+```
+slot  13 pthread_mutex_lock   -> ICD+0xbf20      slot 167 fclose   -> ICD+0xd00c
+slot  14 pthread_mutex_unlock -> ICD+0xbfdc      slot 168 fgets    -> ICD+0xd2cc
+slot  30 malloc               -> ICD+0xbcec      slot 197 fseek    -> ICD+0xd5c4
+slot  57 pthread_cond_wait    -> ICD+0xc544      slot 198 ftell    -> ICD+0xd700
+slot  68 pthread_cond_signal  -> ICD+0xc448      slot 220 pthread_getspecific -> ICD+0xca8c
+slot  70 pthread_cond_broadcast-> ICD+0xc34c     slot 348 strlen   -> ICD+0xbd8c
+slot  73 strcmp               -> ICD+0xbd9c      slot 349 memcpy   -> ICD+0xbd5c
+slot  75/76/77 pthread_rwlock_{w,un,rd}lock -> ICD+0xccfc / +0xccbc / +0xcd64
+```
+
+Every one is in `ICD+0xbd5c .. 0xd700` - inside **our ICD's PROT_NONE inter-segment gap** (vaddr
+`0x64f8..0x164f8`, which is `---p` by design between the read-only and executable segments). Slot 72,
+a neighbour of the interposed set, resolves normally to a real module (`0x7baa17db00`), so the table is
+not globally broken.
+
+**So:** the HAL's imports of the **allocator and pthread primitives - the symbols libhybris
+interposes** - resolve to addresses in our ICD's PROT_NONE gap, and the first call through one of them
+(`strcmp`, from `vulkan_device_open`) is the fault.
+
+**Not yet established: why.** The shape is a table indexed consistently by slot, and the values are
+frame-independent (the same 17 slots, the same offsets, across every run), so something is filling them
+deliberately rather than corrupting them at random. Candidates not yet tested: libhybris's hook layer
+returning a table entry that lands in the ICD's address space; the ICD's own symbol table being used as
+the resolution target for interposed symbols; or an offset applied to the wrong module's base. The
+`/proc/self/maps` short-read is now fixed in `crashcatch.c` (procfs answers large reads in chunks, so a
+single `read()` got only the first few mappings).
+
+**Gap in the rig:** `symwatch` produced no output (`/tmp/sym.log` absent) - libhybris's hook callback is
+a single slot and the ICD sets its own, so whichever runs last wins. To see what the hook layer is
+asked, the ICD's callback has to chain to the recorder, or the ICD's own trace has to be used.
