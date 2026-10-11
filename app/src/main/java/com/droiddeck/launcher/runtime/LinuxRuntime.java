@@ -404,19 +404,30 @@ public final class LinuxRuntime {
             // The GPU's card node, the way libdrm finds a device's primary: the card* entry beside
             // the render node. gamescope's Wayland backend requires one (rendervulkan.cpp), so
             // without it the session dies at "physical device has no primary node" and falls back to
-            // SDL. Where the device link above is the kernel's own directory this already comes with
-            // it; otherwise it is described here from the real sysfs, which the app may read.
+            // SDL. It matters just as much to GBM: gbm_create_device() is handed a card node by its
+            // callers (Chromium's gbm_wrapper.cc among them), and a guest whose /dev/dri has only
+            // the render node cannot open one.
+            //
+            // Where the device link above is the kernel's own directory (real != null), the sysfs
+            // side of the card node already comes with it - the guest reads card*/dev through the
+            // symlink - so only the device node under /dev/dri is missing. Where the tree is
+            // fabricated (real == null, an Adreno) both are written here. The sysfs writes must NOT
+            // run when real != null: device/drm/ is then the kernel's read-only directory, and
+            // writing card*/dev there throws EACCES (measured on a Tensor G5 - it is what left the
+            // stand-in with renderD128 and no card node at all).
             String card = powervr ? cardNodeFor(gpuNode) : null;
             if (card != null) {
                 String[] cardDev = card.split(":");
-                File cardEntry = new File(drm.getParentFile(), "card" + cardDev[1]);
-                Files.write(new File(cardEntry, "dev").toPath(),
-                        (card + "\n").getBytes(StandardCharsets.UTF_8));
-                // The device numbers on the uevent's own MAJOR/MINOR lines are what the ICD reads to
-                // report the primary dev_t (it cannot stat /dev/dri/card* either).
-                Files.write(new File(cardEntry, "uevent").toPath(),
-                        ("MAJOR=" + cardDev[0] + "\nMINOR=" + cardDev[1] + "\nDEVNAME=dri/card" + cardDev[1]
-                                + "\nDEVTYPE=drm_minor\n").getBytes(StandardCharsets.UTF_8));
+                if (real == null) {
+                    File cardEntry = new File(drm.getParentFile(), "card" + cardDev[1]);
+                    Files.write(new File(cardEntry, "dev").toPath(),
+                            (card + "\n").getBytes(StandardCharsets.UTF_8));
+                    // The device numbers on the uevent's own MAJOR/MINOR lines are what the ICD reads
+                    // to report the primary dev_t (it cannot stat /dev/dri/card* either).
+                    Files.write(new File(cardEntry, "uevent").toPath(),
+                            ("MAJOR=" + cardDev[0] + "\nMINOR=" + cardDev[1] + "\nDEVNAME=dri/card" + cardDev[1]
+                                    + "\nDEVTYPE=drm_minor\n").getBytes(StandardCharsets.UTF_8));
+                }
                 new File(dri, "card" + cardDev[1]).createNewFile();
             }
         } catch (IOException | ErrnoException e) {
@@ -488,12 +499,21 @@ public final class LinuxRuntime {
         File[] entries = drmDir.listFiles((d, name) -> name.startsWith("card"));
         if (entries == null) return null;
         for (File card : entries) {
-            try {
-                String numbers = new String(Files.readAllBytes(new File(card, "dev").toPath()),
-                        StandardCharsets.UTF_8).trim();
-                if (numbers.matches("\\d+:\\d+")) return numbers;
-            } catch (IOException e) {
-                // A card node whose dev cannot be read is simply not the one we can describe.
+            // The card's own dev file is readable through the render node's device link on some
+            // kernels, but a retail phone's SELinux policy denies that read (the link crosses into
+            // the GPU device's directory) - measured on a Tensor G5, which is why the stand-in was
+            // built with renderD128 and no card node at all. /sys/class/drm/<card>/dev names the
+            // same node through a path the app may read, so try it first and fall back.
+            for (String devFile : new String[]{
+                    "/sys/class/drm/" + card.getName() + "/dev",
+                    new File(card, "dev").getPath()}) {
+                try {
+                    String numbers = new String(Files.readAllBytes(new File(devFile).toPath()),
+                            StandardCharsets.UTF_8).trim();
+                    if (numbers.matches("\\d+:\\d+")) return numbers;
+                } catch (IOException e) {
+                    // A card node whose dev cannot be read through this path: try the next one.
+                }
             }
         }
         return null;
