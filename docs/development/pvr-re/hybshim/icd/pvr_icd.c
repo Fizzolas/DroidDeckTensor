@@ -129,6 +129,22 @@ static FILE *diagf(void) {
     if (!tried) { const char *p = getenv("PVR_ICD_DIAG"); tried = 1; if (p) f = fopen(p, "a"); }
     return f;
 }
+/* Every symbol libhybris is asked to resolve for the HAL, and (through diag_plt) what the HAL's PLT
+ * ends up holding. The callback is libhybris's documented seam; setting it here is safe because the
+ * ICD loads the HAL, so it is registered before any of the HAL's symbols are resolved. NULL means
+ * "resolve it normally". */
+typedef void *(*hook_cb_t)(const char *name, const char *requester);
+extern void hybris_set_hook_callback(hook_cb_t callback);
+static void *diag_hook(const char *name, const char *requester) {
+    FILE *o = diagf();
+    if (o && name) {
+        fprintf(o, "ICD hook pid=%d sym=%s requester=%s\n",
+                (int)getpid(), name, requester ? requester : "(null)");
+        fflush(o);
+    }
+    return NULL;
+}
+
 static void diag_plt(unsigned long long base, const char *when) {
     FILE *o = diagf();
     if (!o || !base) return;
@@ -148,6 +164,7 @@ static void diag_plt(unsigned long long base, const char *when) {
 /* Load the bionic HAL once. Returns 0 on success. */
 static int icd_load(void) {
     if (g_gipa) return 0;
+    if (diagf()) hybris_set_hook_callback(diag_hook);   /* before the HAL's symbols are resolved */
     g_blob = android_dlopen_ext(BLOB, RTLD_NOW, NULL);
     if (!g_blob) { fprintf(stderr, "pvr_icd: android_dlopen_ext(%s) failed: %s\n", BLOB, android_dlerror()); return -1; }
 

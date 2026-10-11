@@ -1118,3 +1118,52 @@ allocated it, and why the hook layer hands out addresses inside it - is the next
 **Rig note:** the ICD now takes `PVR_ICD_DIAG` from the session environment (set by the overlay session
 script's rig block) and appends the HAL's PLT at `open` to that file, so open-time and crash-time views
 can be compared in one session. That comparison is what produced both corrections above.
+
+## 27. The mechanism: libhybris resolves the HAL's interposed imports to trampolines that are not
+## executable (2026-10-11)
+
+The ICD now logs every symbol libhybris is asked to resolve (its hook callback, registered before the
+HAL is loaded, writing to `PVR_ICD_DIAG`). One session produced **109,590 queries**, and among them the
+HAL's own, matching the bad slots exactly:
+
+```
+ICD hook sym=strcmp            requester=/vendor/lib64/hw/vulkan.powervr.so
+ICD hook sym=malloc            requester=/vendor/lib64/hw/vulkan.powervr.so
+ICD hook sym=pthread_mutex_lock requester=/vendor/lib64/hw/vulkan.powervr.so
+ICD hook sym=fclose / pthread_getspecific / strlen / memcpy / __memcpy_chk   (same requester)
+```
+
+So libhybris **is** asked, for exactly the symbols that end up unusable - and what it answers becomes
+the HAL's PLT slot.
+
+**What it answers.** `hybris/common/wrappers.c:157`:
+
+```c
+wrapper_addr = mmap(NULL, wrapper_size,
+    PROT_READ | PROT_WRITE | PROT_EXEC,
+    MAP_ANONYMOUS | MAP_PRIVATE, 0, 0);
+...
+memcpy(wrapper_addr, wrapper_code, wrapper_size);
+return (void*)wrapper_addr + thumb_fixup;
+```
+
+For each interposed symbol libhybris can hand back a small generated **trampoline** in a fresh mapping,
+rather than the hook function itself. The HAL's slots hold addresses that resolve to an **anonymous
+`---p` (PROT_NONE) region** - the shape of that trampoline area, but with no access. The first call
+through one of them (`strcmp`, from `vulkan_device_open`) is the fault.
+
+**So the defect is:** the trampolines libhybris generates for the HAL's interposed imports live in a
+region that is not executable, so calling through them faults immediately. It is not corruption (the
+values are identical before `open`, after `open` and at the crash, §26) and not our ICD (§26).
+
+**What is not established:** why that region is PROT_NONE. `create_wrapper` asks for
+`PROT_READ|PROT_WRITE|PROT_EXEC`, and the mapping that results is read-only-none - so either the
+`PROT_EXEC` request is refused or downgraded on this kernel, or the address handed out is not the
+mapping that was made. `create_wrapper` only generates a trampoline when tracing is on
+(`case WRAPPER_HOOKED: if(!trace_hooked) return function;`) and no `HYBRIS_TRACE_*` is set in the
+session, which is a second thing that does not add up yet.
+
+**Next step, and it is a lever as well as a measurement:** have the ICD's hook callback resolve each
+symbol itself (`android_dlsym`) and return that, instead of returning NULL and letting libhybris answer
+with a trampoline. That logs the address actually handed to the HAL *and* bypasses the trampoline path
+if the trampolines are the problem.
