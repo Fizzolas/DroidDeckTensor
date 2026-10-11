@@ -118,6 +118,33 @@ void *pvr_icd_resolve(void *instance, const char *name) {
     return g_gipa((VkInstance)instance, name);
 }
 
+/* Diagnostic: the HAL's PLT at open, so it can be compared with the same table at a later crash.
+ * The question is whether a slot's value CHANGES during the process's life (something rewrites it)
+ * or was already wrong when the HAL was opened. Off unless PVR_ICD_DIAG names a file to append to. */
+#define HAL_OPEN_VADDR   0x1b9ee0u
+#define HAL_GOT_PLT_OFF  0x286ab0u
+#define HAL_GOT_PLT_N    349
+static FILE *diagf(void) {
+    static FILE *f; static int tried;
+    if (!tried) { const char *p = getenv("PVR_ICD_DIAG"); tried = 1; if (p) f = fopen(p, "a"); }
+    return f;
+}
+static void diag_plt(unsigned long long base, const char *when) {
+    FILE *o = diagf();
+    if (!o || !base) return;
+    char cb[64] = {0};
+    int cf = open("/proc/self/comm", O_RDONLY);
+    if (cf >= 0) { ssize_t r = read(cf, cb, sizeof(cb) - 1); (void)r; close(cf); }
+    for (char *q = cb; *q; q++) if (*q == 10) { *q = 0; break; }
+    unsigned long long *g = (unsigned long long *)(uintptr_t)(base + HAL_GOT_PLT_OFF);
+    fprintf(o, "ICD %s pid=%d comm=%s base=%llx", when, (int)getpid(), cb, base);
+    static const int w[] = {13,14,30,57,68,70,73,75,76,77,167,168,197,198,220,348,349};
+    for (unsigned k = 0; k < sizeof(w)/sizeof(w[0]); k++)
+        fprintf(o, " %d=%llx", w[k], g[w[k]]);
+    fprintf(o, "\n");
+    fflush(o);
+}
+
 /* Load the bionic HAL once. Returns 0 on success. */
 static int icd_load(void) {
     if (g_gipa) return 0;
@@ -127,8 +154,17 @@ static int icd_load(void) {
     hw_module_t *mod = (hw_module_t *)android_dlsym(g_blob, "HMI");
     if (!mod || !mod->methods || !mod->methods->open) { icd_log("no HMI/open in the HAL"); return -1; }
 
+    { Dl_info hi; unsigned long long hb = 0;
+      if (dladdr((void *)mod->methods->open, &hi) && hi.dli_fbase)
+          hb = (unsigned long long)(uintptr_t)hi.dli_fbase;
+      /* dladdr cannot see a libhybris-loaded library, so fall back to the known file offset of the
+       * entry point (vulkan_device_open is at 0x1b9ee0). */
+      if (!hb) hb = (unsigned long long)(uintptr_t)mod->methods->open - HAL_OPEN_VADDR;
+      diag_plt(hb, "before_open"); }
     void *dev = NULL;
     int rc = mod->methods->open(mod, "vk0", &dev);
+    { unsigned long long hb = (unsigned long long)(uintptr_t)mod->methods->open - HAL_OPEN_VADDR;
+      diag_plt(hb, "after_open"); }
     if (rc != 0 || !dev) { fprintf(stderr, "pvr_icd: HAL open(vk0) rc=%d\n", rc); return -1; }
 
     hwvulkan_device_t *d = (hwvulkan_device_t *)dev;

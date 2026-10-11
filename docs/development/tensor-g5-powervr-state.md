@@ -1077,3 +1077,44 @@ single `read()` got only the first few mappings).
 **Gap in the rig:** `symwatch` produced no output (`/tmp/sym.log` absent) - libhybris's hook callback is
 a single slot and the ICD sets its own, so whichever runs last wins. To see what the hook layer is
 asked, the ICD's callback has to chain to the recorder, or the ICD's own trace has to be used.
+
+## 26. The PLT values do not change - and they are not in the ICD (2026-10-10/11)
+
+Two corrections to §25, both from measuring rather than reasoning, and the finding that survives.
+
+**Correction 1: the values are not in our ICD.** §25 read "ICD+0xbd9c" because one run's layout put the
+ICD where those addresses fell. With the ICD dumping its own view at the HAL's `open`
+(`PVR_ICD_DIAG`), the target resolves against the maps to an **anonymous `---p` (PROT_NONE) region**,
+not to `libvulkan_powervr.so`. The "ICD + 0xbd9c" was a coincidence of that run's address layout.
+
+**Correction 2: the slots do not change.** Same pid, same process, before and after the HAL's `open`,
+and then at the crash:
+
+```
+OPEN  [before_open] pid=29299 slot73 = 0x7d4843bd9c
+OPEN  [after_open]  pid=29299 slot73 = 0x7d4843bd9c
+CRASH               pid=29299 si_addr = 0x7d4843bd9c
+```
+
+So nothing rewrites them. **They are already wrong when the HAL loads**, which makes this a
+**resolution** error and not corruption - and it rules out "something disturbs the table later".
+
+**What survives, and is now measured:**
+
+* The HAL's 17 interposed-symbol PLT slots - `malloc`, `memcpy`, `strcmp`, `strlen`, `fclose`,
+  `fgets`, `fseek`, `ftell`, `pthread_mutex_lock/unlock`, `pthread_cond_wait/signal/broadcast`,
+  `pthread_rwlock_rdlock/wrlock/unlock`, `pthread_getspecific` - hold addresses in **one anonymous
+  PROT_NONE region**, tightly spaced (~`0x2e0` apart over ~6.7 KB).
+* The values are identical before and after `open`, and identical across every run (same offsets
+  relative to whatever base they share).
+* The crash is the first call through one of them: `strcmp`, from the HAL's `vulkan_device_open`
+  (HAL file offset `0x1b9f10`).
+* Neighbouring non-interposed slots resolve to real modules, so the table is not globally broken.
+
+**So the defect is: the HAL's imports of exactly the symbols libhybris interposes are resolved to an
+anonymous PROT_NONE region instead of to libhybris's hook functions.** The region's identity - what
+allocated it, and why the hook layer hands out addresses inside it - is the next question.
+
+**Rig note:** the ICD now takes `PVR_ICD_DIAG` from the session environment (set by the overlay session
+script's rig block) and appends the HAL's PLT at `open` to that file, so open-time and crash-time views
+can be compared in one session. That comparison is what produced both corrections above.

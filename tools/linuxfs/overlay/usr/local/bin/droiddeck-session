@@ -22,6 +22,11 @@ if [ -e /tmp/crashcatch.so ] || [ -e /tmp/mmwatch.so ] || [ -e /tmp/symwatch.so 
   export LD_PRELOAD
   CRASHCATCH_ALL=1
   export CRASHCATCH_ALL
+  # The ICD dumps the HAL PLT to this file at open, so it can be compared with the same table at a
+  # crash - the difference tells whether a PLT slot is rewritten during the process or was already
+  # wrong when the HAL loaded.
+  PVR_ICD_DIAG=/tmp/icd_plt.log
+  export PVR_ICD_DIAG
 fi
 mode=${1:-desktop}
 shift || true
