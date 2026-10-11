@@ -302,10 +302,17 @@ class SessionService : Service() {
      * choice: an empty preference on an Adreno stays the runtime's own driver.
      */
     private fun effectiveLinuxDriver(chosen: String): String {
+        // Refreshing the bundled driver has to happen even when one is already chosen, or an apk
+        // that carries a new build of it never reaches an install that exists: the choice is the id,
+        // not a promise the directory matches the apk. installBundled re-extracts only when this
+        // apk did not put the directory there, so a session on an unchanged driver does no work.
+        bundledId()?.let { LinuxVulkanDriverManager(this).installBundled(it) }
         if (!chosen.isEmpty()) return chosen
-        val id = LinuxVulkanDriverManager.bundledIdFor(GpuInfo.detect()) ?: return ""
-        return LinuxVulkanDriverManager(this).installBundled(id) ?: ""
+        return bundledId() ?: ""
     }
+
+    /** The driver this apk bundles for the GPU in front of us, or null. */
+    private fun bundledId(): String? = LinuxVulkanDriverManager.bundledIdFor(GpuInfo.detect())
 
     private fun tuDebug(linuxDriverId: String): String? {
         val override = File(Environment.getExternalStorageDirectory(), TU_DEBUG_SWITCH)

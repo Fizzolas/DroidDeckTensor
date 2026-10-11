@@ -125,6 +125,9 @@ static void line(const char *op, void *addr, size_t len, int prot, long long res
     put(" caller=", 8); putx((unsigned long long)lr); put(" ", 1);
     put_module(lr);
     put("\n", 1);
+    /* Every line, not just on a full buffer: a process that crashes never runs the destructor, so a
+     * buffered tail is lost - and the tail is exactly the record that matters. */
+    wflush();
 }
 
 void *mmap(void *addr, size_t len, int prot, int flags, int fd, off_t off) {

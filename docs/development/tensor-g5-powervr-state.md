@@ -954,3 +954,53 @@ being written, not with anything under `files/linuxfs/`.
 **Still true and worth keeping:** `droiddeck-session` and the other `usr/local/bin/*` scripts are
 redeployed from the apk at every session start (`SessionFiles.kt`), so a guest-side edit to one lasts
 exactly one session. Instrumentation that must survive has to go through the app build.
+
+## 23. The guard fix was never shipped - and the rig proved it in one line (2026-10-10)
+
+With the rig live, the crashed page resolved to a **read-only linker page**, i.e. fault #1, the
+`ProtectedDataGuard` bug that was fixed (§18). It could not be: a fix did not change the fault, so the
+fix was not running.
+
+**It was not running because it had never been shipped.** The guest's `q.so` was `fb3908ce` - the
+original - while the fix existed only as a patch in the repo and as a file that had been hand-copied
+once. That is the "the new apk was not shipped" trap, and the rig turned it from an inference into one
+`md5sum`.
+
+Getting it shipped needed two things, and the second was the real defect:
+
+* the built `q.so` had to be put into the shipped asset (`package_asset.py`), and the apk's version
+  bumped so the driver is re-extracted;
+* **`SessionService.effectiveLinuxDriver` returned early when a driver was already chosen**:
+
+  ```kotlin
+  private fun effectiveLinuxDriver(chosen: String): String {
+      if (!chosen.isEmpty()) return chosen          // <- never reaches installBundled
+      ...
+      return LinuxVulkanDriverManager(this).installBundled(id) ?: ""
+  }
+  ```
+
+  `session.xml` holds `<string name="linuxDriver">powervr-g5x</string>`, so the choice is always set on
+  this device and `installBundled` was **never called from a session**. A bundled driver that is
+  explicitly chosen could never be updated - the version stamp of §15 was correct and unreachable.
+
+  Now the install runs first and the choice is returned after it. `installBundled` re-extracts only
+  when this apk did not put the directory there, so an unchanged driver still does no work.
+
+**Measured after the fix:** the guest extracts `q.so` = `de7e96cd...` (the patched build) with
+`installedByVersionCode: 14`, and the session's fault **changed** -
+
+```
+before  si_addr=...c028  pc=<libhybris+0x2d9c>   a STORE into a read-only linker page
+after   si_addr == pc == <ICD + 0x4d9c>          an INSTRUCTION FETCH, lr in the HAL's
+                                                 vulkan_device_open (HAL file 0x1b9f10)
+```
+
+The store-into-a-protected-page fault is gone. What remains is a jump to an address in a `---p`
+(PROT_NONE) region inside **our own ICD**, called from the HAL's `vulkan_device_open`.
+
+**Also found:** installing an apk does not restart a running app process, so the new code is not in
+effect until it is force-stopped - and the driver refresh does not happen either, because it runs in
+the old process. This cost a run; `am force-stop com.droiddeck.launcher` is now part of the loop.
+
+See `docs/development/pvr-re/rig/` for the instrumentation that found all of this.
