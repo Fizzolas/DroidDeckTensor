@@ -869,3 +869,48 @@ symbols, which is a concrete thing to chase rather than a mystery.
 **Also a correction:** the catcher's `q.so_base` readout assumes the faulting `pc` is at `q.so+0x6c17c`,
 which is only true of the §17 crash. In this report it printed a meaningless value; only `si_addr`,
 `pc`, `lr` and the register set are load-bearing there.
+
+## 21. Where the 17 bad slots point, and the diagnostic that is silent (2026-10-10)
+
+§20 established that 17 of the HAL's 352 PLT slots hold unmapped addresses, and that they are the
+allocator and pthread symbols libhybris interposes. Two more facts, and one dead end worth recording so
+nobody repeats it.
+
+**Where they point.** With `q.so`'s real base (`0x76f59f0000`, its `r--p` mapping at file offset 0) the
+17 addresses are `base + 0x13bd5c` through `base + 0x13d700`. `q.so`'s loaded image ends at
+`base + 0xf1408` (the last `LOAD` is `vaddr 0xee2a8`, `memsz 0x3160`). So **they point past the end of
+the DSO's own image**, about 480 KB beyond it, into a region that was never mapped. They are not
+arbitrary: they are tightly packed (about `0x30` apart across a 6 KB span), which is the shape of a
+table of same-sized entries rather than 17 independent function addresses.
+
+**The diagnostic exists and is silent.** `__hybris_get_hooked_symbol` knows about exactly this failure
+and says so in a comment:
+
+```c
+if (strncmp(sym, "pthread", 7) == 0 || strncmp(sym, "__pthread", 9) == 0) {
+    if (strcmp(sym, "pthread_sigmask") == 0) return NULL;
+    counter--;
+    // If you're experiencing a crash later on check the address of the
+    // function pointer being call. If it matches the printed counter value
+    // here then you can easily find out which symbol is missing.
+    LOGD("Missing hook for pthread symbol %s (counter %" PRIiPTR ")\n", sym, counter);
+    return (void *) counter;
+}
+```
+
+It returns a **small integer as a function pointer** when a pthread hook is missing - the crash it
+describes is this crash. The log it writes is at `HYBRIS_LOG_DEBUG`, and `logging.c` defaults
+`hybris_minimum_log_level` to `HYBRIS_LOG_WARN`, so none of it reaches the session log.
+
+**The dead end.** `HYBRIS_LOGGING_LEVEL=debug` is the switch (`logging.c:45`), and setting it - both on
+the client directly and on the session script so every guest process gets it - produced **no**
+`Missing hook` and no `Could not find a hook` lines, in a session that still crashed. So either the
+level is not being honoured on this path, or the hooks are being resolved by a different route than
+`__hybris_get_hooked_symbol`'s missing-hook branches. Raising the level is worth trying again with the
+output captured separately (the guest's `stderr` is interleaved into a very noisy session log), but it
+did not answer the question here.
+
+**Where this leaves it.** The mechanism is still open: whether those slots were resolved to a table that
+was never mapped, or resolved and then unmapped. What is settled is the *shape* - a bounded set of
+interposed libc symbols, all pointing at the same unmapped region just past `q.so`, and a resolver that
+has a branch for exactly this and does not report it.
