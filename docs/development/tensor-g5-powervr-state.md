@@ -1522,8 +1522,15 @@ guest files/linux_vulkan_drivers/powervr-g5x/
   libvulkan_powervr.so b31d4d2d...   = build_id.json   ✓   source ba22250
 ```
 
-**What this does not do.** The crash baseline is *unchanged*, not fixed: the guest already ran
-`c9b54d74`, and that is what now ships. §35's process-dependence and its next step (log the
-relocation that writes the hook table's `func`) stand exactly as written - but they are now
-answerable, because "which build was that?" has an answer. The count of sessions that produced
-nothing measurable (29->45) is the cost this section is meant to stop paying.
+**The crash baseline reproduces on the shipped build** (session `2026-10-11-11-steam`, the first
+run on a driver whose hashes are known): `Initted Wayland backend` -> the update UI's swapchain
+(`xid 0x800002`, 2404x1080) -> the client's own swapchain (`xid 0x1200002`, **1x1**, destroyed
+immediately) -> `Error: XRRGetOutputInfo() is not available` -> `steam exited rc=139`. Identical to
+sessions 44/45, so the fault is stable across builds and the earlier sessions were not lying - they
+were just unlabelled.
+
+**What this does not do.** The crash is *unchanged*, not fixed: the guest already ran `c9b54d74`,
+and that is what now ships. §35's process-dependence and its next step (log the relocation that
+writes the hook table's `func`) stand exactly as written - but they are now answerable, because
+"which build was that?" has an answer. The count of sessions that produced nothing measurable
+(29->45) is the cost this section is meant to stop paying.
