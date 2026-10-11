@@ -2087,3 +2087,24 @@ correctly rendered and presented; it is not yet a performance statement.
 
 **Reproduce:** `tools/droiddeckctl run /usr/bin/vkcube` (the session must be stopped/idle first; the
 env file `Download/droiddeck-env` must not carry a stale CEF switch - it is read with a lag).
+
+**Addendum to §48 - the GL path works too (session `2026-10-11-62-glxgears`).** `tools/droiddeckctl
+run /usr/bin/glxgears` renders through **mesa zink -> our ICD -> the PowerVR GPU** and presents
+through our WSI:
+
+```
+session.log:  pApplicationName: glxgears   pEngineName: mesa zink
+session.log:  [Gamescope WSI] Executable name: glxgears
+session.log:  pvr_wsi: swapchain: 3 images 300x300 stride 2048 fmt 44 (fd0=17)
+session.log:  pvr_wsi: Wayland present: 300x300 ... x20
+session.log:  1030 frames in 5.0 seconds = 205.923 FPS      (steady ~205 FPS)
+```
+
+So both guest rendering paths are proven on screen: **Vulkan** (vkcube, §48) and **GL via zink**
+(glxgears) - which is the path Steam's own client uses (`pEngineName: mesa zink` in its logs). The
+GL path's "Error getting buffer" line (the same one seen with Steam) is non-fatal here: glxgears ran
+at 205 FPS.
+
+**What this says about Steam.** Steam's *client UI* is the only thing still blocked, and it is blocked
+in CEF's GPU process (a Chromium component, §45-47), not in the driver or the WSI - both of which now
+carry real, correctly-rendered frames from two independent guest stacks.
