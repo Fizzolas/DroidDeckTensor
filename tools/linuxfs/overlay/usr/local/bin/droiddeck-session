@@ -8,6 +8,21 @@
 # BL_WIDTH / BL_HEIGHT size the output, BL_FPS limits it, BL_LOG collects everything said here.
 set -u
 export HOME=${HOME:-/root}
+
+# Test rig. If the instrumentation shims are present in the guest, preload them for the whole
+# session so every process - the compositor, the X server and the client - is recorded rather than
+# only the one that happens to crash. Nothing is preloaded and nothing changes when the shims are
+# absent, so a release build is unaffected; see docs/development/pvr-re/rig/.
+if [ -e /tmp/crashcatch.so ] || [ -e /tmp/mmwatch.so ] || [ -e /tmp/symwatch.so ]; then
+  _rig=""
+  for _m in crashcatch mmwatch symwatch; do
+    [ -e "/tmp/$_m.so" ] && _rig="${_rig:+$_rig }/tmp/$_m.so"
+  done
+  LD_PRELOAD="${_rig}${LD_PRELOAD:+ $LD_PRELOAD}"
+  export LD_PRELOAD
+  CRASHCATCH_ALL=1
+  export CRASHCATCH_ALL
+fi
 mode=${1:-desktop}
 shift || true
 # One line per milestone, greppable as "== STEP", so a first run reads as a narrative rather than
