@@ -10,8 +10,39 @@ bionic Android **Vulkan HAL** cannot be `dlopen`ed by a glibc loader (every bion
 `probes/pvr_dltest.c`). libhybris's emulated bionic linker loads it anyway, and its libc hooks satisfy
 the loader-only symbols (`__loader_android_get_exported_namespace`) that made the trap.
 
+## Build identity — one command, and why
+
+```sh
+sh docs/development/pvr-re/hybshim/build_all.sh          # from WSL
+python3 -I docs/development/pvr-re/hybshim/package_asset.py
+```
+
+`build_all.sh` builds the shim (`build_hybris.sh`) and the ICD (`build_icd.sh`) **into the
+directories the app ships from** (`dist/` and `icd/`), then stamps `dist/build_id.json` with the
+sha256 of each artifact and the libhybris commit they came from. `package_asset.py` **refuses to
+package** unless the bytes on disk match that stamp.
+
+This exists because a day was lost to measuring one `libhybris.so` while shipping another. Every
+`build_hybris.sh` run wrote to a scratch drop (`/mnt/d/GUH/`) while `dist/` - the shipped copy - was
+updated only by hand, once. `_hybris_hook_strcmp` was at `0x3bf94`, `0x3c080`, `0x3bfd8` and
+`0x3bd9c` across four sessions that were all narrated as one thread; the shipped `libhybris.so` was
+`d7508713…` while the one under investigation was `c9b54d74…`. Same class of bug as the app-side
+"a bundled driver could never be updated" (state doc §15): the artifact under test was never the
+artifact under deployment, so no conclusion could compound.
+
+The asset carries `build_id.json`, so a hash taken during a session can be checked against the build
+it claims to be. Verify a running guest's driver with:
+
+```sh
+# inside the guest, or over adb, against files/linux_vulkan_drivers/powervr-g5x/
+sha256sum libhybris.so q.so libvulkan_powervr.so   # compare with build_id.json
+```
+
 ## What is here
 
+* `build_all.sh` — the one command: shim + ICD + stamp. Run it before any measurement.
+* `build_id.sh` — stamps `dist/build_id.json` (called by `build_all.sh`).
+* `build_icd.sh` — builds the ICD into `icd/`. It previously existed only loose at `/mnt/d/GUH/`.
 * `build_hybris.sh` — builds the two DSOs from a libhybris checkout. Reproducible, no Android SDK:
   uses `zig` (`zig cc`/`zig c++`) at `$HOME/zig-linux-x86_64-0.13.0`. Edit `CO=` to the checkout path.
 * `config/` — the three tiny headers libhybris normally gets from autotools + the `android-headers`

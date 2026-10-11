@@ -2,5 +2,9 @@
 dist/*
 !dist/meta.json
 !dist/package.sh
+# build_id.json is the record of what the last build produced and shipped - the file that makes a
+# session's artifact traceable. Keep it: it is the one thing that must NOT be a generated-and-forgotten
+# leftover, or "what did we actually run?" is unanswerable again.
+!dist/build_id.json
 icd/libvulkan_powervr.so
 build/

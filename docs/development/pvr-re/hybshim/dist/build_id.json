@@ -1,0 +1,14 @@
+{
+  "schemaVersion": 1,
+  "builtAt": "2026-10-11T13:00:17Z",
+  "artifacts": {
+    "libhybris.so": "c9b54d74938c08cc431a4b00a38104fb47db800c6eb3e4ebcf96ee6706493b8e",
+    "q.so": "ba9b7904f39053a676abbc62f278d67e48b04d1389335f7022bb3d23bc11f2ed",
+    "libvulkan_powervr.so": "b31d4d2d57286ea2ba527cccf1de731960fd9e5eced8bf05b7391b6d5580f421"
+  },
+  "libhybrisSource": {
+    "commit": "ba2225051eb4875d92aed95bbc7a8e840b22138e",
+    "branch": "droiddeck-pvr-rig",
+    "checkout": "/mnt/d/GUH/libhybris"
+  }
+}

@@ -1,6 +1,12 @@
 set -e
 ZIG=$HOME/zig-linux-x86_64-0.13.0/zig
-CO=/mnt/d/GUH/libhybris/hybris/common
+# The libhybris checkout. Override with HYBRIS_CO=/path/to/libhybris/hybris/common.
+CO=${HYBRIS_CO:-/mnt/d/GUH/libhybris/hybris/common}
+# Output goes to dist/, which is what package_asset.py ships. It used to go to a scratch
+# drop (/mnt/d/GUH/), and dist/ was updated only by hand - so the measured libhybris.so and
+# the shipped one silently diverged (d7508713 shipped vs c9b54d74 measured). Keep them equal.
+DIST=$(cd "$(dirname "$0")" && pwd)/dist
+mkdir -p "$DIST"
 OUT=/tmp/hyb_obj
 rm -rf "$OUT"; mkdir -p "$OUT/q" "$OUT/hk/lp"
 CF="-target aarch64-linux-gnu.2.38 -fPIC -O1 -w -D_GNU_SOURCE -D_LARGEFILE64_SOURCE -DANDROID -D_FORTIFY_SOURCE=1 -D_USING_LIBCXX -I$CO/include -I$CO -I$CO/../include -I$HOME/zig-linux-x86_64-0.13.0/lib/libc/include/aarch64-linux-any -I$HOME/zig-linux-x86_64-0.13.0/lib/libc/include/any-linux-any -I$CO/q -I$CO/q/bionic/libc -I$CO/q/bionic/libc/include"
@@ -18,4 +24,5 @@ for f in hooks wrappers wrapper_code_generic_arm logging native_handle hooks_shm
 for f in properties cache runtime_cache; do $ZIG cc $HF $LIBP -c "$CO/legacy_properties/$f.c" -o "$OUT/hk/lp/$f.o"; done
 $ZIG c++ -target aarch64-linux-gnu.2.38 -shared -O1 "$OUT/hk"/*.o "$OUT/hk/lp"/*.o -o /tmp/libhybris.so
 echo "built libhybris.so (Q)"
-cp /tmp/q.so /tmp/libhybris.so /mnt/d/GUH/
+cp /tmp/q.so /tmp/libhybris.so "$DIST/"
+echo "installed into $DIST"
