@@ -64,8 +64,9 @@ static VkInstance g_instance;         /* the instance we made for the HAL */
 
 /* The instance extensions this ICD provides on top of the HAL (the HAL has only Android surfaces). */
 static const char *const ICD_INSTANCE_EXTENSIONS[] = {
-    "VK_KHR_surface", "VK_KHR_wayland_surface", "VK_KHR_xcb_surface", "VK_KHR_xlib_surface" };
-#define ICD_NUM_INSTANCE_EXTENSIONS 4
+    "VK_KHR_surface", "VK_KHR_wayland_surface", "VK_KHR_xcb_surface", "VK_KHR_xlib_surface",
+    "VK_KHR_get_surface_capabilities2" };
+#define ICD_NUM_INSTANCE_EXTENSIONS 5
 
 static void icd_log(const char *m) { fprintf(stderr, "pvr_icd: %s\n", m); }
 
@@ -250,12 +251,19 @@ static VkResult icd_create_device(void *pd, const void *ci, const void *alloc, v
 }
 
 static void *icd_gdpa(VkDevice device, const char *pName) {
+    /* Diagnostic: EVERY device entry point the app asks for, at entry, so a NULL answer is visible
+     * even for the names this ICD serves itself (which return before the tail log). A NULL becomes a
+     * NULL slot in the app's dispatch table and the app calls it and faults. Off unless PVR_ICD_DIAG. */
+    FILE *o = diagf();
+    if (o && pName) { fprintf(o, "ICD gdpa pid=%d name=%s", (int)getpid(), pName); fflush(o); }
     void *wsi = pvr_wsi_proc(pName);
-    if (wsi) return wsi;
-    if (!g_gipa && icd_load() != 0) return NULL;
+    if (wsi) { if (o) { fprintf(o, " -> %p (wsi)\n", wsi); fflush(o); } return wsi; }
+    if (!g_gipa && icd_load() != 0) { if (o) { fprintf(o, " -> load-fail\n"); fflush(o); } return NULL; }
     void *(*hal_gdpa)(VkDevice, const char *) =
         (void *(*)(VkDevice, const char *))g_gipa(g_instance, "vkGetDeviceProcAddr");
-    return hal_gdpa ? hal_gdpa(device, pName) : NULL;
+    void *r = hal_gdpa ? hal_gdpa(device, pName) : NULL;
+    if (o) { fprintf(o, " -> %p\n", r); fflush(o); }
+    return r;
 }
 
 /* Device extensions this ICD adds on top of the HAL: the swapchain the WSI presents to, and the
@@ -620,7 +628,12 @@ void *vk_icdGetInstanceProcAddr(VkInstance instance, const char *pName) {
         !strcmp(pName, "vkGetPhysicalDeviceImageFormatProperties2KHR"))
         return (void *)icd_get_phys_dev_img_fmt_props2;
     if (!g_gipa) { if (icd_load() != 0) return NULL; }
-    return g_gipa(instance, pName);
+    void *r = g_gipa(instance, pName);
+    /* Diagnostic: which instance entry points fall through to the HAL and, of those, which it does
+     * not answer - a NULL becomes a NULL in the app's dispatch table. Off unless PVR_ICD_DIAG. */
+    FILE *o = diagf();
+    if (o) { fprintf(o, "ICD gipa pid=%d name=%s -> %p\n", (int)getpid(), pName, r); fflush(o); }
+    return r;
 }
 
 __attribute__((visibility("default")))

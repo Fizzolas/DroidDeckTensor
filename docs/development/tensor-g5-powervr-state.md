@@ -1601,3 +1601,46 @@ layer to chain.
 **The two fixes so far, both measured:** §36 (build identity - so a measurement means something) and
 §37 (`nodelete` - so the HAL's PLT stops pointing at unmapped code). Neither is the last wall, but
 each moved the crash to a strictly later point, and for the first time the movements are traceable.
+
+## 39. The FROG NULL call is `vkAcquireNextImage2KHR`, which the ICD did not provide - and the
+## segfault is now gone (2026-10-11)
+
+§38's `BLR x3` with `x3 = 0`: `x20` is gamescope's `vkroots::VkDeviceDispatch` and `[x20+0x38]` is
+member 7 of it. The layer's own `AcquireNextImageKHR` (source read, not guessed) is:
+
+```cpp
+static VkResult AcquireNextImageKHR(pDispatch, ...) {
+  VkAcquireNextImageInfoKHR acquireInfo = { ... };
+  return AcquireNextImage2KHR(pDispatch, device, &acquireInfo, pImageIndex);  // -> pDispatch.m_AcquireNextImage2KHR
+}
+```
+
+and **our ICD returned NULL for `vkAcquireNextImage2KHR`** (measured: every session's
+`ICD gdpa ... name=vkAcquireNextImage2KHR -> (nil)`), because `pvr_wsi_proc` served only the 1KHR
+form. So the loader left that dispatch slot NULL and the layer called through it.
+
+**Fix:** `pvr_wsi.c` now serves `vkAcquireNextImage2KHR` (forwarding to the same logic as the 1KHR
+form - the only difference is the info struct).
+
+**Measured effect: the segfault is gone.** Session `2026-10-11-18-steam` has **no `rc=139`** and
+`crash.txt` was not rewritten (still the previous session's), so the crashcatch never fired. Steam's
+client gets past the point it has died at in every session since 43.
+
+**The next wall, also measured, and it is a different kind:** the client's frames now reach
+gamescope and gamescope **cannot import them** -
+
+```
+[gamescope] wlserver: [types/wlr_linux_dmabuf_v1.c:219] Failed to import DMA-BUF FD for plane 0: Invalid argument
+[destroyed object]: error 7: importing the supplied dmabufs failed
+MESA: error: zink: failed to update swapchain capabilities: VK_ERROR_SURFACE_LOST_KHR
+```
+
+Our WSI exports a dma-buf per swapchain image (`pvr_wsi: swapchain: 3 images 2404x1080 stride 9616
+fmt 44`) and gamescope's linux-dmabuf importer rejects the fd. That is a **format/modifier or plane
+descriptor** mismatch between what we advertise on the exported image and what gamescope's
+`zwp_linux_dmabuf` import expects - the next thing to fix, and a normal WSI-integration problem
+rather than a crash.
+
+**Where this stands:** four measured steps, each moving the wall strictly later - §36 build identity,
+§37 `nodelete`, §38-39 the `AcquireNextImage2KHR` slot. The client no longer crashes; it renders and
+presents, and the compositor refuses the buffer. The crash that cost sessions 29-45 is closed.

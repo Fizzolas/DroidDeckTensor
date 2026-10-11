@@ -285,6 +285,38 @@ static VkResult wsi_surface_formats(VkPhysicalDevice pd, VkSurfaceKHR surface, u
     return (*count < 2) ? VK_INCOMPLETE : VK_SUCCESS;
 }
 
+/* The "2" forms of the two surface queries, from VK_KHR_get_surface_capabilities2. gamescope's WSI
+ * layer (libVkLayer_FROG_gamescope_wsi) fetches vkGetPhysicalDeviceSurfaceCapabilities2KHR from the
+ * instance and calls it to learn the surface's real extent - the non-2 form is not enough for it, and
+ * with no answer it built a 1x1 swapchain and then faulted on a NULL it fetched through its own
+ * dispatch table. The loader's trampoline for the 2 form fills the app's pNext chain and calls the
+ * ICD only for the base struct, so these delegate to the same helpers the non-2 forms use. */
+static VkResult wsi_surface_caps2(VkPhysicalDevice pd, const VkPhysicalDeviceSurfaceInfo2KHR *info,
+                                  VkSurfaceCapabilities2KHR *caps) {
+    if (!info || !caps) return VK_ERROR_INITIALIZATION_FAILED;
+    return wsi_surface_caps(pd, info->surface, &caps->surfaceCapabilities);
+}
+
+static VkResult wsi_surface_formats2(VkPhysicalDevice pd, const VkPhysicalDeviceSurfaceInfo2KHR *info,
+                                     uint32_t *count, VkSurfaceFormat2KHR *formats) {
+    if (!info) return VK_ERROR_INITIALIZATION_FAILED;
+    if (!formats) {
+        uint32_t n = 0;
+        VkResult r = wsi_surface_formats(pd, info->surface, &n, NULL);
+        *count = n;
+        return r;
+    }
+    /* VkSurfaceFormat2KHR carries sType/pNext before the VkSurfaceFormatKHR, so the array cannot be
+     * filled as a plain format array - take the base formats and copy each into its element. */
+    uint32_t want = *count;
+    VkSurfaceFormatKHR base[8];
+    uint32_t n = want < 8 ? want : 8;
+    VkResult r = wsi_surface_formats(pd, info->surface, &n, base);
+    for (uint32_t i = 0; i < n; i++) formats[i].surfaceFormat = base[i];
+    *count = n;
+    return r;
+}
+
 static VkResult wsi_surface_present_modes(VkPhysicalDevice pd, VkSurfaceKHR surface, uint32_t *count, VkPresentModeKHR *modes) {
     (void)pd; (void)surface;
     if (!modes) { *count = 1; return VK_SUCCESS; }
@@ -464,6 +496,18 @@ static VkResult wsi_acquire_next_image(VkDevice device, VkSwapchainKHR sw, uint6
     return VK_SUCCESS;
 }
 
+/* vkAcquireNextImage2KHR, from VK_KHR_swapchain. gamescope's WSI layer implements
+ * vkAcquireNextImageKHR by building a VkAcquireNextImageInfoKHR and calling this entry through its
+ * device dispatch table; when the ICD did not provide it, the slot was NULL and the layer called
+ * through it (si_addr=0, pc=0, inside AcquireNextImageKHR). The extra deviceMask/swapchain pair in
+ * the info struct is the only difference from the 1KHR form, which this WSI already serves. */
+static VkResult wsi_acquire_next_image2(VkDevice device, const VkAcquireNextImageInfoKHR *info,
+                                        uint32_t *index) {
+    if (!info) return VK_ERROR_INITIALIZATION_FAILED;
+    return wsi_acquire_next_image(device, info->swapchain, info->timeout,
+                                  info->semaphore, info->fence, index);
+}
+
 /* ---- present: dmabuf fd -> wl_buffer -> attach -> commit ------------------------ */
 
 /* Wait for a binary semaphore the app signaled through vkQueueSubmit. There is no host-side
@@ -573,12 +617,16 @@ void *pvr_wsi_proc(const char *name) {
         { "vkGetPhysicalDeviceSurfaceCapabilitiesKHR", (void *)wsi_surface_caps },
         { "vkGetPhysicalDeviceSurfaceFormatsKHR", (void *)wsi_surface_formats },
         { "vkGetPhysicalDeviceSurfacePresentModesKHR", (void *)wsi_surface_present_modes },
+        /* VK_KHR_get_surface_capabilities2: gamescope's WSI layer uses the 2 forms. */
+        { "vkGetPhysicalDeviceSurfaceCapabilities2KHR", (void *)wsi_surface_caps2 },
+        { "vkGetPhysicalDeviceSurfaceFormats2KHR", (void *)wsi_surface_formats2 },
         { "vkGetPhysicalDeviceWaylandPresentationSupportKHR", (void *)wsi_present_support },
         { "vkGetPhysicalDeviceSurfaceSupportKHR", (void *)wsi_present_support },
         { "vkCreateSwapchainKHR", (void *)wsi_create_swapchain },
         { "vkDestroySwapchainKHR", (void *)wsi_destroy_swapchain },
         { "vkGetSwapchainImagesKHR", (void *)wsi_get_swapchain_images },
         { "vkAcquireNextImageKHR", (void *)wsi_acquire_next_image },
+        { "vkAcquireNextImage2KHR", (void *)wsi_acquire_next_image2 },
         { "vkQueuePresentKHR", (void *)wsi_queue_present },
     };
     for (unsigned i = 0; i < sizeof(t) / sizeof(*t); i++) if (!strcmp(name, t[i].n)) return t[i].p;
