@@ -1308,3 +1308,44 @@ and `-DDEBUG` does not break gamescope.
 
 **Where the next fix goes:** libhybris. `hookret_log` and the rig are the instruments; `build_hybris.sh`
 rebuilds both DSOs with zig, so a candidate fix is one build and one session away.
+
+## 32. The returned address is a thunk in a region that is not mapped (2026-07-11)
+
+§31 established that libhybris returns an address that is unmapped. Narrowing where that address is
+relative to:
+
+```
+crashing process (pid 11136):
+  q.so base        0x7e887d0000
+  libhybris base   0x7e7e520000
+  ICD base         0x7e88960000
+  strcmp hook      0x7e8890bf94   -> no mapping (a gap between q.so's data and the ICD)
+```
+
+The hook value's implied base is `0x7e88900000`, which is none of the three. And across processes the
+values share a **fixed low offset**: every process's `strcmp` hook ends in `bf94` -
+
+```
+pid 10522  0x7e652ebf94      pid 10645  0x7c7746bf94
+pid 11136  0x7e8890bf94      pid 11137  0x71d452bf94
+```
+
+The offsets of the interposed set from that base are all within ~0x100 bytes of each other
+(`malloc` +0xbee4, `memcpy` +0xbf54, `strlen` +0xbf84, `strcmp` +0xbf94). Real functions are not
+64 bytes apart, so these are **thunks** - small stubs, one per interposed symbol, in a single region -
+and that region is not mapped in the process that calls through them.
+
+So the defect, stated as tightly as the evidence allows: **libhybris builds a table of per-symbol thunk
+addresses for the interposed imports and hands them to the HAL, and the region those thunks live in is
+not mapped (or not executable) in the process, so the first call through one faults.**
+
+**What is left, and it is one question:** where is that region meant to be, and why is it not mapped?
+The address is computed from something that varies per process but is not any module's load address, so
+the next step is to find the code that builds the thunk table and read the base it uses -
+`hooks.c`'s hook tables (`HOOK_INDIRECT`, `hooks_common`/`hooks_p`) and whatever supplies the per-process
+base are the places to look.
+
+**Instruments that got here**, all kept: `docs/development/pvr-re/rig/` (mmwatch, symwatch, crashcatch,
+build.sh, README) and, for libhybris's own resolver, `hookret_log` in `hooks.c` writing
+`/tmp/hookret.log` filtered to `vulkan.powervr`. That last one is what closed the chain: it showed the
+returned value and the crash address are the same number.
