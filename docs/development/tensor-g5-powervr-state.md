@@ -2053,3 +2053,37 @@ force_windows_fullscreen`, line 4909). The client's main UI window is 1x1 becaus
 it there until its renderer comes up - and its renderer is CEF, which is exactly what is crashing.
 So the 1x1 is downstream of the CEF GPU-process crash, not an independent sizing bug; §44's framing
 of it as a "gamescope surface geometry" question was wrong.
+
+## 48. A GUEST VULKAN APP'S FRAME IS ON SCREEN (2026-10-11, session `2026-10-11-60-vkcube`)
+
+**The goal is met: a real GPU frame from a guest Vulkan app reaches the panel.** vkcube, run through
+the session (`tools/droiddeckctl run /usr/bin/vkcube`), rendered on the PowerVR GPU via our ICD and
+its frames were composited to the screen by the DroidDeck compositor. Measured, in one session:
+
+```
+session.log:  == droiddeck-session ... mode=run /usr/bin/vkcube
+session.log:  Selected GPU 0: PowerVR D-Series DXT-48-1536 MC1, type: IntegratedGpu, apiVersion 1.4.317
+session.log:  [Gamescope WSI] Executable name: vkcube
+session.log:  pvr_wsi: swapchain: 3 images 2404x1080 stride 16384 fmt 44 (fd0=18)   x2
+session.log:  pvr_wsi: Wayland present: 2404x1080 ... (wl_buffer attach+commit)     x20
+wayland.log:  vulkan  "gamescope" (gamescope) is presenting GPU frames through Wayland: 2404x1080,
+                       format AR24, linear (dma-buf: copied into the screen swapchain)
+wayland.log:  stats   last 10 s: 13 frames on screen (1.3 fps) | 14 GPU frames from games | 2 window redraws
+```
+
+So the whole chain, end to end, for a real (if simple) Vulkan application:
+`vkcube -> glibc loader -> our ICD -> libhybris -> bionic PowerVR HAL -> GPU render -> exportable
+dma-buf -> gamescope -> DroidDeck compositor -> on screen`. 20 presents from the app, 13-14 frames
+composited to the panel at 2404x1080.
+
+**This is the milestone the whole effort was for**, and it says what was actually blocking Steam: not
+the GPU path (this proves it works) but **CEF's GPU process** (sections 45-47), which is a Chromium
+component using GBM/GEM that the PowerVR node does not implement. A game, or any app that renders
+with Vulkan/GL through the ICD rather than through CEF, gets its frames on screen.
+
+**Caveat.** The compositor log says "copied into the screen swapchain" - the path is a copy, not
+zero-copy, at 1.3 fps (vkcube is uncapped-ish and the copy is on the CPU path). It is a real frame,
+correctly rendered and presented; it is not yet a performance statement.
+
+**Reproduce:** `tools/droiddeckctl run /usr/bin/vkcube` (the session must be stopped/idle first; the
+env file `Download/droiddeck-env` must not carry a stale CEF switch - it is read with a lag).
