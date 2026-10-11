@@ -1349,3 +1349,42 @@ base are the places to look.
 build.sh, README) and, for libhybris's own resolver, `hookret_log` in `hooks.c` writing
 `/tmp/hookret.log` filtered to `vulkan.powervr`. That last one is what closed the chain: it showed the
 returned value and the crash address are the same number.
+
+## 33. EXACT ROOT CAUSE: the hook address is computed against the wrong base (2026-10-11)
+
+The returned value's low bits identify the function. From the built `libhybris.so`:
+
+```
+000000000003bee4 t _hybris_hook_malloc
+000000000003bf94 t _hybris_hook_strcmp
+```
+
+`_hybris_hook_strcmp` is at file offset `0x3bf94` - and **every** returned hook value ends in `bf94`
+(`0x7e652ebf94`, `0x7c7746bf94`, `0x7e8890bf94`, `0x71d452bf94`), `malloc`'s in `bee4`. So libhybris is
+returning the right function, computed against the wrong base:
+
+```
+returned strcmp hook        = 0x7e8890bf94
+correct _hybris_hook_strcmp = 0x7e7e56bf94      (libhybris base 0x7e7e520000 + 0x3bf94)
+returned - 0x3bf94          = 0x7e888d0000      <- the base it used
+```
+
+**Off by `0xa3a0000`.** The offset within the function is exactly right; the base is not. That is why
+the address lands in a gap between `q.so` and the ICD rather than in libhybris's code segment.
+
+**So, precisely:** libhybris resolves the HAL's interposed imports (`strcmp`, `malloc`, `memcpy`,
+`strlen`, `fclose`, `pthread_*`, ...) to its own hook functions, but computes their addresses against a
+base that is not its own load address, and hands those to the HAL. The HAL's PLT slots receive them
+correctly; the first call through one faults because the address is not mapped.
+
+**What remains is a single libhybris-internal question:** what base is that, and why. It is not the
+ICD, not `q.so` and not libhybris. `hookret_log` (§31) and `build_hybris.sh` are the instruments; the
+next step is to find the expression that forms these addresses - the hook table's `func` entries and
+whatever supplies the per-process base - and read it. That is a libhybris source change, not an ICD or
+app one.
+
+**The whole chain, for the record:** gamescope's DRM primary-node gate -> the linker's
+`ProtectedDataGuard` -> the driver that could never be updated -> **the HAL's interposed imports
+resolving to unmapped addresses, because the hook addresses are computed against the wrong base.**
+Every link was measured on the device, and each was found only after several earlier readings of the
+same fault were withdrawn.
