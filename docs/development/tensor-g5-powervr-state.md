@@ -1309,7 +1309,7 @@ and `-DDEBUG` does not break gamescope.
 **Where the next fix goes:** libhybris. `hookret_log` and the rig are the instruments; `build_hybris.sh`
 rebuilds both DSOs with zig, so a candidate fix is one build and one session away.
 
-## 32. The returned address is a thunk in a region that is not mapped (2026-07-11)
+## 32. The returned address is a thunk in a region that is not mapped (2026-10-11)
 
 §31 established that libhybris returns an address that is unmapped. Narrowing where that address is
 relative to:
@@ -1389,7 +1389,7 @@ resolving to unmapped addresses, because the hook addresses are computed against
 Every link was measured on the device, and each was found only after several earlier readings of the
 same fault were withdrawn.
 
-## 34. The base mismatch, measured exactly (2026-07-11)
+## 34. The base mismatch, measured exactly (2026-10-11)
 
 Instrumented the resolver to log the hook table entry and `dladdr`'s view of libhybris's own base. One
 run, one pid:
@@ -1427,7 +1427,7 @@ where the fix belongs. It is not the ICD, not `q.so`'s own linker, and not the a
 no DEBUG build), plus `docs/development/pvr-re/rig/`. `build_hybris.sh` rebuilds both DSOs in one
 command, so a candidate fix is one build and one session.
 
-## 35. Clean same-process measurement, and what it rules out (2026-07-11)
+## 35. Clean same-process measurement, and what it rules out (2026-10-11)
 
 The previous sections' base claims were made across processes. This one is not: the hook log and the
 crash are the **same pid**, and libhybris's base is taken from that pid's own maps.
@@ -1468,3 +1468,62 @@ relocation of the hook table entry (what writes `func`) rather than the value re
 each was killed by the next measurement. The cause was inference outrunning measurement, and twice it
 was comparing addresses across processes. The instruments are sound (`hookret_log`, the rig, same-pid
 comparison); the discipline of using them on one process at a time is what has to hold.
+
+## 36. Why §31-35 could not converge: the measured build was never the shipped build (2026-10-11)
+
+§35 is right that the defect is process-dependent. But the four root causes before it were not only
+"inference outrunning measurement" - they were **measurements of different binaries**, and nothing in
+the tree could tell. This section is the outer-loop fix, and it is the prerequisite for any further
+libhybris work: without it, the next fix is unverifiable too.
+
+**The build was moving under the measurements.** `_hybris_hook_strcmp`'s offset in the built
+`libhybris.so`, across the sections that were all narrated as one continuous thread:
+
+```
+§33 0x3bf94      §34 0x3c080      §35 0x3bfd8      (dist/, shipped = 0x3bd9c)
+```
+
+Four builds, four numbers, one story. §33's "off by 0xa3a0000" and §35's "off by 0x62e0000" are the
+same symptom measured against different binaries, so the numbers never reconciled.
+
+**Why: the build output and the shipped artifact were two different directories.** Every
+`build_hybris.sh` run copied to a scratch drop (`/mnt/d/GUH/`); `package_asset.py` ships
+`docs/development/pvr-re/hybshim/dist/`, which changed only by hand. Measured:
+
+```
+shipped  dist/libhybris.so    sha256 d7508713...   (mtime 2026-10-10 22:02)
+under test /mnt/d/GUH/...so   sha256 c9b54d74...   (mtime 2026-10-11 08:39)
+```
+
+And `build_icd.sh` - which `package_asset.py` claims to read - **existed only loose at
+`/mnt/d/GUH/build_icd.sh`**, never committed, while the README's ICD one-liner omitted `pvr_wsi.c`.
+The guest's installed `libhybris.so` was `c9b54d74` because it had been **hand-pushed** to match the
+measurement; the next clean apk install would have shipped `d7508713` and silently regressed.
+
+**The toolchain is fine; the coupling was not.** Rebuilt twice, the shim and ICD are byte-identical.
+So the fix is not in the compiler but in what feeds it and where it lands:
+
+* `build_hybris.sh` writes into `dist/`; `build_icd.sh` is committed and writes into `icd/`.
+* `build_all.sh` runs both and then `build_id.sh`, which stamps `dist/build_id.json` with the sha256
+  of each artifact and the libhybris commit/branch they came from.
+* `package_asset.py` **refuses to package** unless `dist/` matches that stamp, and the asset carries
+  `build_id.json` so a running guest's driver can be checked against the build it claims to be.
+* The instrumentation that produced §31-35 (`hookret_log` in `hooks.c`) is committed on
+  `droiddeck-pvr-rig` (`ba22250`) - it was an uncommitted working-copy edit, one `git checkout` from
+  being deleted.
+
+**Verified on the device (2026-10-11).** Built, stamped, packaged, installed (versionCode 15, so
+`installBundled` re-extracted - the §15 trap), and read back the guest's own files:
+
+```
+guest files/linux_vulkan_drivers/powervr-g5x/
+  libhybris.so         c9b54d74...   = build_id.json   ✓
+  q.so                 ba9b7904...   = build_id.json   ✓
+  libvulkan_powervr.so b31d4d2d...   = build_id.json   ✓   source ba22250
+```
+
+**What this does not do.** The crash baseline is *unchanged*, not fixed: the guest already ran
+`c9b54d74`, and that is what now ships. §35's process-dependence and its next step (log the
+relocation that writes the hook table's `func`) stand exactly as written - but they are now
+answerable, because "which build was that?" has an answer. The count of sessions that produced
+nothing measurable (29->45) is the cost this section is meant to stop paying.

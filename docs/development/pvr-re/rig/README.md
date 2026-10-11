@@ -33,10 +33,16 @@ preloaded wholesale rather than rebuilt per question.
 5. **The HAL is loaded by libhybris, not glibc** - `dladdr` cannot see it. Its base comes from
    `mod->methods->open` (which is `vulkan_device_open` at file offset `0x1b9ee0`).
 6. **`libhybris.so` and its diagnostics are silent by default** (`#if defined(DEBUG)` in `logging.h`,
-   and a `WARN` minimum level). A `-DDEBUG` build of `libhybris.so` breaks gamescope outright - do not
-   ship or deploy one. Diagnostics belong in the ICD instead, writing to their own file.
+   and a `WARN` minimum level). A `-DDEBUG` build is **safe to run** - the earlier claim that it
+   "breaks gamescope outright" was confounded with `prootNoSeccomp` being on at the time (retracted,
+   state doc §30) - but its `HYBRIS_LOGGING_LEVEL=debug` output wrote **2.8 GB in one session**, so
+   cap or filter it rather than shipping it. Prefer diagnostics in the ICD, writing to their own file.
 7. **Never hand-copy over a shipped file.** Put instrumentation in `files/linuxfs/tmp/` and remove it.
-   Copying a library over `files/linux_vulkan_drivers/...` invalidated a whole run earlier today.
+   Copying a library over `files/linux_vulkan_drivers/...` invalidated a whole run earlier today - and
+   later the reverse: the guest's `libhybris.so` was hand-pushed to match a measurement, so it ran one
+   build while the apk would have shipped another, and nothing could say which (§36). Before any run,
+   `sha256sum files/linux_vulkan_drivers/powervr-g5x/{libhybris.so,q.so,libvulkan_powervr.so}` and
+   check them against `dist/build_id.json`. Build with `build_all.sh`, not by hand.
 8. **Identify the process.** Multiple processes load the ICD (`gamescope`, `Xwayland`, `steam`, ...);
    absolute addresses from different ones are not comparable. Every line carries pid and comm.
 
