@@ -595,10 +595,20 @@ static VkResult wsi_queue_present(VkQueue queue, const VkPresentInfoKHR *pi) {
             if (!sc->images[idx].pixmap) {
                 xcb_pixmap_t px = xcb_generate_id(surf->c);
                 int32_t fds[1] = { sc->images[idx].fd };
-                xcb_dri3_pixmap_from_buffers(surf->c, px, surf->window, 1,
+                xcb_void_cookie_t ck = xcb_dri3_pixmap_from_buffers_checked(surf->c, px, surf->window, 1,
                                              (uint16_t)sc->width, (uint16_t)sc->height,
                                              sc->stride, 0, 0, 0, 0, 0, 0, 0,
                                              surf->x_depth, surf->x_bpp, 0 /* LINEAR */, fds);
+                /* Checked: X errors are async, so the BadAlloc seen in the log could be this very
+                 * request. The error (or its absence) says which. */
+                xcb_generic_error_t *err = xcb_request_check(surf->c, ck);
+                if (err) {
+                    WSI_LOG("X11 present: DRI3 PixmapFromBuffers failed: error_code=%u major=%u minor=%u "
+                            "(window=0x%x %dx%d stride=%u depth=%u)",
+                            err->error_code, err->major_code, err->minor_code,
+                            (unsigned)surf->window, sc->width, sc->height, sc->stride, surf->x_depth);
+                    free(err);
+                }
                 sc->images[idx].pixmap = px;
             }
             xcb_present_pixmap(surf->c, surf->window, sc->images[idx].pixmap, ++sc->serial,
@@ -624,6 +634,9 @@ static VkResult wsi_queue_present(VkQueue queue, const VkPresentInfoKHR *pi) {
         wl_surface_damage_buffer(surf->surface, 0, 0, sc->width, sc->height);
         wl_surface_commit(surf->surface);
         wl_display_flush(surf->display);
+        { static int wl_logged; if (wl_logged < 20) { wl_logged++;
+            WSI_LOG("Wayland present: %dx%d stride=%u fmt=%u fd=%d buffer=%p (wl_buffer attach+commit)",
+                    sc->width, sc->height, sc->stride, sc->drm_format, sc->images[idx].fd, (void *)buf); } }
         if (pi->pResults) pi->pResults[i] = VK_SUCCESS;
     }
     pthread_mutex_unlock(&wsi_lock);

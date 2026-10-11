@@ -1,10 +1,10 @@
 {
   "schemaVersion": 1,
-  "builtAt": "2026-10-11T20:23:35Z",
+  "builtAt": "2026-10-11T20:35:04Z",
   "artifacts": {
     "libhybris.so": "058bdaed24d4c6499297731da2d1442821f80a213a66e9302f8d3191aa471775",
     "q.so": "ba9b7904f39053a676abbc62f278d67e48b04d1389335f7022bb3d23bc11f2ed",
-    "libvulkan_powervr.so": "83105856a87300c82743939f58e15d93433f1a00524c282552301dfdacf3c511"
+    "libvulkan_powervr.so": "68f90ad851da57665de211f6f88772fa4ddb38c0c65c44d18eadca0e2dd1cf96"
   },
   "libhybrisSource": {
     "commit": "9d809e94ff9e48b6e0eb7dab9a7b3c51a6d42520",
