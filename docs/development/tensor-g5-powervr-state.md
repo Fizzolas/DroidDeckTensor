@@ -1426,3 +1426,45 @@ where the fix belongs. It is not the ICD, not `q.so`'s own linker, and not the a
 **Instruments:** `hookret_log` in `hybris/common/hooks.c` (filtered to `vulkan.powervr`, own file,
 no DEBUG build), plus `docs/development/pvr-re/rig/`. `build_hybris.sh` rebuilds both DSOs in one
 command, so a candidate fix is one build and one session.
+
+## 35. Clean same-process measurement, and what it rules out (2026-07-11)
+
+The previous sections' base claims were made across processes. This one is not: the hook log and the
+crash are the **same pid**, and libhybris's base is taken from that pid's own maps.
+
+```
+pid 17327   strcmp /vendor/lib64/hw/vulkan.powervr.so -> 0x704c36bfd8 (hook)
+pid 17327   caught signal 11  si_addr=0x704c36bfd8  pc=0x704c36bfd8
+pid 17327   libhybris mapped at 0x7046050000   (its own /proc/self/maps)
+            so &_hybris_hook_strcmp would be 0x704608bfd8
+            returned - real = 0x62e0000, and returned = ICD_base + 0xbfd8
+```
+
+But another process got it **right**:
+
+```
+pid 16778   returned             0x764f5ebfd8
+            REAL &_hybris_hook_strcmp  0x764f5ebfd8     <- identical
+            (libhybris base 0x764f5b0000, offset 0x3bfd8)
+```
+
+**So the returned address is correct in some processes and wrong by `0x62e0000` in others.** That is
+what every fixed hypothesis in §31-34 failed to survive: the defect is not a constant wrong base and
+not a wrong table entry - both would be the same in every process. It is **process-dependent**.
+
+**What this rules out**, cleanly:
+
+* not "the table entry is wrong" - in the process where it was checked, `name`, `func` and
+  `debug_func` are consistent and `func` equals the real function address;
+* not "a constant wrong base" - one process has no error at all;
+* not our ICD, the HAL, Steam, or `q.so`'s own linker - the value comes out of libhybris's resolver.
+
+**What it points at:** something per-process about how the hook address is formed or relocated - the
+order in which libhybris, `q.so` and the ICD are loaded, or a relocation applied against the wrong
+module's base in some orders. The next measurement should log, **in the faulting process**, the
+relocation of the hook table entry (what writes `func`) rather than the value read out of it.
+
+**Process note, for whoever continues this.** Four successive root-cause claims in §31-34 were wrong and
+each was killed by the next measurement. The cause was inference outrunning measurement, and twice it
+was comparing addresses across processes. The instruments are sound (`hookret_log`, the rig, same-pid
+comparison); the discipline of using them on one process at a time is what has to hold.
