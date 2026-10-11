@@ -1167,3 +1167,32 @@ session, which is a second thing that does not add up yet.
 symbol itself (`android_dlsym`) and return that, instead of returning NULL and letting libhybris answer
 with a trampoline. That logs the address actually handed to the HAL *and* bypasses the trampoline path
 if the trampolines are the problem.
+
+## 28. Bypassing libhybris's hook answer breaks the session - a negative result (2026-10-11)
+
+§27's next step was to have the ICD's hook callback resolve each symbol itself (`dlsym`) and return
+that, on the theory that libhybris's trampoline answer is the fault. It was implemented and it is
+**wrong**: the session died in **1.8 seconds**, right after gamescope loaded, with `guest.exited
+status 0` and nothing further - no Wayland backend, no Xwayland, no Steam. The diagnostic file was
+empty, so it died before the HAL was even opened.
+
+That is a useful result rather than a dead end:
+
+* **libhybris's answer to these imports is load-bearing.** Handing the HAL the plain glibc function
+  instead of libhybris's own is not equivalent - bionic callers depend on libhybris's hooks for
+  semantics that a direct glibc function does not provide, and breaking that breaks the whole guest,
+  not just the HAL. So the fix cannot be "resolve it a different way"; whatever libhybris hands back
+  has to become executable.
+* It also confirms the callback is genuinely on the HAL's resolution path in every process (the
+  ICD's `pvr_icd: HYBRIS_LINKER_DIR=` line was the last thing printed), which is why the logging
+  version (§27) is trustworthy.
+
+**Reverted**; the committed ICD logs the queries and returns `NULL` (libhybris decides), and a session
+on it behaves as before - 914 log lines and the expected `rc=139`.
+
+**Where this leaves the mechanism.** The HAL asks libhybris for `strcmp`/`malloc`/`strlen`/`memcpy`/
+`fclose`/`pthread_*` with `requester=/vendor/lib64/hw/vulkan.powervr.so`; what libhybris returns for
+those ends up in the HAL's PLT and points into an anonymous **PROT_NONE** region. Returning something
+else breaks bionic, so the region must be made executable rather than avoided. Why that region is
+`PROT_NONE` is still not established, and `create_wrapper`'s trampoline path is not obviously it -
+it only generates a trampoline when `HYBRIS_TRACE_*` is set, which nothing in the session sets.
