@@ -2116,3 +2116,28 @@ carry real, correctly-rendered frames from two independent guest stacks.
 crashes, ~80 `gbm_wrapper` export failures. CEF's launch flags are exhausted as a lever; the fault is
 in the GPU process's buffer path (GBM export, a GEM operation the node does not implement), not in how
 it is started.
+
+**Addendum 4 to §46 - GBM is not the crash; Chromium's shared-image handle is (session
+`2026-10-11-65-steam`).** A scoped shim (`/tmp/gbmshim.so` via `Download/droiddeck-env`'s `LD_PRELOAD`,
+`gbm_create_device` returning NULL for `comm=steamwebhelper` only) removed CEF's GBM use entirely.
+Measured: the `gbm_wrapper.cc` plane/export errors went **80 -> 0** - and the GPU process **still
+crashed** (54 times), on the same lines as before:
+
+```
+shared_image_interface_proxy.cc(130)]  Buffer handle is null. Not creating a mailbox from it.
+one_copy_raster_buffer_provider.cc(348)] Creation of StagingBuffer's SharedImage failed.
+gpu_process_host.cc(1002)]              GPU process exited unexpectedly
+```
+
+So the fault is **not** GBM export. It is Chromium's **shared-image buffer handle**: the GPU process
+asks for a buffer handle (a GEM handle / dma-buf) to back a shared image and gets none, then aborts.
+`Buffer handle is null` and `StagingBuffer's SharedImage failed` persist with GBM disabled, which
+rules GBM out as the cause and names the handle path instead. On this node that handle needs **GEM**
+(`drmPrimeFDToHandle`), which PowerVR's render node does not implement (§41) - and our `drm.c` shim
+answers only for handles *it* minted, not for one the driver's own allocation produced.
+
+**Conclusion.** Steam's client UI is blocked by a **Chromium shared-image/buffer-handle requirement
+that needs GEM**, a GPU capability this node does not have. The guest's GPU path is otherwise sound -
+proven on screen by vkcube (Vulkan) and glxgears (GL/zink, §48). Making CEF render would need a real
+GEM/GBM backend on the PowerVR node (or a Chromium build that does not use shared-image handles for
+its raster path), not another launch flag or a shim. The CEF launch surface is exhausted.
