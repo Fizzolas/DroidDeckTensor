@@ -1196,3 +1196,47 @@ those ends up in the HAL's PLT and points into an anonymous **PROT_NONE** region
 else breaks bionic, so the region must be made executable rather than avoided. Why that region is
 `PROT_NONE` is still not established, and `create_wrapper`'s trampoline path is not obviously it -
 it only generates a trampoline when `HYBRIS_TRACE_*` is set, which nothing in the session sets.
+
+## 29. Where the PowerVR chase stands after the rig (2026-10-11)
+
+A checkpoint, because the last several sessions produced a mechanism chain and several corrections
+rather than a fix, and the open question has narrowed to one.
+
+**Proven, in order:**
+
+1. A Tensor G5 session now gets all the way to Steam's client: gamescope's Wayland backend, Xwayland,
+   the ICD, the client's own window and swapchain. That is the three original blockers (§9) plus the
+   linker guard (§18) fixed and shipped.
+2. The client then dies on **the first call through the HAL's PLT slot for `strcmp`**, from the HAL's
+   `vulkan_device_open` (HAL file offset `0x1b9f10`).
+3. That slot, and the 16 others for the symbols libhybris exists to interpose
+   (`malloc`, `memcpy`, `strlen`, `fclose`, `fgets`, `fseek`, `ftell`, the `pthread_mutex/cond/rwlock`
+   set, `pthread_getspecific`), hold addresses in **one anonymous `---p` (PROT_NONE) region**.
+4. The values are **identical before the HAL's `open`, after it, and at the crash** (same pid), so this
+   is a resolution result, not later corruption.
+5. libhybris's hook layer **is** asked for exactly those symbols, with
+   `requester=/vendor/lib64/hw/vulkan.powervr.so` (its own hook callback, logging from the ICD, 109,590
+   queries in one session).
+6. Returning anything other than libhybris's answer kills the session in under two seconds, so its
+   answer is load-bearing for bionic callers and the region must be made executable rather than
+   resolved around.
+
+**Corrections made along the way** (each was a claim I had to withdraw after measuring): the fault was
+not in Steam's UI, not in X11, not zink, and not Steam's `strcmp`(); the guard fix was not "dead code";
+the bad values are not in our ICD; the values do not change during the process; and `crashcatch`'s
+bases were computed from a constant that only held while the fault was in q.so.
+
+**The open question, and it is now one question:** what is that anonymous PROT_NONE region, and why
+does libhybris's answer for an interposed symbol land in it? Candidates not yet separated:
+
+* a libhybris hook table or trampoline area that is allocated but never made executable on this kernel;
+* the HAL's relocations pointing at a per-process stub table the ICD is expected to populate;
+* an address-space layout difference (32-bit-era assumptions in the linker about where scratch memory
+  lives) that this device's 39-bit layout breaks.
+
+**Next step:** log the *value* the ICD's hook callback is asked about and the value libhybris returns
+for it, in the same line - the callback cannot see libhybris's own answer (it runs before it), so this
+needs the linker's relocation of the HAL's PLT logged instead, which `mmwatch`-style instrumentation
+cannot reach because it happens inside q.so. Attaching to the HAL's relocation directly, or building
+`libhybris.so` with its `DEBUG` logging *and* a working `HYBRIS_LOGGING_LEVEL` (see the rig README for
+why a plain `-DDEBUG` build breaks gamescope), is the way in.
