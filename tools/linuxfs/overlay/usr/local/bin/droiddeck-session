@@ -28,9 +28,10 @@ if [ -e /tmp/crashcatch.so ] || [ -e /tmp/mmwatch.so ] || [ -e /tmp/symwatch.so 
   PVR_ICD_DIAG=/tmp/icd_plt.log
   export PVR_ICD_DIAG
   # libhybris only logs when built with DEBUG and the level is raised; its default is WARN.
-  HYBRIS_LOGGING_LEVEL=debug
-  HYBRIS_LOGGING_TARGET=/tmp/hybris.log
-  export HYBRIS_LOGGING_LEVEL HYBRIS_LOGGING_TARGET
+  # libhybris resolver trace (instrumented build): what each HAL symbol resolved to. Its own
+  # file, filtered to the HAL, so it needs no DEBUG build and does not flood.
+  HYBRIS_HOOKRET_LOG=1
+  export HYBRIS_HOOKRET_LOG
 fi
 mode=${1:-desktop}
 shift || true

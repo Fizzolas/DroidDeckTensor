@@ -1265,3 +1265,46 @@ DEBUG logging does not report what a symbol resolved to, only when a hook runs.
 **If a verbose build is needed again:** put `HYBRIS_LOGGING_TARGET` on the phone's external storage and
 cap it, or patch `hybris_should_log` to filter to `vulkan.powervr` - the same filter the ICD's callback
 already applies.
+
+## 31. ROOT CAUSE: libhybris hands the HAL an unmapped hook address (2026-10-11)
+
+Instrumented libhybris's own resolver (`hookret_log` at each return of
+`__hybris_get_hooked_symbol`, writing `/tmp/hookret.log`, filtered to `vulkan.powervr`, no DEBUG build
+needed) and compared it with the crash **in the same run, same pid**:
+
+```
+11136 strcmp /vendor/lib64/hw/vulkan.powervr.so -> 0x7e8890bf94 (hook)
+comm=steam  caught signal 11  si_addr=0x7e8890bf94  pc=0x7e8890bf94
+```
+
+**`si_addr == pc == exactly the address libhybris returned.** And resolving it against the crash
+report's 960 mappings:
+
+```
+strcmp hook / si_addr 0x7e8890bf94  ->  UNMAPPED
+x16 (the HAL's GOT slot)            ->  inside /vendor/lib64/hw/vulkan.powervr.so  (correct)
+```
+
+So the whole chain is now closed and it is **not** our ICD, not the HAL, not Steam:
+
+1. The HAL imports `strcmp` (and the other interposed symbols) and asks libhybris to resolve it.
+2. **libhybris answers with an address that is not mapped in the process.**
+3. The HAL's PLT slot is filled with that address - correctly, as far as the relocation goes.
+4. The first call through it, from `vulkan_device_open`, fetches an instruction from unmapped memory and
+   faults.
+
+**What is still open, and it is now a libhybris-internal question:** why the returned address is
+unmapped. `HOOK_INDIRECT(strcmp)` is defined as `{#symbol, _hybris_hook_##symbol, _hybris_hook_##symbol}`
+(`hooks.c:189`), i.e. it should be the address of a real function inside libhybris - and libhybris's own
+mappings are present. Candidates: the hook is a non-exported or generated entry that lives in a section
+this build does not map; an ifunc resolved at load to something wrong; or a relocation applied against a
+base that differs on this device's layout.
+
+**Corrections in this section's history**, since several claims had to be withdrawn as the fault moved
+and the instruments were fixed: the fault was not in Steam's UI, X11, zink, or Steam's own `strcmp()`;
+the guard fix was not dead code; the values are not in our ICD; the values do not change during the
+process; `crashcatch`'s bases were computed from a constant that only held while the fault was in q.so;
+and `-DDEBUG` does not break gamescope.
+
+**Where the next fix goes:** libhybris. `hookret_log` and the rig are the instruments; `build_hybris.sh`
+rebuilds both DSOs with zig, so a candidate fix is one build and one session away.
