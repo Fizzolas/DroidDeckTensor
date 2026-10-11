@@ -1814,3 +1814,28 @@ pixmap-format/param mismatch in our `xcb_dri3_pixmap_from_buffers` call.
 **Net state of the guest:** load -> ICD -> device -> render -> export dma-buf -> **gamescope imports
 and binds it** -> Xwayland/X11 present runs. The compositor can now consume our frames; what is left
 is the client's own X11 present and the surface-size question, not the GPU path.
+
+## 44. The Wayland surfaces now report a real size - the client still chooses 1x1 (2026-10-11)
+
+The WSI now tracks the compositor's `wl_output` mode (`reg_global` binds `wl_output`; `out_mode`
+records the current mode) and reports it as the surface size when a Wayland surface has none, so a
+fullscreen surface gets a real `currentExtent` instead of `UINT32_MAX`. Measured (session
+`2026-10-11-30-steam`, the capped caps diagnostic):
+
+```
+caps: kind=0 window=0x0 geom=2404x1080 out=2404x1080   (x25)   <- Wayland, real size now
+caps: kind=1 window=0x1c0002f geom=32x32 out=-1x-1      (x6)    <- X11 32x32 windows
+```
+
+**And the client still creates 1x1 swapchains.** So the 1x1 is the *client's* choice, not our
+`currentExtent`: gamescope hands the game a surface whose viewport is 1x1, and the game sizes its
+swapchain to that. The size a client actually gets is negotiated through xdg-shell
+(`xdg_toplevel.configure`); the WSI does not carry xdg-shell, and the 1x1 configure comes from
+gamescope. So this is a gamescope-side sizing question (its nested output geometry), not the ICD -
+and it is separate from the still-present X `BadAlloc` on DRI3, which is the client/CEF's own X11
+present (our WSI's X11 present runs only for the 32x32 clip windows).
+
+**Net state:** the compositor imports and binds our frames (§42); our X11 present runs; the Wayland
+path has an honest surface size. The two remaining items are both about *what size and how the
+client presents* - gamescope's surface geometry, and the client's X11/CEF DRI3 - not the GPU path,
+which is proven end to end.

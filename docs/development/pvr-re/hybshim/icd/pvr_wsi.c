@@ -106,6 +106,7 @@ struct wsi_surface {
     struct wl_display *display;
     struct wl_surface *surface;
     struct zwp_linux_dmabuf_v1 *dmabuf;
+    struct wsi_display *wd;       /* for the output size, so caps can report a real extent */
     /* X11 (kind == WSI_X11) */
     xcb_connection_t *c;
     xcb_window_t window;
@@ -125,6 +126,7 @@ struct wsi_display {
     struct wl_display *display;
     struct zwp_linux_dmabuf_v1 *dmabuf;
     struct wl_registry *registry;
+    int out_w, out_h;   /* the compositor's output mode, so a Wayland surface has a size to report */
 };
 static struct wl_registry_listener g_reg_listener;
 
@@ -148,10 +150,27 @@ static struct wsi_display *wsi_for_display(struct wl_display *d) {
     return wd;
 }
 
+static void out_geometry(void *data, struct wl_output *o, int32_t x, int32_t y,
+                         int32_t pw, int32_t ph, int32_t subpixel, const char *make,
+                         const char *model, int32_t transform) { (void)data;(void)o;(void)x;(void)y;(void)pw;(void)ph;(void)subpixel;(void)make;(void)model;(void)transform; }
+static void out_mode(void *data, struct wl_output *o, uint32_t flags, int32_t w, int32_t h, int32_t refresh) {
+    (void)o; (void)refresh;
+    struct wsi_display *wd = data;
+    if ((flags & WL_OUTPUT_MODE_CURRENT) && w > 0 && h > 0) { wd->out_w = w; wd->out_h = h; }
+}
+static void out_done(void *data, struct wl_output *o) { (void)data; (void)o; }
+static void out_scale(void *data, struct wl_output *o, int32_t f) { (void)data; (void)o; (void)f; }
+static const struct wl_output_listener g_out_listener = { out_geometry, out_mode, out_done, out_scale };
+
 static void reg_global(void *data, struct wl_registry *reg, uint32_t name, const char *iface, uint32_t ver) {
     struct wsi_display *wd = data;
     if (!strcmp(iface, zwp_linux_dmabuf_v1_interface.name)) {
         wd->dmabuf = wl_registry_bind(reg, name, &zwp_linux_dmabuf_v1_interface, ver < 3 ? ver : 3);
+    } else if (!strcmp(iface, wl_output_interface.name)) {
+        /* The output's mode is the size a fullscreen surface will be. Tracked so a Wayland surface
+         * can report a real currentExtent instead of UINT32_MAX (which makes clients pick 1x1). */
+        struct wl_output *o = wl_registry_bind(reg, name, &wl_output_interface, ver < 2 ? ver : 2);
+        if (o) wl_output_add_listener(o, &g_out_listener, wd);
     }
 }
 static void reg_remove(void *data, struct wl_registry *reg, uint32_t name) { (void)data; (void)reg; (void)name; }
@@ -169,9 +188,12 @@ static VkResult wsi_create_wayland_surface(VkInstance instance, const VkWaylandS
     s->display = ci->display;
     s->surface = ci->surface;
     s->dmabuf = wd ? wd->dmabuf : NULL;
-    /* No size yet: a wl_surface is sized by the first buffer committed to it, so the app picks (see
-     * wsi_surface_caps). */
-    s->width = -1; s->height = -1;
+    s->wd = wd;
+    /* No size from the surface itself (a wl_surface is sized by the first buffer committed to it),
+     * so fall back to the output mode - a fullscreen surface is that size, and UINT32_MAX would make
+     * the client pick 1x1 (see wsi_surface_caps). */
+    s->width = (wd && wd->out_w > 0) ? wd->out_w : -1;
+    s->height = (wd && wd->out_h > 0) ? wd->out_h : -1;
     if (!s->dmabuf) WSI_LOG("no zwp_linux_dmabuf_v1 on the display; present will be unavailable");
     *out = (VkSurfaceKHR)s;
     return VK_SUCCESS;
@@ -250,19 +272,20 @@ static VkResult wsi_surface_caps(VkPhysicalDevice pd, VkSurfaceKHR surface, VkSu
             s->width = s->height = -1;   /* unreadable: let the app pick, see below */
         }
     } else if (s->kind == WSI_WAYLAND && s->surface) {
-        /* wl_surface has no size of its own before a buffer is committed; the compositor's
-         * configure is what carries it and this WSI does not track it yet, so leave the choice to
-         * the app rather than invent one. */
-        s->width = s->height = -1;
+        /* wl_surface has no size of its own before a buffer is committed. The output mode is the
+         * best available size for a fullscreen surface (the game runs fullscreen in gamescope);
+         * without it the client picks 1x1. Re-read each call so a mode change is picked up. */
+        if (s->wd && s->wd->out_w > 0 && s->wd->out_h > 0) {
+            s->width = s->wd->out_w;
+            s->height = s->wd->out_h;
+        } else {
+            s->width = s->height = -1;
+        }
     }
+    { static int logged; if (!logged) { logged = 1;
+        WSI_LOG("caps: kind=%d window=0x%x geom=%dx%d out=%dx%d", s->kind, (unsigned)s->window,
+                s->width, s->height, s->wd ? s->wd->out_w : -1, s->wd ? s->wd->out_h : -1); } }
     if (s->width <= 0 || s->height <= 0) {
-        /* Rare (only an unreadable window), so logged unconditionally, once: it distinguishes "the
-         * window has no geometry yet" (this branch, app then picks its own size - Steam picks 1x1)
-         * from "the window really is 1x1", which is the difference between a WSI bug and a client
-         * choice. A Wayland surface always lands here: this WSI does not track the compositor's
-         * configure, so it has no size to report. */
-        static int logged;
-        if (!logged) { logged = 1; WSI_LOG("caps: window 0x%x kind=%d unreadable -> currentExtent UINT32_MAX (app chooses)", (unsigned)s->window, s->kind); }
         caps->currentExtent.width = UINT32_MAX;
         caps->currentExtent.height = UINT32_MAX;
     } else {
@@ -565,7 +588,7 @@ static VkResult wsi_queue_present(VkQueue queue, const VkPresentInfoKHR *pi) {
             /* Give the image's dma-buf to Xwayland as a DRI3 Pixmap (once per image) and show it with
              * Present. buffer_from_pixmap is the X->client direction, not needed here. */
             static int x11_logged;
-            if (!x11_logged) { x11_logged = 1;
+            if (x11_logged < 40) { x11_logged++;
                 WSI_LOG("X11 present: window=0x%x %dx%d stride=%u depth=%u bpp=%u fd=%d (DRI3 PixmapFromBuffers)",
                         (unsigned)surf->window, sc->width, sc->height, sc->stride, surf->x_depth, surf->x_bpp, sc->images[idx].fd); }
             if (sc->images[idx].fd < 0) { if (pi->pResults) pi->pResults[i] = VK_ERROR_SURFACE_LOST_KHR; continue; }
