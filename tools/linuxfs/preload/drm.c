@@ -252,6 +252,96 @@ __attribute__((visibility("hidden"))) int bl_drm_gem_close(int fd, unsigned long
 }
 
 /*
+ * The same emulation, for a caller that issues the PRIME ioctls itself instead of through libdrm.
+ * Chromium's GPU process (CEF) does exactly this: on the PowerVR render node it calls
+ * DRM_IOCTL_PRIME_HANDLE_TO_FD and DRM_IOCTL_PRIME_FD_TO_HANDLE directly (measured: 240 and 247 per
+ * session), and the node answers ENODEV/EINVAL because it has no GEM. libdrm's wrapper was covered;
+ * the raw ioctl was not. Handled here so both callers share one handle table.
+ *
+ * This is a real gap closed, but measured NOT to be what aborts CEF: with this in place the ioctl
+ * returns rc=0 with a valid handle (258 calls, all rc=0) and the GPU process still aborts on the
+ * same "Buffer handle is null" / "StagingBuffer's SharedImage failed" lines (state doc 45-46). So
+ * that null handle does not come from this ioctl. Kept because it is correct - a caller issuing the
+ * PRIME ioctls directly gets the same stand-in as one going through libdrm - not because it fixed CEF.
+ *
+ * drm.h: struct drm_prime_handle { __u32 handle; __u32 flags; __s32 fd; };
+ *        DRM_IOCTL_PRIME_HANDLE_TO_FD = DRM_IOWR(0x2d, struct drm_prime_handle);
+ *        DRM_IOCTL_PRIME_FD_TO_HANDLE = DRM_IOWR(0x2e, struct drm_prime_handle);
+ */
+struct prime_handle {
+  uint32_t handle;
+  uint32_t flags;
+  int32_t fd;
+};
+#define PRIME_HANDLE_TO_FD _IOWR('d', 0x2d, struct prime_handle)
+#define PRIME_FD_TO_HANDLE _IOWR('d', 0x2e, struct prime_handle)
+
+__attribute__((visibility("hidden"))) int bl_drm_prime_ioctl(int fd, unsigned long request, void *arg, int *rc) {
+  if ((request != PRIME_FD_TO_HANDLE && request != PRIME_HANDLE_TO_FD) || !arg) {
+    return 0;
+  }
+  struct prime_handle *ph = arg;
+  if (!is_kgsl(fd)) {
+    /* Ask the node first; only stand in where it says it cannot do GEM at all. The real answer is
+     * passed through unless the node refused this as a no-GEM node (ENODEV/EINVAL/ENOTTY/EOPNOTSUPP),
+     * which is the same test the libdrm wrappers above use. */
+    int (*fn)(int, unsigned long, void *) = (int (*)(int, unsigned long, void *)) real("ioctl");
+    if (!fn) {
+      return 0;
+    }
+    int rrc = fn(fd, request, arg);
+    if (rrc == 0 || !no_gem_errno(errno)) {
+      *rc = rrc;
+      return 1;   /* the node answered for real: use its answer, do not emulate */
+    }
+  }
+  if (request == PRIME_FD_TO_HANDLE) {
+    int dup_fd = fcntl(ph->fd, F_DUPFD_CLOEXEC, 0);
+    if (dup_fd < 0) {
+      *rc = -1;
+      return 1;
+    }
+    int ret = -ENOMEM;
+    pthread_mutex_lock(&lock);
+    for (int i = 0; i < MAX_HANDLES; i++) {
+      if (handle_entries[i].handle == 0) {
+        uint32_t token = alloc_handle_locked();
+        if (!token) {
+          break;
+        }
+        handle_entries[i].handle = token;
+        handle_entries[i].dma_fd = dup_fd;
+        handle_entries[i].drm_fd = fd;
+        ph->handle = token;
+        ret = 0;
+        break;
+      }
+    }
+    pthread_mutex_unlock(&lock);
+    if (ret) {
+      close(dup_fd);
+      errno = ENOMEM;
+      *rc = -1;
+    } else {
+      *rc = 0;
+    }
+    return 1;
+  }
+  /* PRIME_HANDLE_TO_FD: only a handle this table minted is ours to answer. */
+  pthread_mutex_lock(&lock);
+  int index = find_handle_locked(fd, ph->handle);
+  if (index >= 0) {
+    ph->fd = fcntl(handle_entries[index].dma_fd, F_DUPFD_CLOEXEC, 0);
+    *rc = ph->fd < 0 ? -1 : 0;
+  } else {
+    errno = EINVAL;
+    *rc = -1;
+  }
+  pthread_mutex_unlock(&lock);
+  return 1;
+}
+
+/*
  * fork() carries over only the calling thread, so a lock another thread was holding at that
  * instant stays held in the child by a thread that is not there to release it. Taking it before
  * the fork makes the copy consistent; the parent then unlocks it and the child, whose one thread
