@@ -2204,3 +2204,34 @@ GEM/GBM (libdrm API, raw PRIME ioctls, the GBM API, dma-heap, udmabuf) has been 
 the PowerVR node - a kernel driver, not an app or shim change - or a Chromium/CEF build whose raster
 path does not require a platform buffer handle. **The frame-rendering goal is met** (vkcube, glxgears,
 §48); Steam's CEF UI specifically is gated by the driver.
+
+**Addendum 8 to §46 - replacing libgbm outright (session 87).** The direct test of "is GBM the
+blocker": the client's `LD_LIBRARY_PATH` was prefixed (client-only, via `BL_CEF_LIBDIR`) with a
+directory holding a **hand-written `libgbm.so.1`** whose `gbm_bo_get_fd` returns a real fd
+(memfd-backed), so a GBM-using caller gets a non-null handle without the driver.
+
+Measured (session `2026-10-11-87-steam`):
+
+```
+steamwebhelper.log  gbm_wrapper "Failed to export/get fd":  80 -> 0     <- the stub was used
+cef_log.txt         "GPU process exited":                   69          <- still crashes
+cef_log.txt         "Buffer handle is null":                351         <- unchanged
+cef_log.txt         "Reinitialized the GPU process":        26
+```
+
+**So replacing GBM removes the GBM errors but does not stop the crash, and the `Buffer handle is
+null` count is unchanged.** That is the strongest evidence yet that the null handle is not GBM's
+export: even with GBM entirely substituted, Chromium still gets a null handle and still aborts. The
+handle comes from a different part of Chromium's buffer path (its GPU-memory-buffer / shared-image
+bookkeeping), fed by something other than the GBM export the stub replaced.
+
+**A note on flakiness.** This round the device intermittently refused to start sessions (state stuck
+at `STARTING_GUEST`, logs not refreshed). The numbers above are from the run where the stub was
+confirmed in use (gbm errors 0); runs where the config did not apply are not counted. The conclusion
+is consistent with addenda 4 and 5 (GBM removed by a scoped shim; Vulkan off) - three independent
+ways of taking GBM out of the picture, all leaving the crash.
+
+**The reachable surface is exhausted, now including a GBM replacement.** What remains for Steam is a
+real GEM/GBM backend on the PowerVR node (kernel driver) or a Chromium/CEF build that does not take
+a platform buffer handle on this path. The frame-rendering goal is met (§48); Steam's CEF UI is gated
+by the driver, not by anything the app or its shims can supply.

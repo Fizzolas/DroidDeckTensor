@@ -887,6 +887,12 @@ BUSCONF
         export VK_ICD_FILENAMES="$BL_CEF_VULKAN_ICD"
         echo "== steam: VK_ICD_FILENAMES=$VK_ICD_FILENAMES (client only)"
       fi
+      # Client-only LD_LIBRARY_PATH prefix, for replacing one library (e.g. libgbm) in the client's
+      # search path without touching gamescope/Xwayland. Cleared before the next start.
+      if [ -n "${BL_CEF_LIBDIR:-}" ]; then
+        export LD_LIBRARY_PATH="$BL_CEF_LIBDIR${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+        echo "== steam: LD_LIBRARY_PATH prefixed with $BL_CEF_LIBDIR (client only)"
+      fi
       "$steam_root/steamrtarm64/steam" "${_bl_ui[@]}" "${_bl_cdp[@]}" "${_bl_lang[@]}" -clientbeta "$steam_channel" \
         -no-cef-sandbox "${_bl_cef[@]}" "$@"
       rc=$?
