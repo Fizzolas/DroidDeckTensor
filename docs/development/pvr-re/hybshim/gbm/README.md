@@ -1,39 +1,36 @@
-# libminigbm.so over AHardwareBuffer
+# libgbm.so.1 over AHardwareBuffer (for CEF)
 
-A drop-in replacement for the Steam client's `steamrtarm64/libminigbm.so` whose GBM API is answered
-by **real gralloc buffers** (`AHardwareBuffer_*`) reached from the glibc guest through **libhybris** -
-the same glibc->bionic bridge the Vulkan ICD uses. Chromium's GPU process allocates its shared-image
-buffers through GBM; the PowerVR render node has no GBM/GEM, so its `gbm_bo_get_fd` fails and the GPU
-process aborts. This shim gives it a genuine dma-buf instead.
+A drop-in replacement for **`libgbm.so.1`** whose GBM API is answered by real gralloc buffers
+(`AHardwareBuffer_*`) reached from the glibc guest through **libhybris** - the same glibc->bionic
+bridge the Vulkan ICD uses.
 
-## Why libminigbm.so and not libgbm.so.1
+## Why `libgbm.so.1`, and where it goes
 
-Steam's client ships and loads its **own** `steamrtarm64/libminigbm.so` (Chromium's minigbm); a
-`libgbm.so.1` placed in `LD_LIBRARY_PATH` is never consulted. The replacement must be
-`steamrtarm64/libminigbm.so`.
+**`libcef.so`** (CEF's engine) is the GBM consumer: its `DT_NEEDED` is **`libgbm.so.1`**, and it
+references `gbm_create_device` and `gbm_bo_import`. It does **not** reference `libminigbm.so`, and
+`steamwebhelper` references neither - so a shim named `libminigbm.so` is loaded by nothing. The
+client's rpath is `$ORIGIN` (its own `steamrtarm64/` directory), so the shim goes there as
+**`steamrtarm64/libgbm.so.1`**.
 
-## Why it must be padded to exactly 2046456 bytes
+## Padding
 
-Steam verifies its installed files by **size** (`BVerifyInstalledFiles: ...is N bytes, expected M`)
-and refuses to start (`rc=42`) when it does not match. ELF ignores trailing bytes, so the shim is
-padded to the real library's size.
+Steam verifies installed files by size; the shim must be padded to the real `libgbm.so.1.0.0` size
+(2046456 bytes on this device). ELF ignores trailing bytes.
 
-## Build and deploy (dev procedure, not yet packaged)
+## Build
 
 ```
-zig cc -target aarch64-linux-gnu.2.31 -fPIC -shared -O2 -Wl,-soname,libminigbm.so \
-    -o libminigbm_shim.so gbm_ahb.c -ldl
-# pad to the size of the real library on this device
-python3 -c "d=open('libminigbm_shim.so','rb').read(); open('libminigbm.so','wb').write(d+b'\x00'*(2046456-len(d)))"
+zig cc -target aarch64-linux-gnu.2.31 -fPIC -shared -O2 -Wl,-soname,libgbm.so.1 \
+    -o libgbm_shim.so gbm_ahb.c -ldl
+python3 -c "d=open('libgbm_shim.so','rb').read(); open('libgbm.so.1','wb').write(d+b'\x00'*(2046456-len(d)))"
 ```
 
-Deploy: back up the real `steamrtarm64/libminigbm.so` as `.real`, put the padded shim in its place,
-and place `libhybris.so` + `q.so` (from the PowerVR driver bundle) beside it or where
-`HYBRIS_LINKER_DIR` points.
+Deploy `libgbm.so.1` into `steamrtarm64/` (back up the real one first), with `libhybris.so` + `q.so`
+beside it or where `HYBRIS_LINKER_DIR` points.
 
-## Measured
+## Measured (2026-10-12)
 
-With the shim in place (session `2026-10-11-102-steam`): CEF GPU-process crashes ~70 -> **1**,
-`Buffer handle is null` ~350 -> **9**, `gbm_wrapper` export errors 80 -> **0**, update-UI presents
-21 -> **40**. The main client window is still 1x1 and the client still ends `WaitingForCredentials`;
-the last crash and the 1x1 remain. See `docs/development/tensor-g5-powervr-state.md` sections 49-50.
+With the shim correctly as `steamrtarm64/libgbm.so.1`: it **loads** (`gbma loaded comm=steamwebhelper`)
+and is **called** (`gbm_bo_create ... -> ok`), and CEF's `Buffer handle is null` count drops
+**128 -> 0** - the wall that blocked the UI is gone. The GPU process still crashes afterward (when it
+uses the handle), with no Chromium-level message; that is the remaining problem. See state doc §53.

@@ -14,6 +14,7 @@
 #include <dlfcn.h>
 #include <errno.h>
 #include <stdint.h>
+#include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -101,10 +102,21 @@ int gbm_device_get_fd(struct gbm_device *d) { return d->fd; }
 int gbm_device_is_format_supported(struct gbm_device *d, uint32_t fmt, uint32_t usage) { (void)d; (void)fmt; (void)usage; return 1; }
 uint32_t gbm_device_get_format_modifier_plane_count(struct gbm_device *d, uint32_t fmt, uint64_t mod) { (void)d; (void)fmt; (void)mod; return 1; }
 
+static void logline(const char *fmt, ...) {
+    int f = open("/root/.local/share/Steam/logs/gbma.log", O_WRONLY | O_APPEND | O_CREAT, 0600);
+    if (f < 0) return;
+    char b[256];
+    va_list ap; va_start(ap, fmt);
+    int n = vsnprintf(b, sizeof(b), fmt, ap);
+    va_end(ap);
+    if (n > 0) { ssize_t w = write(f, b, (size_t)n); (void)w; }
+    close(f);
+}
+
 struct gbm_bo *gbm_bo_create(struct gbm_device *d, uint32_t w, uint32_t h, uint32_t fmt, uint32_t flags) {
     (void)d; (void)flags;
     load_ahb();
-    if (!g_ahb_alloc) { errno = ENODEV; return NULL; }
+    if (!g_ahb_alloc) { logline("gbm_bo_create FAIL: no AHB alloc (hybris not loaded)\n"); errno = ENODEV; return NULL; }
     struct gbm_bo *b = calloc(1, sizeof(*b));
     if (!b) return NULL;
     b->fd = -1; b->w = w; b->h = h; b->fmt = fmt; b->stride = w * 4;
@@ -117,7 +129,8 @@ struct gbm_bo *gbm_bo_create(struct gbm_device *d, uint32_t w, uint32_t h, uint3
         struct ahb_desc d2 = desc; d2.format = AH_PF_RGBA8888; d2.usage = 0x100u | 0x200u;
         rc = g_ahb_alloc(&d2, &ahb);
     }
-    if (rc != 0 || !ahb) { free(b); errno = ENOMEM; return NULL; }
+    if (rc != 0 || !ahb) { logline("gbm_bo_create w=%u h=%u fmt=0x%x -> FAIL rc=%d\n", w, h, fmt, rc); free(b); errno = ENOMEM; return NULL; }
+    logline("gbm_bo_create w=%u h=%u fmt=0x%x -> ok ahb=%p\n", w, h, fmt, ahb);
     b->ahb = ahb;
     if (g_ahb_desc) { struct ahb_desc o = {0}; g_ahb_desc(ahb, &o); if (o.stride) b->stride = o.stride; }
     return b;
@@ -137,7 +150,7 @@ int gbm_bo_get_fd(struct gbm_bo *bo) {
     if (!bo || !bo->ahb || !g_ahb_nh) return -1;
     if (bo->fd < 0) {
         const int *nh = g_ahb_nh(bo->ahb);
-        if (!nh || nh[1] < 1) { errno = EINVAL; return -1; }
+        if (!nh || nh[1] < 1) { logline("gbm_bo_get_fd NULL handle\n"); errno = EINVAL; return -1; }
         bo->fd = fcntl(nh[3], F_DUPFD_CLOEXEC, 0);
     }
     return bo->fd < 0 ? -1 : fcntl(bo->fd, F_DUPFD_CLOEXEC, 0);
@@ -176,7 +189,46 @@ int gbm_bo_write(struct gbm_bo *bo, const void *buf, size_t count) { (void)bo; (
 void gbm_bo_set_user_data(struct gbm_bo *bo, void *data, void (*destroy)(struct gbm_bo *, void *)) { (void)bo; (void)data; (void)destroy; }
 void *gbm_bo_get_user_data(struct gbm_bo *bo) { (void)bo; return NULL; }
 struct gbm_bo *gbm_bo_new(struct gbm_device *d, uint32_t w, uint32_t h, uint32_t fmt, uint32_t flags, uint32_t *mods, int nmods) { (void)mods; (void)nmods; return gbm_bo_create(d, w, h, fmt, flags); }
-struct gbm_bo *gbm_bo_import(struct gbm_device *d, uint32_t type, void *buffer, uint32_t usage) { (void)d; (void)type; (void)buffer; (void)usage; return NULL; }
+/* gbm_bo_import: CEF's GPU process imports a dma-buf (or ANativeWindowBuffer) as a bo - this is the
+ * call that produces the "Buffer handle" it needs. type is GBM_BO_IMPORT_FD(2),
+ * GBM_BO_IMPORT_FD_MODIFIER(4) or GBM_BO_IMPORT_WL_BUFFER(0).
+ *   GBM_BO_IMPORT_FD:         buffer = struct gbm_import_fd_data { int fd; u32 width, height, stride; u32 format; }
+ *   GBM_BO_IMPORT_FD_MODIFIER: buffer = struct gbm_import_fd_modifier_data { u32 width,height,format; u32 num_fds;
+ *                                    int fds[4]; int strides[4]; int offsets[4]; u64 modifier; }
+ * We keep the imported fd and answer get_fd/stride/format from it, so a caller round-tripping an fd
+ * through import -> get_fd gets a real buffer. */
+struct gbm_import_fd_data { int fd; uint32_t width, height, stride, format; };
+struct gbm_import_fd_modifier_data { uint32_t width, height, format, num_fds; int fds[4]; int strides[4]; int offsets[4]; uint64_t modifier; };
+
+static int ahb_import_fd(int fd, uint32_t w, uint32_t h, uint32_t fmt, void **out_ahb) {
+    /* Newer Android exposes AHardwareBuffer_createFromHandle(desc, handle, usage, out). Build a
+     * native_handle from the fd and call it if available. */
+    (void)w; (void)h; (void)fmt; (void)out_ahb; (void)fd;
+    return -1;   /* not available through the libnativewindow the shim holds yet */
+}
+
+struct gbm_bo *gbm_bo_import(struct gbm_device *d, uint32_t type, void *buffer, uint32_t usage) {
+    (void)d; (void)usage;
+    load_ahb();
+    struct gbm_bo *b = calloc(1, sizeof(*b));
+    if (!b) return NULL;
+    b->fd = -1;
+    if (type == 2 /* GBM_BO_IMPORT_FD */ && buffer) {
+        struct gbm_import_fd_data *im = buffer;
+        b->w = im->width; b->h = im->height; b->fmt = im->format; b->stride = im->stride;
+        b->fd = fcntl(im->fd, F_DUPFD_CLOEXEC, 0);
+    } else if (type == 4 /* GBM_BO_IMPORT_FD_MODIFIER */ && buffer) {
+        struct gbm_import_fd_modifier_data *im = buffer;
+        b->w = im->width; b->h = im->height; b->fmt = im->format; b->stride = im->strides[0];
+        if (im->num_fds >= 1) b->fd = fcntl(im->fds[0], F_DUPFD_CLOEXEC, 0);
+    } else {
+        logline("gbm_bo_import type=%u unsupported\n", type);
+        free(b);
+        return NULL;
+    }
+    logline("gbm_bo_import type=%u w=%u h=%u fmt=0x%x fd=%d\n", type, b->w, b->h, b->fmt, b->fd);
+    return b;
+}
 
 struct gbm_surface *gbm_surface_create(struct gbm_device *d, uint32_t w, uint32_t h, uint32_t fmt, uint32_t flags) { (void)d; (void)w; (void)h; (void)fmt; (void)flags; return NULL; }
 struct gbm_surface *gbm_surface_create_with_modifiers(struct gbm_device *d, uint32_t w, uint32_t h, uint32_t fmt, const uint64_t *m, unsigned n) { (void)d; (void)w; (void)h; (void)fmt; (void)m; (void)n; return NULL; }
@@ -199,4 +251,15 @@ const char *gbm_format_get_name(uint32_t fmt, struct gbm_format_name_desc *desc)
         return desc->name;
     }
     return "?";
+}
+
+__attribute__((constructor)) static void gbma_load_marker(void) {
+    int f = open("/root/.local/share/Steam/logs/gbma_loaded.log", O_WRONLY | O_APPEND | O_CREAT, 0600);
+    if (f < 0) return;
+    char c[64] = {0}; int cf = open("/proc/self/comm", O_RDONLY);
+    if (cf >= 0) { ssize_t n = read(cf, c, sizeof(c) - 1); (void)n; close(cf); }
+    for (char *q = c; *q; q++) if (*q == 10) { *q = 0; break; }
+    char b[128]; int m = snprintf(b, sizeof(b), "gbma loaded comm=%s pid=%d\n", c, (int)getpid());
+    if (m > 0) { ssize_t w = write(f, b, (size_t)m); (void)w; }
+    close(f);
 }
