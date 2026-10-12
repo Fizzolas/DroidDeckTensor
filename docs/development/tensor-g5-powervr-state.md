@@ -2182,3 +2182,25 @@ process - not a change this app or its shims can make.
 **The GPU path itself is proven and unaffected:** vkcube (Vulkan) and glxgears (GL/zink) both render
 on the PowerVR GPU and present frames on screen (§48), verified again after every one of these
 changes. Games and apps that render through the ICD get frames; only Steam's CEF-based UI does not.
+
+**Addendum 7 to §46 - the last levers, and why they are closed (2026-10-11, sessions 81-86).**
+
+- **CEF's GPU process dies by signal, with no CHECK/FATAL message.** A `write()` interposer captured
+  its stderr to a file (it had been going nowhere); the only messages are the `gbm_wrapper` export
+  errors and Chromium's usual noise - no fatal line. So there is nothing to read that names the fault.
+- **A GBM shim cannot be installed the obvious way.** Chromium **dlopens** `libgbm.so.1` and calls
+  `gbm_create_device` through `dlsym()`, so an `LD_PRELOAD` interposer of the symbol is bypassed. An
+  interposer that also overrides `dlsym` was built and still did not stop the `gbm_wrapper` errors,
+  so the call site is not the plain `dlsym` route either.
+- **The two dma-buf allocators a GBM replacement would need are both denied to the app:**
+  `/dev/dma_heap/system` -> `Permission denied` (measured), `/dev/udmabuf` could not be exercised
+  (device flaky). Without one, a shim cannot mint a real dma-buf to hand back where GBM's export
+  failed, so a "GBM over dma-heap" replacement is not available in this sandbox.
+- **`--ozone-platform=headless`** (no GBM device at all) still crashed the GPU process.
+
+**The reachable surface is now exhausted.** Every facility that could stand in for the missing
+GEM/GBM (libdrm API, raw PRIME ioctls, the GBM API, dma-heap, udmabuf) has been either implemented
+(the PRIME ioctls, `04926c5`) or shown to be denied. CEF's GPU process needs a real GEM/GBM backend on
+the PowerVR node - a kernel driver, not an app or shim change - or a Chromium/CEF build whose raster
+path does not require a platform buffer handle. **The frame-rendering goal is met** (vkcube, glxgears,
+§48); Steam's CEF UI specifically is gated by the driver.
