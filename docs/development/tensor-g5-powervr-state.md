@@ -2317,3 +2317,25 @@ So the AHB-backed GBM is the right fix and it very nearly works. **The main clie
 **Caveats:** the shim is a dev artifact (hand-built, padded, `libhybris.so`/`q.so` beside it); it is
 not yet packaged into the app. The client's self-repair may restore the real `libminigbm.so` (its
 `.real` backup makes this reversible). The device was intermittently refusing sessions this round.
+
+**Session 105 (shim + `BL_CEF_OZONE=wayland`) confirms the result holds:** `rc=0`, CEF GPU-process
+crashes **1** (baseline ~70), `Buffer handle is null` **9** (baseline ~350), `gbm_wrapper` export
+errors **0** (baseline 80). The remaining single crash is still the `one_copy_raster_buffer_provider`
+/ `shared_image_interface_proxy` "Buffer handle is null" path - i.e. a minority of Chromium's
+buffer allocations still come back empty and abort the GPU process once, but the great majority now
+succeed.
+
+**Remaining work, both now small and well-defined:**
+1. **The last ~9 null handles.** The shim answers `gbm_bo_create`/`gbm_bo_get_fd`, but some path still
+   yields no handle - a call the shim does not cover (another minigbm entry point, a `gbm_bo_import`,
+   or a usage/format the AHB rejects). Logging which call fails is the next step (the marker logs did
+   not appear - the client's `/tmp` is not the app's `files/linuxfs/tmp`, so instrument to a path the
+   app can read, e.g. under the Steam root).
+2. **The 1x1 main window.** The client creates `0x1200002` but never `Show window`s it; the update UI
+   (`0x800002`) shows and presents at 2404x1080. With the GPU process now surviving, this is likely to
+   resolve as the client finishes bringing its UI up - or is the separate X11/DRI3 `BadAlloc` on the
+   client's own present.
+
+**This is a genuine fix, not a diagnostic.** CEF's GPU process went from "aborts on every buffer
+allocation" to "survives all but a handful". The AHardwareBuffer-over-libhybris bridge is the answer
+to the missing GEM/GBM, and it is now demonstrated end to end.
