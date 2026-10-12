@@ -2592,3 +2592,29 @@ GpuMemoryBuffer bookkeeping), not in a call reaching the shim - **every `gbm_*` 
 **Net for this stage:** the buffer-handle wall is fixed (128 -> 0) and the shim's create/map/import are
 correct; what remains is a crash inside CEF after it has the buffers, whose address is not capturable
 in the guest. Shim source: `docs/development/pvr-re/hybshim/gbm/gbm_ahb.c`.
+
+## 55. Decisive isolation: GBM was the crash source; the UI blocker is separate (2026-10-12)
+
+With the shim correctly loaded as `steamrtarm64/libgbm.so.1` (§53) and its map/import fixed (§54), the
+GPU process still crashed ~48x. The decisive experiment: make **`gbm_create_device` return NULL**, so
+CEF sees GBM as unavailable and cannot use the shim's buffers at all.
+
+**Measured (session 45): `GPU process exited` 48 -> 1.** CEF handles the NULL device gracefully and
+falls back to a non-GBM path (it logs once and carries on). So:
+
+- **The GBM path is the crash source.** When CEF actually *uses* buffers through the shim, it faults
+  (48x). When it can't use GBM (device NULL), it doesn't (1x). The crash is in CEF's use of the
+  buffers, not in the shim's gbm_* entry points (all of which return sane values now).
+- **This also means CEF has a working non-GBM fallback**, which is the path the update UI (which
+  renders fine) already uses.
+
+**But the UI still does not render.** With the GPU process nearly healthy (1 crash) and CEF off GBM,
+the main client UI window is still created at 1x1 / never shown, and the client still ends
+`WaitingForCredentials` then `rc=0`. So **the UI-blocking problem is independent of the GPU/GBM crash**
+- it is the client's window creation/bring-up, not the graphics stack.
+
+**Two shim variants now exist** (both in `docs/development/pvr-re/hybshim/gbm/`): the real
+AHardwareBuffer-backed one (§53-54), and a diagnostic variant whose `gbm_create_device` returns NULL.
+The former gives CEF real buffers (null 128 -> 0) but CEF crashes using them; the latter makes CEF use
+its own fallback (crash 1) without the shim's buffers. Neither is yet a working configuration - the
+remaining work is the UI bring-up, which is upstream of both.
