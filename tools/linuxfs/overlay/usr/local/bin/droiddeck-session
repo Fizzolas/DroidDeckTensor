@@ -894,7 +894,20 @@ BUSCONF
         echo "== steam: LD_LIBRARY_PATH prefixed with $BL_CEF_LIBDIR (client only)"
       fi
       "$steam_root/steamrtarm64/steam" "${_bl_ui[@]}" "${_bl_cdp[@]}" "${_bl_lang[@]}" -clientbeta "$steam_channel" \
-        -no-cef-sandbox "${_bl_cef[@]}" "$@"
+        -no-cef-sandbox "${_bl_cef[@]}" "$@" &
+      _bl_steam_pid=$!
+      if [ "${BL_UI_PROBE:-0}" = 1 ]; then
+        ( nap 75; echo "== ui-probe: xrandr =="; xrandr 2>&1 | head -4; \
+          echo "== ui-probe: root props =="; xprop -root 2>&1 | grep -iE "GAMESCOPE|_NET_|STEAM_" | head -25; \
+          echo "== ui-probe: client list =="; xprop -root _NET_CLIENT_LIST 2>&1 | head -3; \
+          echo "== ui-probe: geometry of client windows =="; \
+          for w in 0x800002 0x1200002 0x1400002 0x1c00033 0x2c00002; do \
+            echo "-- window $w --"; xwininfo -id "$w" 2>&1 | grep -iE "Map State|Width|Height|Absolute|IsViewable"; \
+            xprop -id "$w" 2>&1 | head -20; done; \
+          echo "== ui-probe: viewport prop =="; xprop -root GAMESCOPE_VIEWPORT_SUPPORTED 2>&1 | head -2; \
+          echo "== ui-probe: active window =="; xprop -root _NET_ACTIVE_WINDOW 2>&1 | head -2 ) >> "$BL_LOG" 2>&1
+      fi
+      wait "$_bl_steam_pid"
       rc=$?
       echo "== steam exited rc=$rc"
       if [ -n "${BL_ADDED_GAMES:-}" ] && [ -f "$BL_ADDED_GAMES" ]; then

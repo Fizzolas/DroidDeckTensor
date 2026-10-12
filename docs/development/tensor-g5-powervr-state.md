@@ -2370,3 +2370,37 @@ size query failing.
 **The fix that works is preserved** (`docs/development/pvr-re/hybshim/gbm/`), and it is a real
 advance: CEF's GPU process went from aborting on essentially every buffer allocation to surviving all
 but a handful, which is the difference between "no UI possible" and "UI is loading, just mis-sized".
+
+## 51. The 1x1 window: the client draws its UI windowed and exits (2026-10-12, sessions 03-06)
+
+With the AHB GBM shim in place the GPU process is healthy; this section pins down the remaining
+window problem with a live probe.
+
+**Facts measured in a running session** (an `xprop`/`xrandr`/`xwininfo` probe added to the session
+script behind `BL_UI_PROBE=1`):
+
+- `xrandr` inside the session reports `Screen 0: ... current 2404 x 1080` - the display size is
+  correct and readable from the guest.
+- gamescope exposes its properties on the root window (`GAMESCOPE_*`, `_NET_ACTIVE_WINDOW`,
+  `GAMESCOPE_DISPLAY_IS_EXTERNAL = 0`), but **`_NET_CLIENT_LIST` does not exist** - gamescope's WM
+  is minimal and does not export the client list.
+- **By 75 s every client window is gone**: `xprop -id 0x1200002` etc. all return `BadWindow`. The
+  client has already exited and destroyed them.
+
+**Why.** The client's own logs (`console_log.txt`, `steamui_html.txt`) show it reaches
+`SetLoginState: WaitingForCredentials`, creates its SteamUI browser window at
+`CreateBrowser ... (-2147483648, -2147483648) 0x0` (hidden/zero-sized - Steam sizes its UI window
+through the window manager, not itself), the webhelper restarts once (`Restart webhelper process,
+counter 2`), then `Shutdown` - `rc=0` ~30 s in. The client is drawing its interface **windowed** at
+1x1 and then quitting, so nothing is ever shown.
+
+**Strongest lead: Steam is told the display is "Windowed".** `droiddeck-steam-ui-scale` seeds
+`config.vdf` with the display name `"External: gamescope|||Windowed"`
+(`docs/.../droiddeck-steam-ui-scale:16`), and the on-device `config.vdf` carries exactly that entry.
+`|||Windowed` is Steam's own mode suffix for the display; on SteamOS the client's UI is fullscreen.
+A windowed client UI is created at a window size the WM must supply - and gamescope's
+`win_skip_and_not_fullscreen` excludes a 1x1 window from focus, so it stays 1x1. Changing that mode
+to fullscreen (or removing the seeded entry so Steam defaults) is the next thing to try.
+
+**Note.** `XRRGetOutputInfo() is not available` is a red herring: every libXrandr the client can load
+does export the symbol, and the client's workaround is non-fatal (gamescope prints it and survives).
