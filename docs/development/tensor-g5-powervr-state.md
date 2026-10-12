@@ -2235,3 +2235,43 @@ ways of taking GBM out of the picture, all leaving the crash.
 real GEM/GBM backend on the PowerVR node (kernel driver) or a Chromium/CEF build that does not take
 a platform buffer handle on this path. The frame-rendering goal is met (§48); Steam's CEF UI is gated
 by the driver, not by anything the app or its shims can supply.
+
+## 49. A real AHardwareBuffer can be allocated from glibc - the GBM fix is now possible (2026-10-11)
+
+**This overturns §46's conclusion.** The missing piece for CEF is a GBM that hands back a **real GPU
+buffer**. The driver's GBM/GEM cannot; but the device's **gralloc** can, and it is reachable from the
+glibc guest exactly the way the ICD already reaches the Vulkan HAL - through **libhybris**.
+
+Measured (session `2026-10-11-97-ahb-test`), from a plain glibc binary in the session:
+
+```
+dlopen libhybris = 0x1023030
+libnativewindow = 0x327b23c7                       <- bionic libnativewindow.so, via android_dlopen_ext
+allocate=0x7960c32030 describe=0x7960c32500 release=0x7960c324d0
+AHardwareBuffer_allocate rc=0 buf=0x1034530
+described: 256x256 fmt=1 usage=0x300
+```
+
+So `android_dlopen_ext("/system/lib64/libnativewindow.so")` + `AHardwareBuffer_allocate` works from a
+glibc process. (`libandroid.so` itself does not load - it pulls libgui/libui/libbinder/... - but on
+Android 10+ the `AHardwareBuffer_*` symbols live in **libnativewindow.so**, which loads fine. That is
+the library to use.)
+
+**Why this matters.** A `libgbm.so.1` replacement for CEF's processes can now be built on top of
+AHardwareBuffer:
+
+- `gbm_create_device(fd)` -> open the render node, set up libhybris, resolve the AHB functions.
+- `gbm_bo_create(dev,w,h,fmt,flags)` -> `AHardwareBuffer_allocate(w,h,fmt,usage)` -> a **real
+  gralloc buffer**.
+- `gbm_bo_get_fd(bo)` -> `AHardwareBuffer_getNativeHandle(bo)` -> `native_handle->data[0]`, the
+  dma-buf fd (dup'd).
+- `gbm_bo_map/unmap` -> `AHardwareBuffer_lock/unlock`; `gbm_bo_destroy` -> `AHardwareBuffer_release`.
+
+Then Chromium's `gbm_wrapper.cc` gets a non-null GpuMemoryBufferHandle backed by actual GPU memory -
+not the memfd the earlier stub returned (which could not become a texture, which is why that test was
+inconclusive: `Buffer handle is null` counts were unchanged there, but the stub was never a fair test
+of a *real* buffer). This is the same glibc->bionic bridge the ICD uses; the pieces are proven.
+
+**Next:** implement the shim (`libgbm.so.1` over AHardwareBuffer, loading libhybris.so beside it),
+scope it to the client's processes via `BL_CEF_LIBDIR` (already wired), and measure whether CEF's GPU
+process stops crashing and its UI comes up.
