@@ -2533,3 +2533,36 @@ and why that segfaults.
 with the shim in the wrong place, so it was actually the *stock* library plus variance; the real,
 reproducible effect is the one above (null handles 128 -> 0). The shim now lives at
 `steamrtarm64/libgbm.so.1`.
+
+## 54. Correct shim in place: null handle gone (128 -> 0); the crash moved past buffer creation (2026-10-12)
+
+With the shim correctly installed as `steamrtarm64/libgbm.so.1` (so `libcef.so` loads it - §53), a
+clean run measures:
+
+```
+cef_log:   "Buffer handle is null":  128 -> 0            <- the wall is GONE
+cef_log:   "GPU process exited":     ~39 (still crashing)
+gbma.log:  gbm_bo_create w=2 h=2 fmt=0x20203852 -> ok   (27x; the shim IS called)
+gbma.log:  gbm_bo_get_fd:  0       gbm_bo_import:  0     <- CEF never gets to these
+```
+
+So the shim now gives CEF a real buffer handle, and CEF's GPU process **still crashes immediately
+after** the series of 2x2 buffer creations - before it ever calls `get_fd` or `destroy`. The crash:
+
+- is a **signal**, not a Chromium `CHECK` (no `FATAL:`/`CHECK failed` line in the GPU process's own
+  stderr, which was captured);
+- **no crash file is produced** by any in-guest handler - not the rig's `crashcatch`, not a handler
+  installed from the shim's constructor (loaded by libcef.so, so it runs in the GPU process), and
+  Chromium's own crashpad produces no `.dmp` (breakpad is disabled with `--disable-breakpad`);
+- **no siginfo reaches a handler** - consistent with the process being killed by the browser/parent
+  (crashpad's route) rather than crashing in-place, or with Chromium reinstalling `SIG_DFL`.
+
+**Net:** the GBM buffer-handle wall - the thing that made the UI impossible - is fixed and measured
+(128 -> 0). What remains is a crash after CEF receives the buffer, whose address is not capturable from
+inside the guest with the tools available; the next step is a real debugger or reproducing it with a
+minimal `gbm`-consuming program.
+
+**How to install the shim (working recipe):** build `gbm_ahb.c` as `libgbm.so.1`
+(`-Wl,-soname,libgbm.so.1`), pad to the real `libgbm.so.1.0.0` size (2046456 B), place it at
+`steamrtarm64/libgbm.so.1` (rpath `$ORIGIN`), with `libhybris.so`+`q.so` and `HYBRIS_LINKER_DIR` set.
+Source: `docs/development/pvr-re/hybshim/gbm/`.
