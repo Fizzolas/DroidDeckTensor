@@ -899,11 +899,12 @@ BUSCONF
       # Diagnostic only (BL_UI_PROBE=1): sample the client's X windows while it runs, to see what
       # size gamescope gives them and whether they are ever mapped. off by default.
       if [ "${BL_UI_PROBE:-0}" = 1 ]; then
-        ( for _round in 1 2 3 4 5 6; do nap 10; \
-            echo "== ui-probe round $_round =="; \
-            for w in 0x800002 0x1200002 0x1400002 0x1c0002f 0x1c00033 0x2c00002; do \
-              echo "-- $w --"; xprop -id "$w" 2>&1 | grep -iE "WM_NAME|_NET_WM_NAME|NORMAL_HINTS|WM_STATE|_NET_WM_STATE|geometry" | head -6; done; \
-            xrandr 2>&1 | head -2; done ) >> "$BL_LOG" 2>&1 &
+        ( for _round in 1 2 3 4 5 6 7 8; do nap 4; \
+            echo "== ui-probe round $_round DISPLAY=$DISPLAY =="; \
+            /tmp/xinspect 2>&1 | head -40; \
+            echo "-- also gamescope's own display listing --"; \
+            for _d in :0 :1; do DISPLAY=$_d xrandr 2>/dev/null | head -1; done; \
+          done ) >> "$BL_LOG" 2>&1 &
       fi
       wait "$_bl_steam_pid"
       rc=$?

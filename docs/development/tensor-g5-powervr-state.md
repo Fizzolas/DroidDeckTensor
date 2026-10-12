@@ -2499,3 +2499,37 @@ creates the main UI windows and quits without ever mapping them.
    the update UI appeared; the main client's display may be `:1`, which the read-only tool could not
    reach. Worth checking which display the client and gamescope are on.
 3. The `steamwebhelper` restarts (`Restart webhelper process`) tearing the window down mid-show.
+
+## 53. THE SHIM WAS MISNAMED: it must be `libgbm.so.1`, and now CEF uses it (2026-10-12)
+
+**The fix to the shim, found by reading what actually needs GBM.** `libcef.so` (CEF's engine, 208 MB)
+is the GBM consumer - its `DT_NEEDED` is **`libgbm.so.1`**, and it references `gbm_create_device` and
+`gbm_bo_import`. It does **not** reference `libminigbm.so` at all, and `steamwebhelper` references
+neither. So installing the shim as `steamrtarm64/libminigbm.so` (§49-50, and the earlier `.real`
+scheme) was **never loaded by anything** - the "Buffer handle is null" logs came from the real library.
+
+**Correct placement:** the client's rpath is `$ORIGIN` (= its own `steamrtarm64/` dir), so the shim
+goes there as **`steamrtarm64/libgbm.so.1`** (padded to the real `libgbm.so.1.0.0` size, 2046456 B).
+
+**Measured, immediately:**
+
+```
+gbma_loaded.log:  gbma loaded comm=steamwebhelper pid=...   (10+ processes - the shim is loaded!)
+gbma.log:         gbm_bo_create w=2 h=2 fmt=0x20203852 -> ok ahb=0x3000b09ed0   (repeated - called!)
+cef_log:          "Buffer handle is null":  128 -> 0         <- the wall is GONE
+```
+
+So CEF's GPU process now gets a **real buffer handle** (`gbm_bo_create` returns an AHardwareBuffer)
+where before it got null. `gbm_bo_import` was also given a real implementation (it previously returned
+NULL, which alone would have produced the null handle).
+
+**But the GPU process still crashes** (49x, mixed `exit_code=11` SIGSEGV and `exit_code=6` SIGABRT) -
+a *new* fault, after the buffer is created. The buffers seen are tiny (2x2, format "R8"); the crash
+now happens when Chromium uses the handle, not when it asks for one. This is the next thing to chase:
+what CEF's GPU process does with the AHB-backed buffer (map? bind as a GL/Vulkan texture? import?)
+and why that segfaults.
+
+**Corrections to earlier sections:** §49-50's claim that the shim "cuts crashes 70->1" was measured
+with the shim in the wrong place, so it was actually the *stock* library plus variance; the real,
+reproducible effect is the one above (null handles 128 -> 0). The shim now lives at
+`steamrtarm64/libgbm.so.1`.
