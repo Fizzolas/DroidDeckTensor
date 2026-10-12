@@ -282,9 +282,20 @@ static VkResult wsi_surface_caps(VkPhysicalDevice pd, VkSurfaceKHR surface, VkSu
             s->width = s->height = -1;
         }
     }
-    { static int logged; if (!logged) { logged = 1;
-        WSI_LOG("caps: kind=%d window=0x%x geom=%dx%d out=%dx%d", s->kind, (unsigned)s->window,
-                s->width, s->height, s->wd ? s->wd->out_w : -1, s->wd ? s->wd->out_h : -1); } }
+    /* DIAG (Phase 2): log every caps query with surface identity + the returned currentExtent, so the
+     * main UI surface and the update-UI surface can be told apart and their extents compared. For an
+     * X11 surface also log the window's map state (0=unmapped,1=unviewable,2=viewable). */
+    int mapst = -1;
+    if (s->kind == WSI_X11 && s->c) {
+        xcb_get_window_attributes_cookie_t ac = xcb_get_window_attributes(s->c, s->window);
+        xcb_get_window_attributes_reply_t *a = xcb_get_window_attributes_reply(s->c, ac, NULL);
+        if (a) { mapst = a->map_state; free(a); }
+    }
+    WSI_LOG("caps: surf=%p kind=%d window=0x%x geom=%dx%d out=%dx%d map=%d -> currentExtent=%ux%u",
+            (void *)s, s->kind, (unsigned)s->window, s->width, s->height,
+            s->wd ? s->wd->out_w : -1, s->wd ? s->wd->out_h : -1, mapst,
+            (s->width <= 0 || s->height <= 0) ? UINT32_MAX : (uint32_t)s->width,
+            (s->width <= 0 || s->height <= 0) ? UINT32_MAX : (uint32_t)s->height);
     if (s->width <= 0 || s->height <= 0) {
         caps->currentExtent.width = UINT32_MAX;
         caps->currentExtent.height = UINT32_MAX;
@@ -412,6 +423,10 @@ static VkResult wsi_create_swapchain(VkDevice device, const VkSwapchainCreateInf
     struct wsi_device_entries *de = wsi_entries(device);
     if (de && de->GetDeviceQueue) de->GetDeviceQueue(device, de->queue_family, 0, &sc->queue);
     sc->width = ci->imageExtent.width; sc->height = ci->imageExtent.height;
+    /* DIAG (Phase 2): what the caller asked for and which surface it is. */
+    WSI_LOG("create_swapchain: surf=%p kind=%d window=0x%x requested=%ux%u minImg=%u",
+            (void *)surf, surf->kind, (unsigned)surf->window,
+            ci->imageExtent.width, ci->imageExtent.height, ci->minImageCount);
     sc->drm_format = drm_format_for(ci->imageFormat);
     sc->count = ci->minImageCount > 3 ? 3 : (ci->minImageCount < 2 ? 2 : ci->minImageCount);
     sc->CreateImage = (PFN_vkCreateImage)dev_proc(device, "vkCreateImage");

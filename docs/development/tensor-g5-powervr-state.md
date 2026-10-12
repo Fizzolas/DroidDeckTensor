@@ -2618,3 +2618,53 @@ AHardwareBuffer-backed one (§53-54), and a diagnostic variant whose `gbm_create
 The former gives CEF real buffers (null 128 -> 0) but CEF crashes using them; the latter makes CEF use
 its own fallback (crash 1) without the shim's buffers. Neither is yet a working configuration - the
 remaining work is the UI bring-up, which is upstream of both.
+
+## 56. Phase 1-3 (2026-10-12): NULL-create shim -> 0-1 crashes; main UI window DOES size, but its swapchain is 1x1 and nothing presents
+
+Baseline recorded in `docs/development/pvr-re/ROLLBACK_BASELINE.md` (dist checksums, helper-script
+hash, stock guest libgbm/libminigbm). Installed the **NULL-create** `libgbm.so.1` shim at
+`steamrtarm64/libgbm.so.1` (padded to 2046456 B; the stock lib is untouched, it resolves via
+`/usr/lib`). libhybris/q.so copied beside it and into `/tmp`.
+
+**Phase 1 (low-crash baseline) — reproducible, 2 runs (sessions 49, 50).**
+- The shim loads in **all 8 `steamwebhelper`** processes; `gbm_create_device -> NULL` is reached
+  (logged once per session); **`gbm_bo_create` is never called** (CEF takes its non-GBM fallback).
+- **GPU-process crashes: 0 and 1** across the two runs (baseline with stock libgbm: ~48). So the
+  NULL-create fallback removes the crash entirely.
+- The remaining 0-1 crash does **not** block fallback init: the client runs its full ~30 s, reaches
+  `WaitingForCredentials`, and the update UI renders (21 presents at 2404x1080).
+- The main UI window still showed 1x1 in the *session log*, but see Phase 3.
+
+**Phase 2 (first broken transition) — instrumented our WSI** (`pvr_wsi.c`: every
+`vkGetPhysicalDeviceSurfaceCapabilities*` now logs `surf/kind/window/geom/out/map/currentExtent`; every
+`vkCreateSwapchainKHR` logs the surface and requested extent). Findings (session 52):
+- Our WSI is **correct**: for the main client's `xid 0x1200002` surface it reports
+  `currentExtent=2404x1080`.
+- The main client's swapchain is created **requested=1x1**, and it goes through the **gamescope WSI
+  layer** (`[Gamescope WSI] Creating swapchain for xid: 0x1200002 ... flip: true; pvr_wsi:
+  create_swapchain: ... requested=1x1`).
+- The gamescope WSI layer sources `currentExtent` from the **X window rect**
+  (`frog_wsi.cpp` `xcb::getWindowRect`, line 1243/1567), so a 1x1 X window -> 1x1 swapchain. **The
+  1x1 is the X window's size, propagated by the gamescope WSI layer**, not chosen by the client.
+- All the 32x32/64x24/1x1 windows are `map=0` (unmapped) — helpers/internals.
+
+**Phase 3 — the causal observation (NO intervention needed; xctl's title match failed, so these are
+the client's own behavior).** Live window-tree sampling (session 56) shows the main UI window
+**"Steam Big Picture Mode" (class `steamwebhelper`, depth 32) at `2404x1080+0+0 VIEWABLE`** with
+children `1280x800 VIEWABLE` — at t+15, then it is gone at t+16.
+
+So with CEF not crashing:
+- the main UI window **does reach full size (2404x1080) and map (VIEWABLE)** — the earlier "1x1
+  window" was the *pre-CEF-init* state;
+- **but** the client's own swapchain for the main window (`0x1200002`) is created **1x1 and destroyed
+  immediately** (never recreated at 2404x1080), **no frame from the main client is presented** (all 21
+  presents are the update UI), and the client exits `rc=0` ~14 s in (`ProcessNextMessage: socket
+  disconnected`).
+
+**Reframed conclusion.** The remaining blocker is **not** window sizing and **not** the GPU-process
+crash (both are resolved/benign under the NULL-create shim). It is the **client's UI swapchain/present
+path**: the client builds a 1x1 probe swapchain for its window, the window grows to 2404x1080, the
+client does not rebuild the swapchain at the real size, presents nothing, and exits. The next step is
+to trace why the client never recreates its swapchain at the (now correct) window size — i.e. whether
+it receives the `VK_ERROR_SUBOPTIMAL_KHR`/resize signal it expects, or gives up on the run of
+gamescope `vkCreateComputePipelines failed (-13)` / `Error getting buffer` seen around the same time.
