@@ -2566,3 +2566,29 @@ minimal `gbm`-consuming program.
 (`-Wl,-soname,libgbm.so.1`), pad to the real `libgbm.so.1.0.0` size (2046456 B), place it at
 `steamrtarm64/libgbm.so.1` (rpath `$ORIGIN`), with `libhybris.so`+`q.so` and `HYBRIS_LINKER_DIR` set.
 Source: `docs/development/pvr-re/hybshim/gbm/`.
+
+**§54 continued - a real shim bug fixed, and the crash located to CEF's use of the buffer.**
+Three shim fixes, each verified with a standalone reproducer
+(`gbmrepro`: `dlopen` the shim, create device on renderD128, do CEF's exact pattern - 40x
+`gbm_bo_create(2,2,fmt=0x20203852,flags)` then `get_fd`/`map`/`destroy`):
+
+1. **`gbm_bo_map` passed the wrong struct to `AHardwareBuffer_lock`.** Its 4th argument is an
+   `ARect{left,top,right,bottom}`, not a buffer desc; passing a desc made the lock fail and map
+   return NULL. CEF then dereferenced the NULL map and crashed. Fixed to pass a proper rect.
+2. **The lock usage was wrong:** the GPU bits used for *allocation* are not valid for
+   `AHardwareBuffer_lock`; it needs a CPU access flag (`CPU_READ_OFTEN|CPU_WRITE_OFTEN`).
+3. **`gbm_bo_import` was a stub returning NULL** - given a real implementation (keeps the imported fd;
+   answers get_fd/stride/format from it). `libcef.so` does reference `gbm_bo_import`.
+
+**Measured after the fixes** (standalone reproducer): `gbm_bo_map FAIL` is gone - the lock succeeds.
+**In Steam:** `Buffer handle is null` stays **0** and `gbm_bo_map FAIL` is **0**, so the shim now
+serves create + map correctly. The GPU process still crashes (`~48`), and the shim-call sequence at
+the crash is **a run of `gbm_bo_create` (36x, all 2x2 R8) and then nothing** - no `get_fd`, no `map`,
+no `destroy` in most runs (occasionally one `get_fd`+`map` right before). So CEF creates a batch of
+tiny buffers and then faults; the fault is in CEF's own use of those buffers (its `gbm_wrapper` /
+GpuMemoryBuffer bookkeeping), not in a call reaching the shim - **every `gbm_*` symbol the real
+`libgbm.so.1` exports (all 38) is present in the shim**, so it is not a missing-symbol fault.
+
+**Net for this stage:** the buffer-handle wall is fixed (128 -> 0) and the shim's create/map/import are
+correct; what remains is a crash inside CEF after it has the buffers, whose address is not capturable
+in the guest. Shim source: `docs/development/pvr-re/hybshim/gbm/gbm_ahb.c`.

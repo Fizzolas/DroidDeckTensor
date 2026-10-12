@@ -140,6 +140,7 @@ struct gbm_bo *gbm_bo_create_with_modifiers2(struct gbm_device *d, uint32_t w, u
 
 void gbm_bo_destroy(struct gbm_bo *bo) {
     if (!bo) return;
+    logline("gbm_bo_destroy %p\n", (void*)bo);
     if (bo->map && g_ahb_unlock) { int fence = -1; g_ahb_unlock(bo->ahb, &fence); }
     if (bo->fd >= 0) close(bo->fd);
     if (bo->ahb && g_ahb_rel) g_ahb_rel(bo->ahb);
@@ -153,7 +154,9 @@ int gbm_bo_get_fd(struct gbm_bo *bo) {
         if (!nh || nh[1] < 1) { logline("gbm_bo_get_fd NULL handle\n"); errno = EINVAL; return -1; }
         bo->fd = fcntl(nh[3], F_DUPFD_CLOEXEC, 0);
     }
-    return bo->fd < 0 ? -1 : fcntl(bo->fd, F_DUPFD_CLOEXEC, 0);
+    int r = bo->fd < 0 ? -1 : fcntl(bo->fd, F_DUPFD_CLOEXEC, 0);
+    logline("gbm_bo_get_fd -> %d (w=%u h=%u fmt=0x%x)\n", r, bo->w, bo->h, bo->fmt);
+    return r;
 }
 int gbm_bo_get_fd_for_plane(struct gbm_bo *bo, int plane) { (void)plane; return gbm_bo_get_fd(bo); }
 int gbm_bo_get_plane_fd(struct gbm_bo *bo, int plane) { (void)plane; return gbm_bo_get_fd(bo); }
@@ -173,14 +176,24 @@ void *gbm_bo_get_handle_for_plane(struct gbm_bo *bo, int p) { (void)p; return gb
 
 void *gbm_bo_map(struct gbm_bo *bo, uint32_t x, uint32_t y, uint32_t w, uint32_t h, uint32_t flags, uint32_t *stride, void **map_data) {
     (void)x; (void)y; (void)flags;
+    logline("gbm_bo_map %p w=%u h=%u\n", (void*)bo, bo ? bo->w : 0, bo ? bo->h : 0);
     if (!bo || !g_ahb_lock) return NULL;
-    struct ahb_desc desc = {0};
-    desc.width = w ? w : bo->w; desc.height = h ? h : bo->h;
+    /* AHardwareBuffer_lock's 4th argument is an ARect {left,top,right,bottom}, not a desc - passing a
+     * desc here made the lock fail (map returned NULL, which CEF then dereferenced). NULL locks the
+     * whole buffer, which is what a GBM map of the whole bo wants. */
+    /* Lock usage must be a CPU access flag - the GPU bits used for allocation are not valid for
+     * AHardwareBuffer_lock. The rect is {left,top,right,bottom}; use the whole buffer. */
+    int rect[4] = {0, 0, (int)bo->w, (int)bo->h};
     void *addr = NULL;
-    if (g_ahb_lock(bo->ahb, AHB_USAGE, -1, &desc, &addr) != 0) return NULL;
+    int lrc = g_ahb_lock(bo->ahb, 0x10u | 0x20u, -1, rect, &addr);
+    if (lrc != 0 || !addr) {
+        logline("gbm_bo_map FAIL: AHB lock rc=%d addr=%p\n", lrc, addr);
+        return NULL;
+    }
     bo->map = addr;
     if (stride) *stride = bo->stride;
     if (map_data) *map_data = addr;
+    logline("gbm_bo_map -> addr=%p stride=%u\n", addr, bo->stride);
     return addr;
 }
 void *gbm_bo_map2(struct gbm_bo *bo, uint32_t x, uint32_t y, uint32_t w, uint32_t h, uint32_t flags, uint32_t *stride, void **map_data, int plane) { (void)plane; return gbm_bo_map(bo, x, y, w, h, flags, stride, map_data); }
@@ -262,4 +275,32 @@ __attribute__((constructor)) static void gbma_load_marker(void) {
     char b[128]; int m = snprintf(b, sizeof(b), "gbma loaded comm=%s pid=%d\n", c, (int)getpid());
     if (m > 0) { ssize_t w = write(f, b, (size_t)m); (void)w; }
     close(f);
+}
+
+/* Crash capture: the shim is loaded by libcef.so in the GPU process, so this constructor runs there.
+ * Install a fatal-signal handler that records the crash pc/lr/si_addr to the shim log, so a crash
+ * that Chromium reports only as "GPU process exited" can be located. */
+#include <signal.h>
+#include <ucontext.h>
+static void gbma_crash(int sig, siginfo_t *si, void *ctx) {
+    ucontext_t *uc = (ucontext_t *)ctx;
+    char b[256];
+    int n = snprintf(b, sizeof(b), "CRASH sig=%d si_addr=%p pc=%p lr=%p sp=%p\n",
+                     sig, si ? si->si_addr : 0, uc ? (void *)uc->uc_mcontext.pc : 0,
+                     uc ? (void *)uc->uc_mcontext.regs[30] : 0,
+                     uc ? (void *)uc->uc_mcontext.sp : 0);
+    int f = open("/root/.local/share/Steam/logs/gbma_crash.log", O_WRONLY | O_APPEND | O_CREAT, 0600);
+    if (f >= 0) { if (n > 0) { ssize_t w = write(f, b, (size_t)n); (void)w; } close(f); }
+    _exit(139);
+}
+__attribute__((constructor)) static void gbma_crash_handler(void) {
+    struct sigaction sa;
+    memset(&sa, 0, sizeof(sa));
+    sa.sa_sigaction = gbma_crash;
+    sa.sa_flags = SA_SIGINFO | SA_NODEFER;
+    sigemptyset(&sa.sa_mask);
+    sigaction(SIGSEGV, &sa, NULL);
+    sigaction(SIGABRT, &sa, NULL);
+    sigaction(SIGBUS, &sa, NULL);
+    sigaction(SIGILL, &sa, NULL);
 }
