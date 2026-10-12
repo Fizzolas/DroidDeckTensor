@@ -2339,3 +2339,34 @@ succeed.
 **This is a genuine fix, not a diagnostic.** CEF's GPU process went from "aborts on every buffer
 allocation" to "survives all but a handful". The AHardwareBuffer-over-libhybris bridge is the answer
 to the missing GEM/GBM, and it is now demonstrated end to end.
+
+**Session 116 (robust shim with a format/usage fallback): crashes 1, `Buffer handle is null` 3**
+(down from 9). The fallback - on an AHB allocation failure, retry with plain RGBA and minimal usage -
+closes most of the last gap. The remaining single crash is a handful of allocations the fallback does
+not cover.
+
+**The 1x1 is NOT the GPU crash - it is a separate client/gamescope interaction (measured).** With the
+shim in place and the GPU process essentially healthy (1 crash), the client's GamepadUI window
+(`0x1200002`) is *still* created at 1x1 and never shown, and the client ends `rc=0`. Evidence it is
+the client's own window-sizing, not the ICD or the compositor:
+
+- The client's own display manager reads the correct size: `OnOutputMode: 2404 x 1080` and
+  `RematchCurrentMode: ...2404x1080@60` (systemdisplaymanager.txt) - it knows the output is 2404x1080.
+- Yet its X window is created `CreateBrowser ... (-2147483648, -2147483648) 0x0` and its swapchain is
+  1x1. Steam creates the window hidden/zero-sized and expects the window manager (gamescope) to
+  configure it to the output size; gamescope's `win_skip_and_not_fullscreen` excludes a 1x1 window
+  from focus (steamcompmgr.cpp), so it is never made the focus window and never sized - a
+  chicken-and-egg the client does not break on its own.
+- The client logs `Error: XRRGetOutputInfo() is not available` and
+  `CX11WindowProperty: failed to read window property: GAMESCOPE_VIEWPORT_SUPPORTED` - the two
+  client->WM size signals it uses are the ones failing.
+- `--force-windows-fullscreen` did **not** change it (tried; the swapchain stayed 1x1).
+
+So two independent problems remain, both now narrow: (1) the last ~3 null handles in the GPU process,
+and (2) the client's main window never being sized - a gamescope/client focus-and-configure
+interaction, most likely the client not being made gamescope's focus window, or its XRandR/viewport
+size query failing.
+
+**The fix that works is preserved** (`docs/development/pvr-re/hybshim/gbm/`), and it is a real
+advance: CEF's GPU process went from aborting on essentially every buffer allocation to surviving all
+but a handful, which is the difference between "no UI possible" and "UI is loading, just mis-sized".
