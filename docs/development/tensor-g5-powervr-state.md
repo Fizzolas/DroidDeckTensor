@@ -2473,3 +2473,29 @@ screen 2404x1080
 
 So the blocker is not "the UI is 1x1"; it is **"the CEF UI window is created at 1280x800 but never
 mapped/shown, so gamescope never composites it."** That is the precise remaining problem.
+
+**§52 continued - what does NOT fix the unmapped UI window (2026-10-12, sessions 20-21).** Tested
+against the live window tree:
+
+- **`-cef-use-gl=desktop` (GLX) for the main client: worse.** The main UI ("Big Picture Mode") window
+  never appears at all - only the update UI (which uses GLX) shows. So the default ANGLE/Vulkan path
+  is the right one for the main client; GLX is not the answer here.
+- **`config.vdf` display mode Windowed -> Fullscreen; gamescope `--force-windows-fullscreen`; Steam
+  `-fullscreen`; gamescope `--debug-focus`:** none changed the unmapped window.
+
+**The client's own sequence** (session 21): `Create window` (update UI 0x800002, shown) -> the main
+client creates `0x1200002`, `0x1400002`, `0xe00005`, `0x2c00002` (all via the Gamescope WSI layer) ->
+**`Shutdown`** ~40 s in -> `rc=0`. It never issues a `Show window` for any of them. So the client
+creates the main UI windows and quits without ever mapping them.
+
+**Remaining hypotheses (not yet tested):**
+1. **Deck mode / `1280x800`.** The client runs `-steamdeck -steamos3`; the unmapped UI window is
+   `1280x800` (the Steam Deck's native size) on a `2404x1080` output, and Deck mode is the one UI mode
+   where the client is meant to draw fullscreen directly. Its `Show` may be gated on something Deck
+   mode expects (gamescope control socket / SteamOS service) that is not present. The next test is a
+   session with `BL_STEAMDECK=0` (non-Deck client) to see whether a normal client window maps and shows.
+2. **A second X display.** The session runs `--xwayland-count 2`; a window created on one Xwayland can
+   never be mapped/shown by gamescope running on the other. The live tree was read on `:0`, where only
+   the update UI appeared; the main client's display may be `:1`, which the read-only tool could not
+   reach. Worth checking which display the client and gamescope are on.
+3. The `steamwebhelper` restarts (`Restart webhelper process`) tearing the window down mid-show.
