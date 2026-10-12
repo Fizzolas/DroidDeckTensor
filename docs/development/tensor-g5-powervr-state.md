@@ -2141,3 +2141,20 @@ that needs GEM**, a GPU capability this node does not have. The guest's GPU path
 proven on screen by vkcube (Vulkan) and glxgears (GL/zink, §48). Making CEF render would need a real
 GEM/GBM backend on the PowerVR node (or a Chromium build that does not use shared-image handles for
 its raster path), not another launch flag or a shim. The CEF launch surface is exhausted.
+
+**Addendum 5 to §46 - it is not the ICD or Vulkan either (session `2026-10-11-72-steam`).** Forcing
+CEF fully off Vulkan (`--use-angle=swiftshader --enable-unsafe-swiftshader
+--disable-features=Vulkan,VulkanFromANGLE,DefaultANGLEVulkan,AcceleratedVideoDecodeLinuxGL`) still
+crashes the GPU process (58x, `Buffer handle is null` 250x). Combined with addendum 4 (GBM removed,
+still crashes) and the sandbox/backend matrix, the conclusion is now forced: **CEF's GPU process
+cannot run in this guest regardless of backend, sandbox, or GBM.** It is not our ICD (SwiftShader does
+not touch it), not Vulkan, not GBM, not the sandbox. What remains is Chromium's platform buffer-handle
+path (GpuMemoryBufferManager/shared-image), which needs a Linux DRM/GEM facility this node does not
+provide, and the guest's proot environment on top of that.
+
+**This is the end of the line for the flag/shim approach.** Getting Steam's client UI up needs either
+(a) a real GEM/GBM backend on the PowerVR node (kernel-level, not ours to add), (b) a Chromium/CEF
+build that does not use platform shared-image handles for its raster path, or (c) running CEF's GPU
+process outside the environment that denies it those facilities. The guest's *GPU path* is proven
+(vkcube, glxgears, §48); Steam's *client UI* specifically needs CEF, and CEF needs facilities this
+device's driver does not expose.
