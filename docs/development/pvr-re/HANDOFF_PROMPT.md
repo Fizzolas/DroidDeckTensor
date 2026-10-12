@@ -1,0 +1,130 @@
+# HANDOFF PROMPT — DroidDeck / Tensor G5 PowerVR: get Steam's UI running
+
+Copy the block below into a fresh session (Claude Code, working dir `D:\GUH\DroidDeck`).
+
+---
+
+## PROMPT
+
+You are picking up a long-running reverse-engineering / porting effort. **Read
+`docs/development/tensor-g5-powervr-state.md` (the authoritative, sectioned record; the relevant
+sections are §40–§55) and `C:\Users\sekri\.claude\projects\D--GUH\memory\*.md` first.** Do not take
+screenshots (images blow the context); extract state as text (adb shell, logs, `/proc`). Build with
+`JAVA_HOME=~/.jdks/jdk-17.0.20+8` (JDK 25 breaks Gradle); `assembleDebug` is signed with the public
+testkey so it installs over any build; bump `versionCode` when a bundled asset changes.
+
+### The environment
+
+- **Device:** Google Pixel 10 Pro XL, `ro.board.platform=laguna`, `ro.hardware=mustang`,
+  `ro.soc.model=Tensor G5`. adb serial `57210DLCQ002KB`. Not rooted; app runs as `untrusted_app_27`.
+- **GPU:** Imagination **PowerVR D-Series DXT-48-1536 MC1** (`vendorID 0x1010`, `deviceID 0x71061212`).
+  Kernel driver `pvrsrvkm` (proprietary Google/Imagination), DRM render node `/dev/dri/renderD128`
+  and card node `card2` (both `226:128`/`226:2`, one device under `34f00000.gpu0`). The node has **no
+  GEM and no GBM** — that is the crux of everything below. `/dev/dma_heap/*` and `/dev/udmabuf`
+  exist but are **denied** to the app.
+- **App:** DroidDeck fork at `D:\GUH\DroidDeck`, branch `feature/google-tensor-support`, `versionCode
+  15`, `versionName 0.3.4` (`app/build.gradle`). It runs a **glibc ARM64 Linux rootfs under `proot`**
+  and shows it in an Android SurfaceView. Single Gradle module; `CLAUDE.md` has the build/architecture.
+- **Guest graphics stack (all inside the proot guest):**
+  - **Our glibc Vulkan ICD** (`docs/development/pvr-re/hybshim/icd/pvr_icd.c` → `libvulkan_powervr.so`)
+    that loads the **bionic PowerVR HAL** `/vendor/lib64/hw/vulkan.powervr.so` through **libhybris**
+    (`android_dlopen_ext`). This is the only way glibc code reaches the GPU. Proven working for compute,
+    raster and dma-buf export.
+  - **Our WSI** (`hybshim/icd/pvr_wsi.c`): swapchain images are exportable dma-bufs, presented over
+    **Wayland** (`wl_buffer`) or **X11/DRI3** (`xcb_dri3_pixmap_from_buffers`).
+  - **gamescope 3.16.29** (patched; `tools/gamescope/`), nested on the app's Wayland compositor
+    (`--backend wayland --expose-wayland -f -W 2404 -H 1080 -w 2404 -h 1080 -e --xwayland-count 2
+    --default-touch-mode 4`). It starts 2 Xwaylands (`:0`, `:1` on sockets at
+    `<files>/linuxfs/tmp/.X11-unix/X0`,`X1`). gamescope's `steamcompmgr.cpp` skips a 1×1 window
+    (`win_skip_and_not_fullscreen`) and only sizes a window to the output when it is fullscreen
+    (`window_is_fullscreen || force_windows_fullscreen`). It **does** honor `_NET_WM_STATE_FULLSCREEN`
+    (via `handle_client_message`/`handle_net_wm_state`).
+  - **Steam client** (Valve's ARM64 `steamrtarm64`), launched by `droiddeck-session` with
+    `-gamepadui -steamdeck -steamos3 -no-cef-sandbox -cef-force-gpu -cef-ozone-platform=x11
+    -cef-use-gl=angle -cef-use-angle=vulkan`. The UI is **CEF** (Chromium 126, `libcef.so`, 208 MB).
+- **Session helper switches** (in `tools/linuxfs/overlay/usr/local/bin/droiddeck-session`, set via
+  `Download/droiddeck-env`, read with a ~1-session lag — always confirm the switch line in the new
+  `session.log`): `BL_*` for the session, plus I added `BL_CEF_USE_GL/BL_CEF_ANGLE/BL_CEF_OZONE/
+  BL_CEF_DISABLE_GPU/BL_CEF_EXTRA/BL_CEF_VULKAN_ICD/BL_CEF_LIBDIR/BL_UI_PROBE/BL_GAMESCOPE_ARGS`.
+  Start a session from adb with
+  `tools/droiddeckctl start steam` (or `run /usr/bin/<prog>`; the `SessionActivity` is not exported,
+  the trampoline is `.agent.AgentStartActivity --es request <base64 {"mode":"steam"}>`).
+  `HYBRIS_LINKER_DIR=<files>/linux_vulkan_drivers/powervr-g5x` is needed wherever libhybris is used.
+
+### What WORKS (measured)
+
+- **A guest Vulkan app renders on screen.** `tools/droiddeckctl run /usr/bin/vkcube`: selects
+  `PowerVR D-Series DXT-48-1536 MC1`, renders, presents 20× `2404x1080` dma-bufs through our WSI;
+  the app's compositor logs `last 10 s: 13 frames on screen | 14 GPU frames from games`. Full chain
+  works: **app → glibc loader → our ICD → libhybris → bionic HAL → GPU → dma-buf → gamescope →
+  DroidDeck compositor → screen.**
+- **GL too:** `glxgears` renders via **mesa zink → our ICD** at `~205 FPS`.
+- **Steam's UPDATE UI renders** (GLX path, `0x800002`, 2404×1080, ~21 presents).
+- **The Steam client reaches its login screen** (`steamui_login.txt`: `SetLoginState:
+  WaitingForCredentials`).
+
+### What is BLOCKED (latest data, §45–§55)
+
+**Blocker A — CEF's GPU process crashes on every buffer allocation (the graphics wall).**
+CEF's GPU process dies ~48×/session. It allocates its buffers through **GBM**. The PowerVR node has no
+GBM/GEM, so `libgbm.so.1`'s `gbm_bo_get_fd` fails → `Buffer handle is null`
+(`shared_image_interface_proxy.cc`) → `Creation of StagingBuffer's SharedImage failed` →
+`gpu_process_host.cc: GPU process exited unexpectedly` (exit_code 11=SIGSEGV, 6=SIGABRT).
+
+- **The GBM consumer is `libcef.so`** (its `DT_NEEDED` is `libgbm.so.1`; it also references
+  `gbm_create_device`, `gbm_bo_import`). NOT `steamwebhelper`, and NOT `libminigbm.so`. So a shim
+  must be `libgbm.so.1` in the client's `$ORIGIN` (`steamrtarm64/`), padded to the real
+  `libgbm.so.1.0.0` size (2046456 B — Steam verifies file size).
+- **A working shim exists** (`docs/development/pvr-re/hybshim/gbm/gbm_ahb.c`): a `libgbm.so.1` whose
+  GBM API is answered by **real gralloc buffers via libhybris** (`AHardwareBuffer_allocate` →
+  real dma-buf). Installed correctly it **loads and is called**, and `Buffer handle is null` goes
+  **128 → 0**. Fixed within it: `gbm_bo_map` must pass an `ARect` (not a desc) to
+  `AHardwareBuffer_lock` and use CPU usage bits; `gbm_bo_import` must be implemented (not a NULL stub).
+- **The remaining crash:** with the shim in place the GPU process still dies — after a run of
+  `gbm_bo_create` (36×, all 2×2, format `0x20203852`="R8") and then **no further `gbm_*` call**. All 38
+  `gbm_*` symbols the real libgbm exports are present, so it is not a missing symbol; the fault is in
+  **CEF's own use of the buffers**. **Decisive experiment:** make `gbm_create_device` return NULL
+  (CEF sees GBM unavailable) → **crash 48 → 1**: CEF has a working non-GBM fallback and runs almost
+  cleanly without GBM. No in-guest handler (rig `crashcatch`, a shim constructor handler, Chromium's
+  own); produces an address — the process is killed by its parent, not crashing in place; breakpad is
+  off (`--disable-breakpad`).
+
+**Blocker B — the main client UI never shows (INDEPENDENT of Blocker A).**
+The client's main UI window is created (via the **gamescope WSI layer**, i.e. Vulkan) as xid
+`0x1200002` with a **1×1 swapchain**, and is never mapped/shown; the client then exits `rc=0` (~30 s).
+The **update UI uses GLX and DOES show** at 2404×1080. So it is specifically the client's
+**Vulkan/WSI surface sizing**. gamescope won't size a 1×1 window (see above). Tried and NOT the fix:
+`config.vdf` display mode Windowed→Fullscreen; gamescope `--force-windows-fullscreen`; Steam
+`-fullscreen`; `-cef-use-gl=desktop` (GLX — worse, the window never appears); `BL_XWAYLAND_COUNT=1`;
+`BL_STEAMDECK=0`; the env `vk_wsi_force_swapchain_to_current_extent=true` (the gamescope-WSI-layer
+flag that forces the swapchain to the current extent — did not change it). `XRRGetOutputInfo() is not
+available` is a red herring (the symbol exists in every loadable libXrandr; non-fatal).
+
+Key read-only facts: `xrandr` inside the session reports `current 2404 x 1080`; the client's own
+display manager logs `OnOutputMode: 2404x1080`; the live X tree shows the client's windows all
+`unmapped` and gamescope `== focused app: none`.
+
+### Variables that matter
+`HYBRIS_LINKER_DIR`, `LD_PRELOAD`, `MESA_LOADER_DRIVER_OVERRIDE=zink`/`GALLIUM_DRIVER=zink` (Steam's
+client renders via zink for GL), `VK_ICD_FILENAMES`/`BL_VK_DRIVER` (our ICD),
+`vk_wsi_force_swapchain_to_current_extent`, `GAMESCOPE_*` (hosted runtime + patched gamescope),
+Steam's own `-cef-*`/`-steamdeck`/`-steamos3`/`-gamepadui`, and the `BL_CEF_*` switches.
+
+### What a COMPLETE project looks like
+1. **CEF's GPU process runs** (Blocker A). Either (a) make the AHB-backed `libgbm.so.1` shim good
+   enough for CEF to use (fix CEF's use-of-buffer crash — needs the crash address, e.g. a real
+   debugger in the guest, or a Chromium build without the GBM path), or (b) ship the
+   `gbm_create_device`→NULL variant so CEF uses its non-GBM fallback (crash 48→1, proven) and make
+   *that* path fully work. Option (b) is the pragmatic one to pursue first.
+2. **The main UI window shows** (Blocker B): make the client's Vulkan/WSI surface report/obtain the
+   real 2404×1080 (gamescope focus+configure, or `ForceSwapchainExtent`, or get the client onto the
+   GLX path that already renders).
+3. **Package everything** into the runtime asset: the ICD (`hybshim/icd/`) + `libhybris.so` + `q.so`
+   (already packaged) + the `libgbm.so.1` shim + its libhybris, wired through
+   `LinuxVulkanDriverManager`/`SessionFiles`/`BwrapSpawner`, with `versionCode` bumped.
+4. **End to end:** Steam Big Picture renders, user signs in, launches a game, a frame is on screen.
+   (A game/app rendering through the ICD already works — vkcube/glxgears — so once the client's own
+   UI tools are satisfied, the game path is the proven part.)
+
+`docs/development/tensor-g5-powervr-state.md` §40–§55 is the fine-grained record of every measurement
+above; `docs/development/pvr-re/hybshim/gbm/README.md` documents the shim's build/install recipe.
