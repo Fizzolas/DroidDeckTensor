@@ -2158,3 +2158,27 @@ build that does not use platform shared-image handles for its raster path, or (c
 process outside the environment that denies it those facilities. The guest's *GPU path* is proven
 (vkcube, glxgears, §48); Steam's *client UI* specifically needs CEF, and CEF needs facilities this
 device's driver does not expose.
+
+**Addendum 6 to §46 - the definitive negative (2026-10-11, sessions 74-80).** After the card-node
+fix (§47), the remaining CEF levers were tried and every one failed to change the crash:
+
+- **PRIME ioctls** - CEF issues `DRM_IOCTL_PRIME_FD_TO_HANDLE` (247/session) and
+  `PRIME_HANDLE_TO_FD` (240) as **raw ioctls** on the render node; the GEM stand-in covered only the
+  libdrm wrappers. `bl_drm_prime_ioctl` now covers both (measured: 258 calls, all `rc=0` with a valid
+  handle) - and the GPU process **still** aborts on the same lines. So "Buffer handle is null" does
+  not come from that ioctl.
+- **Shared-memory backing** (`--disable-gpu-memory-buffer-video-frames
+  --disable-gpu-memory-buffer-compositor-resources`) - still crashed (62x, 341 null).
+- Earlier: GBM removed (still crashed), Vulkan off / SwiftShader (still crashed), sandbox off (still
+  crashed), 20+ launch configs (all identical).
+
+**Conclusion, measured to exhaustion:** CEF's GPU process cannot run in this guest. It is not our ICD
+(SwiftShader does not touch it), not Vulkan, not GBM, not the PRIME ioctls, not the sandbox, not any
+launch flag. What remains is a Chromium-internal path (its GpuMemoryBuffer/shared-image bookkeeping)
+that produces a null handle for reasons not reachable from the driver side or the launch. Getting
+Steam's client UI up needs a different Chromium/CEF build or a different environment for its GPU
+process - not a change this app or its shims can make.
+
+**The GPU path itself is proven and unaffected:** vkcube (Vulkan) and glxgears (GL/zink) both render
+on the PowerVR GPU and present frames on screen (§48), verified again after every one of these
+changes. Games and apps that render through the ICD get frames; only Steam's CEF-based UI does not.
