@@ -2429,3 +2429,47 @@ screen, creates its UI window - and that window is 1x1, never focused/sized by g
 client exits rc=0.** The remaining work is getting gamescope to size (or the client to request a
 fullscreen) window for the Steam client UI. This is a gamescope/client window-management problem,
 separate from the GPU work that is now solved.
+
+## 52. Live window tree: the real Steam UI is a CEF window that is never mapped (2026-10-12)
+
+Read-only window dump taken *while the client ran* (the guest has no `xwininfo`, so a small read-only
+X query tool - XQueryTree/XGetWindowAttributes/XGetWindowProperty, no writes - was run in a second
+proot against the live Xwayland socket). Two runs, consistent:
+
+```
+screen 2404x1080
+0x310         2404x1080+0+0     VIEWABLE                              <- gamescope's output/root window
+  0x200001    1x1+0+0           unmapped       pid=?                  <- internal (gamescope/Xwayland)
+  0x800002    2404x1080+0+0     VIEWABLE       (Steam update UI)      <- the update UI; shows + presents
+  0xa0002d    1x1+-10+-10       unmapped       (InputOnly, depth 0)
+  0x1000001   10x10+10+10       unmapped       pid=18937 name='steam' class='steam'
+    0x1000002 1x1+-1+-1         UNVIEWABLE
+  0xe00005    64x24+0+0         unmapped       class='Steam'
+  0x1400001   10x10+-100+-100   unmapped       (InputOnly)
+  0x1600001   10x10+10+10       unmapped       pid=19151 name='steamwebhelper'    <- CEF process
+  0x1600003   200x200+0+0       unmapped       pid=19151 name='steamwebhelper'
+    0x1600004 1x1+-1+-1         UNVIEWABLE
+  0x1c0002d   1x1+-10+-10       unmapped       (InputOnly)
+  0x1c00033   1280x800+0+0      unmapped       pid=19151 name='Steam Big Picture Mode' class='steamwebhelper'
+    0x1400005 1280x800+0+0      UNVIEWABLE     pid=19151
+      0x1400006 1280x800+0+0    UNVIEWABLE     pid=19151
+```
+
+**Answers to the questions asked:**
+
+- **How many windows:** the root (`0x310`, 2404x1080) plus 10-12 children. Of the client's own: the
+  update UI (`0x800002`, 2404x1080, **VIEWABLE**), the Steam client process's helper window
+  (`0x1000001`, 10x10, `steam`, unmapped), a 64x24 `Steam` window (`0xe00005`, unmapped), and several
+  `steamwebhelper` (CEF) windows.
+- **The real Steam UI is `0x1c00033`, titled "Steam Big Picture Mode", class `steamwebhelper`,
+  owner `_NET_WM_PID` = the steamwebhelper process (19151), sized 1280x800 - and it is `unmapped`
+  (never shown).** This is the CEF browser window the UI would draw into.
+- **The 1x1 windows are NOT the real UI.** They are helper/placeholder windows (the Steam client's own
+  10x10 helper, CEF's 10x10/200x200 helpers, and Xwayland's 1x1 InputOnly internals). The main UI
+  window is 1280x800, not 1x1.
+- **Yes - the CEF browser window exists as a separate window and is not shown.** `0x1c00033` exists
+  with the right title, size and owner, but its map state is `unmapped`, so gamescope never focuses it
+  and nothing it draws reaches the screen. The client then exits `rc=0`.
+
+So the blocker is not "the UI is 1x1"; it is **"the CEF UI window is created at 1280x800 but never
+mapped/shown, so gamescope never composites it."** That is the precise remaining problem.
