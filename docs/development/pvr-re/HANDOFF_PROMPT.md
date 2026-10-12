@@ -63,6 +63,30 @@ testkey so it installs over any build; bump `versionCode` when a bundled asset c
 - **The Steam client reaches its login screen** (`steamui_login.txt`: `SetLoginState:
   WaitingForCredentials`).
 
+### UPDATE 2026-10-12 (Phase 1-3) — read this before §45-55 below
+
+The NULL-create shim (`libgbm.so.1` at `steamrtarm64/`, padded to 2046456 B) makes CEF's GPU process
+**not crash** (0-1/session vs ~48 with stock libgbm): the shim loads in all 8 steamwebhelper procs,
+`gbm_create_device -> NULL` is reached, `gbm_bo_create` is never called, CEF uses its non-GBM
+fallback. **Blocker A is effectively resolved by that shim.**
+
+**Blocker B is reframed — it is NOT window sizing.** With CEF not crashing, the main UI window
+**"Steam Big Picture Mode" (class steamwebhelper, depth 32) reaches `2404x1080 VIEWABLE`** with
+1280x800 children (live tree, session 56). **But the client's swapchain for its window
+(`xid 0x1200002`) is created `1x1` (requested=1x1, via the gamescope WSI layer) and destroyed
+immediately; it is never rebuilt at 2404x1080; no frame from the main client is presented (all 21
+presents are the update UI); the client exits `rc=0` ~14 s in (`ProcessNextMessage: socket
+disconnected`).** Our WSI correctly reports `currentExtent=2404x1080` for that surface; the gamescope
+WSI layer sets the swapchain extent from the X *window rect* at creation (~1x1) via
+`xcb::getWindowRect` (frog_wsi.cpp). `--force-windows-fullscreen` did not change the 1x1 this time.
+The gamescope WSI layer only emits `VK_ERROR_OUT_OF_DATE_KHR` on window resize **at present time**,
+which the client never reaches.
+
+**So the next target is the client's UI swapchain/present path**: why the client builds a 1x1 probe
+swapchain, never rebuilds it after the window grows to 2404x1080, presents nothing, and exits (look at
+the run of `vkCreateComputePipelines failed (-13)` and `Error getting buffer` at the same time). Full
+record: state doc §56. Rollback baseline: `docs/development/pvr-re/ROLLBACK_BASELINE.md`.
+
 ### What is BLOCKED (latest data, §45–§55)
 
 **Blocker A — CEF's GPU process crashes on every buffer allocation (the graphics wall).**
