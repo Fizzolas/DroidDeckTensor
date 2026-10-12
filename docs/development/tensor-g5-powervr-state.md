@@ -2404,3 +2404,28 @@ to fullscreen (or removing the seeded entry so Steam defaults) is the next thing
 
 **Note.** `XRRGetOutputInfo() is not available` is a red herring: every libXrandr the client can load
 does export the symbol, and the client's workaround is non-fatal (gamescope prints it and survives).
+
+**§51 continued - what the client's main window is, and its exit (sessions 06-10).** The client's
+main graphical surface is the window `0x1200002` (`type:12` browser, the canvas the UI draws on). With
+the AHB GBM shim in place it is:
+
+```
+_NET_WM_WINDOW_TYPE(ATOM) = _NET_WM_WINDOW_TYPE_NORMAL
+window state: Normal
+Client accepts input or input focus: True
+```
+
+and its swapchain is created **1x1** (`pvr_wsi: swapchain: 3 images 1x1`). gamescope, whose
+`steamcompmgr.cpp` skips a 1x1 window (`win_skip_and_not_fullscreen`, "If the window is 1x1 then
+prefer anything else"), never makes it the focus window - the session logs `== focused app: none` -
+so it is never sized to the output. The client then exits `rc=0` (~30 s in); it never presents a frame
+to the main window.
+
+Explicitly tried and **not** the fix: `config.vdf` display mode `Windowed` -> `Fullscreen`;
+gamescope `--force-windows-fullscreen`; gamescope `--debug-focus`. None changed the 1x1.
+
+**So the goal is one layer from done: the GPU path is fixed (shim), the client reaches its login
+screen, creates its UI window - and that window is 1x1, never focused/sized by gamescope, and the
+client exits rc=0.** The remaining work is getting gamescope to size (or the client to request a
+fullscreen) window for the Steam client UI. This is a gamescope/client window-management problem,
+separate from the GPU work that is now solved.

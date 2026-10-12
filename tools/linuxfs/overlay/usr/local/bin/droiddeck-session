@@ -896,16 +896,14 @@ BUSCONF
       "$steam_root/steamrtarm64/steam" "${_bl_ui[@]}" "${_bl_cdp[@]}" "${_bl_lang[@]}" -clientbeta "$steam_channel" \
         -no-cef-sandbox "${_bl_cef[@]}" "$@" &
       _bl_steam_pid=$!
+      # Diagnostic only (BL_UI_PROBE=1): sample the client's X windows while it runs, to see what
+      # size gamescope gives them and whether they are ever mapped. off by default.
       if [ "${BL_UI_PROBE:-0}" = 1 ]; then
-        ( nap 75; echo "== ui-probe: xrandr =="; xrandr 2>&1 | head -4; \
-          echo "== ui-probe: root props =="; xprop -root 2>&1 | grep -iE "GAMESCOPE|_NET_|STEAM_" | head -25; \
-          echo "== ui-probe: client list =="; xprop -root _NET_CLIENT_LIST 2>&1 | head -3; \
-          echo "== ui-probe: geometry of client windows =="; \
-          for w in 0x800002 0x1200002 0x1400002 0x1c00033 0x2c00002; do \
-            echo "-- window $w --"; xwininfo -id "$w" 2>&1 | grep -iE "Map State|Width|Height|Absolute|IsViewable"; \
-            xprop -id "$w" 2>&1 | head -20; done; \
-          echo "== ui-probe: viewport prop =="; xprop -root GAMESCOPE_VIEWPORT_SUPPORTED 2>&1 | head -2; \
-          echo "== ui-probe: active window =="; xprop -root _NET_ACTIVE_WINDOW 2>&1 | head -2 ) >> "$BL_LOG" 2>&1
+        ( for _round in 1 2 3 4 5 6; do nap 10; \
+            echo "== ui-probe round $_round =="; \
+            for w in 0x800002 0x1200002 0x1400002 0x1c0002f 0x1c00033 0x2c00002; do \
+              echo "-- $w --"; xprop -id "$w" 2>&1 | grep -iE "WM_NAME|_NET_WM_NAME|NORMAL_HINTS|WM_STATE|_NET_WM_STATE|geometry" | head -6; done; \
+            xrandr 2>&1 | head -2; done ) >> "$BL_LOG" 2>&1 &
       fi
       wait "$_bl_steam_pid"
       rc=$?
