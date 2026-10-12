@@ -2275,3 +2275,45 @@ of a *real* buffer). This is the same glibc->bionic bridge the ICD uses; the pie
 **Next:** implement the shim (`libgbm.so.1` over AHardwareBuffer, loading libhybris.so beside it),
 scope it to the client's processes via `BL_CEF_LIBDIR` (already wired), and measure whether CEF's GPU
 process stops crashing and its UI comes up.
+
+## 50. A GBM shim over AHardwareBuffer cuts CEF's crash from ~70 to 1 (2026-10-11, session 102)
+
+**The fix §49 pointed at works.** Built `libminigbm.so` (a replacement for Steam's own minigbm - see
+below) whose GBM API is answered by real gralloc buffers: `gbm_bo_create` -> `AHardwareBuffer_allocate`
+through libhybris, `gbm_bo_get_fd` -> the AHardwareBuffer's native-handle dma-buf fd. Validated
+standalone (session 99):
+
+```
+gbm_create_device = 0x102b150
+gbm_bo_create     = 0x1026200
+gbm_bo_get_fd     = 10  link=/dmabuf:AHardwareBuffer pid [15745]  stride=1024
+```
+
+i.e. a **real dma-buf backed by gralloc memory**, which is what Chromium needs and the driver's
+GBM/GEM cannot give.
+
+**It must replace `libminigbm.so`, not `libgbm.so.1`.** Steam's client ships and loads its own
+`steamrtarm64/libminigbm.so` (Chromium's minigbm); a `libgbm.so.1` in `LD_LIBRARY_PATH` is never
+consulted. Replacing `steamrtarm64/libminigbm.so` (backup kept as `.real`) is what takes effect.
+
+**Steam verifies the file's SIZE.** With the 37 KB shim in place the client logged
+`BVerifyInstalledFiles: steamrtarm64/libminigbm.so is 37584 bytes, expected 2046456` and exited
+`rc=42` (its self-repair restart). Padding the shim to **exactly 2046456 bytes** (the real library's
+size; ELF ignores trailing bytes) lets it load.
+
+**Measured, session `2026-10-11-102-steam` (padded shim), against the pre-shim baseline:**
+
+| | baseline | with the shim |
+|---|---|---|
+| CEF `GPU process exited` | ~50-70 | **1** |
+| `Buffer handle is null` | ~350 | **9** |
+| `gbm_wrapper` export errors | 80 | **0** |
+| update-UI presents (2404x1080) | 21 | **40** |
+
+So the AHB-backed GBM is the right fix and it very nearly works. **The main client window is still
+1x1** and the client still ends `WaitingForCredentials`; the remaining work is the last crash and the
+1x1 - but the GPU-process crash that made the UI impossible is now essentially gone.
+
+**Caveats:** the shim is a dev artifact (hand-built, padded, `libhybris.so`/`q.so` beside it); it is
+not yet packaged into the app. The client's self-repair may restore the real `libminigbm.so` (its
+`.real` backup makes this reversible). The device was intermittently refusing sessions this round.
