@@ -2721,3 +2721,70 @@ Rollback of the two instrumentation changes: they are additive logging (`pvr_wsi
 `pvr_wsi.c`, probe rounds gated on `BL_UI_PROBE=1` in `droiddeck-session`); `git revert` both or
 rebuild the ICD from the previous commit. Guest is restored stock (ICD `68f90ad8`, no shim, env
 cleared, all probe binaries removed).
+
+## 58. Matched-control experiments (2026-10-13): nulldev vs stub-device; and §57's residual-null claim corrected
+
+Built one probe shim (`hybshim/gbm/gbm_probe.c`, exports a superset of stock libgbm's 38 `gbm_*`
+symbols, verified with llvm-nm; mode selected at load by env `GBM_SHIM_MODE=nulldev|stub` so both
+runs use the **byte-identical artifact** `73bde3bc...` padded to 2046456, same instrumented ICD
+`b1728201...`, same gated `BL_UI_PROBE` script `f64e72f3...` - matched control, one variable).
+Shim log = epoch-ms + pid.tid + comm/role + caller module+file-offset (dladdr) + args + return +
+errno, at `/root/.local/share/Steam/logs/gbma.log` (O_CLOEXEC; caller fds only readlink'd, never
+closed). Device/observer hashes recorded; rollback = delete the file (stock libgbm is in /usr/lib).
+
+**Experiment 1 - nulldev (session 13-06).** Exactly 12 shim lines: 8 LOADs (roles: browser x2 gens
+18411/18724, zygote x4, utility x2), and **2 `gbm_create_device(fd=39 '/dev/dri/renderD128') -> NULL
+errno=ENODEV`** - both from caller `libcef.so+0x2df97f0`, from pids 18545/18761 that have **no LOAD
+line and `--type=zygote` inherited cmdline** => GPU processes forked from the zygote (constructor ran
+in parent; role string inherited). One per browser generation, ~10 s apart = Chromium GPU init, twice.
+**No other GBM entry point is ever reached** (0 bo_create/import/destroy/query lines). Window tree:
+Big-Picture window `0x1c00033` **VIEWABLE 2404x1080 depth-32 pid=18411** by probe round 6; **0
+Wayland presents on it**; presents total 21, all update-UI; `rc=0`.
+
+**Attribution correction to §57.** Steam **appends** `cef_log.txt` across browser/webhelper
+relaunches, and `collect_steam_logs` copies that whole file. Session 13-06's copy began with
+`[32372:...122317...]` - the *previous* run's lines; its 17 `Buffer handle is null` + 1 `GPU process
+exited` belong to pid 32372 (12:23 session), **not** to 13-06's pids: grepping cef_log for 13-06's
+own pids (18411/18545/18607/18724/18734/18733/18761/18790) yields **zero null-handle and zero
+GPU-exit lines**. So "nulldev keeps ~17 residual nulls + restart loop" was log contamination. Under
+clean attribution, the nulldev GPU process is **silent: no GBM traffic beyond the two create
+attempts, no shared-image errors, no exits** - and **still** no login frame is ever presented.
+§57's "residual CEF shared-image loop blocks the first frame" is therefore **not supported**; the
+stock/AHB crash counts there (~48) were likewise pre-append-discovery grep counts and are upper
+bounds, though the AHB shim's crash coupling is independently corroborated by its own shim logs.
+
+**Experiment 2 - valid stub device, honest failure of every allocation (session 13-07, cef_log
+truncated first: fresh).** GPU gen1 (pid 21109, zygote fork, 4.3 s after browser 21011):
+`gbm_create_device -> dev=0x30010184a0` **accepted**, then an immediate probe sweep from
+`libcef.so+0x2dfa0d8`: **16 `gbm_bo_create` of 2x2 buffers** across fourcc `R8  `, `GR88`, `AB24`,
+`XB24`, `AR24`, `XR24`, `AR30`, `RG16`, `NV12`, `NV21`, `P010`, flags `0x0` then `0x5` (LINEAR /
+LINEAR|RENDERING) - all answered `NULL errno=ENOSYS`; then a `gbm_device_is_format_supported`
+sweep (caller `libcef.so+0x2dfa904`, usage=0x1, same fourcc list) all `-> 0`. GPU gen1 exits
+**`exit_code=11` (SIGSEGV) at 14:58:36**, ~4 s after create_device; gen2 (21419) resumes the
+is_format_supported sweep at 14:58:42. **`gbm_bo_import` and all surface entry points: never
+reached.** Interpretation branch hit: stub device -> probe fails -> Chromium **segfaults instead of
+gracefully rejecting GBM** (Chromium's own init bug on this path, or it consumes a return my shim
+does not provide). Client outcome unchanged: Big Picture never presents, `rc=0`.
+
+**What the matrix now says (per-pid-clean only):**
+- nulldev: GPU silent, window sized+mapped, **still zero UI frames** - so no GBM/shared-image
+  failure is on the critical path anymore; the first frame is blocked **downstream of graphics
+  init entirely**.
+- stub device: Chromium's GBM-format probe (2x2 = `GbmWrapper::Initialize`-style probing) needs at
+  least **one** supported alloc to proceed, and dies on SIGSEGV when all fail.
+- AHB (all 2x2 probe succeeds -> then crashes ~48x/upper-bound count): Chromium advances past probe
+  and then faults consuming buffers.
+The 2x2 probe buffers are **compatibility tests, not UI buffers**; the UI's real GpuMemoryBuffers come
+later (never reached in these runs). Producer of any null handle = browser-side
+`GpuMemoryBufferManager` (gbm_wrapper.cc, the only GBM user); consumer = GPU process
+`shared_image_interface_proxy.cc:130`. **Connection of any GBM/shared-image failure to the missing
+login frame: not proven - and the nulldev result argues against it.**
+
+**Next one-variable step (evidence points here now, not at graphics):** with a healthy, silent GPU
+process and a mapped 2404x1080 window, why does the client present nothing? Two candidates, one
+cheap each: (a) webhelper browser gen1->gen2 restart (~10 s) has **no logged reason** - the restart
+itself may be the blocker (login window recreated per generation, swapchain probe abandoned each
+time): read the LIVE per-run `webhelper.txt`/`cef_log` browser-exit lines, and CDP (`-devtools-port`,
+open by default in these sessions, reachable in-guest via proot curl to 127.0.0.1:<port>/json) to
+see whether the login page loaded/painted; (b) CEF's own window->compositor path (the 64x24 overlay
+presenting fine shows our WSI works). Do not touch WSI sizing, do not package.

@@ -899,12 +899,12 @@ BUSCONF
       # Diagnostic only (BL_UI_PROBE=1): sample the client's X windows while it runs, to see what
       # size gamescope gives them and whether they are ever mapped. off by default.
       if [ "${BL_UI_PROBE:-0}" = 1 ]; then
-        # xresize (BL_CEF_EXTRA contains "xresize") runs the causal resize test once at round 7:
-        # it finds the client's small hidden top-level and requests a real 2404x1080 resize+map.
+        # Pure observation (no X writes) unless BL_XRESIZE=1, which adds the external map+resize
+        # intervention at rounds 3/5/7/9. Keep it off for matched-control experiments.
         ( for _round in $(seq 1 12); do nap 4; \
             echo "== ui-probe round $_round DISPLAY=$DISPLAY =="; \
             /tmp/xinspect 2>&1 | grep -avE "^proot" | head -40; \
-            if [ "$_round" = 3 ] || [ "$_round" = 5 ] || [ "$_round" = 7 ] || [ "$_round" = 9 ]; then echo "== xresize CAUSAL TEST round $_round =="; /tmp/xresize 2>&1 | head -20; fi; \
+            if [ "${BL_XRESIZE:-0}" = 1 ] && { [ "$_round" = 3 ] || [ "$_round" = 5 ] || [ "$_round" = 7 ] || [ "$_round" = 9 ]; }; then echo "== xresize CAUSAL TEST round $_round =="; /tmp/xresize 2>&1 | head -20; fi; \
           done ) >> "$BL_LOG" 2>&1 &
       fi
       wait "$_bl_steam_pid"
