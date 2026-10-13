@@ -63,6 +63,40 @@ testkey so it installs over any build; bump `versionCode` when a bundled asset c
 - **The Steam client reaches its login screen** (`steamui_login.txt`: `SetLoginState:
   WaitingForCredentials`).
 
+### UPDATE 2026-10-13b (matched-control experiments, §58) — read this FIRST
+
+Two runs, ONE byte-identical probe shim (`hybshim/gbm/gbm_probe.c`, mode via `GBM_SHIM_MODE` env),
+same instrumented ICD (`b1728201`), same script (`f64e72f3`), logs at `Steam/logs/gbma.log`:
+
+- **nulldev** (session 13-06): 2 `gbm_create_device(/dev/dri/renderD128)->NULL` (caller
+  `libcef.so+0x2df97f0`, GPU processes = zygote forks with no LOAD line), then **complete GBM
+  silence: 0 null handles, 0 GPU exits, 0 webhelper-restart reasons**. The Big-Picture window is
+  created at 2404x1080 depth-32 and **VIEWABLE** — and **still zero login frames are ever
+  presented**.
+- **stub device** (13-07): device accepted; Chromium's GPU-init probe (16x 2x2 `gbm_bo_create`
+  across R8/GR88/AB24/XB24/AR24/XR24/AR30/RG16/NV12/NV21/P010, callers `0x2dfa0d8`+`0x2dfa904`,
+  LINEAR|RENDERING flag sets) all honestly `ENOSYS` -> **GPU process SIGSEGVs ~4 s in** (Chromium's
+  init bug on all-probes-fail; `gbm_bo_import` never reached; client outcome unchanged).
+
+**CRITICAL METHOD FACT: Steam APPENDS `cef_log.txt` across relaunches** — every earlier
+null/crash count must be **filtered by the session's own PIDs** (the copied `steam/cef_log.txt`
+starts with the previous run). This **retracts §57's "17 residual nulls + restart loop under
+NULL-create"** (they were a 12:23 session's pid-32372 lines) and downgrades stock/AHB crash counts
+to upper bounds. **The GPU/GBM/shared-image story is therefore NOT what blocks the login frame
+anymore:** with GBM fully silent (nulldev), the window is mapped and sized, and still nothing
+presents. The failure moved **downstream of graphics**: candidates, both cheap and single-variable —
+(a) the **browser-generation restart** every ~10 s (gen1 18411 -> gen2 18724; no logged reason;
+check the LIVE `webhelper.txt` for the browser's own exit line, or query CDP: these sessions run
+`-cef-enable-debugging -devtools-port <p>`; the page may simply never paint because a login-UI JS/IPC
+step fails); (b) CEF window->compositor (unlikely: the 64x24 overlay window from the same pipeline
+presents fine through our WSI).
+
+**Do not re-litigate GBM/shim variants — the matrix is closed** (stock: crash-heavy; AHB: probes
+pass, consume-crash; nulldev: silent-but-no-frame; stub: probe-fail-crash). The one real driver-side
+gap left visible in logs is our X11/DRI3 BadAlloc (`xcb_dri3_pixmap_from_buffers` on 32x32 utility
+windows -> Xwayland `present: Error getting buffer`) — cosmetic for THIS objective (login window is
+Wayland-path), tracked in §40-41.
+
 ### UPDATE 2026-10-13 (per-PID attribution, §57) — read this before everything below
 
 With per-PID WSI logging (`pvr_wsi[pid]` in `pvr_wsi.c`, `BL_UI_PROBE=1` in the session script) on the
