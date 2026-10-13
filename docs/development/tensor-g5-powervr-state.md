@@ -2967,3 +2967,53 @@ first-activation, does the second visibility readback (V7B BP) flip hidden->visi
 present. Rollback = delete `steamrtarm64/libgbm.so.1` (stock libgbm is at /usr/lib). Device restored
 to stock after sessions 21-23 and re-verified on-device: ICD `68f90ad8...`, libgbm `e28a74e1...`,
 no shim/env/observers, IDLE (sha256-checked same-day).
+
+## 62. STEP 6 causal intervention (sessions 24-25, AHB shim): FAILED, rolled back; and a fourth observer defect found (v7.3)
+
+One reversible intervention was permitted after observation; chosen branch-appropriate candidate from
+§61: the AHB-backed `gbm_ahb.c` shim (`a75d1af0…` padded 2046456, + `libhybris.so` `058bdaed…` /
+`q.so` `ba9b7904…` beside it and in `/tmp`, `HYBRIS_LINKER_DIR` via env, stock ICD, `cef_log`+
+`gbma.log` truncated fresh) — it hands Chromium real gralloc dma-bufs and previously cut crashes
+~70→1 (§49-50). Prediction from §60's framing: BP gen survives first raster; then either flips
+visible (branch D next) or stays hidden (branch B next).
+
+**Session 24 (AHB, observer files accidentally removed at the §61 cleanup — outcome from raw logs
+only):** shim loads and **`gbm_bo_create w=2 h=2 -> ok` x157 lines (real AHB buffers served)**,
+then `gpu_process_host exited unexpectedly exit_code=11` repeatedly and **`FATAL:gpu_data_manager_impl_private.cc(449) GPU process isn't usable. Goodbye.`**
+The browser process re-launched every ~5 s (startcount climbing), **CDP never exposed a usable page
+list** (first `LIST pages=1` at 19:46, immediately `Shutdown`), **no BP native window ever appeared
+in the gamescope tree** (only root/update-UI/probe 1x1s). Client never reached `rc=0`; session was
+stopped manually at ~+3 min. `firstFrame=false`.
+
+**Session 25 (AHB, observers re-staged; the clean intervention observation):** CDP-UP once
+(19:52:16), one `attach-ok page 96F3A15DFE` (`index.html?LOCALE...`) and then **the observer died**:
+the `Traceback` fragments now explained — v7 dropped v6's `try` around `inspect()` and `call()`
+didn't guard `ws.send`; a dying websocket raised through the main loop. Fixed as v7.3 (`9a1bbd7`).
+The native tail kept working (it is a separate process): webhelper **browser generations cycled
+~6 s apart** (pids 13242→13956→15070→15630, all `cdpport=22586`), `cef_log` fresh-log count:
+**174 `GPU process exited unexpectedly exit_code=11`** in ~4 minutes, no `Steam Big Picture Mode`
+window, no FOCUSDIFF for any BP window, `Error getting buffer` + `DRI3 BadAlloc` churn. Session
+stopped manually (client still looping, never `rc=0`).
+
+**Intervention effects recorded (STEP 6 checklist):** (1) native state: NO BP window created — the
+gen dies before page #2 exists; (2) document visibility: not observable this run (observer died at
+first attach — tooling, not subject); (3) login content: none, device showed update UI only;
+(4) device frames: only update-UI presents (2404x1080 wl_buffers) — no BP frames; (5) helper
+lifetime: WORSE than nulldev — fast crash-restart loop (174 GPU exits, no orderly `_exit(0)`
+observed before manual stop) instead of §61's ~15 s orderly shutdown. **Success criterion (login
+content visible on device) NOT met; the intervention is rolled back** (shim + hybris copies + env
+deleted; stock resolution re-verified on-device: `/usr/lib/libgbm.so.1` in effect, ICD `68f90ad8…`).
+
+**Reading:** the AHB shim's buffers are accepted by GBM-API consumers but Chromium's GPU process
+crashes *using them* (the exact §53-54 wall: crash located to CEF's post-import handling; siginfo
+uncapturable in-guest). The nulldev path (§61) is the better-behaved failure: it dies once per gen
+at first BP raster, ~850 ms after activation, with an orderly Steam shutdown chain. **Crucial
+cross-session note for the next step:** §58's "nulldev + GPU totally silent (0-1 crashes, full
+30 s run)" used the **instrumented ICD `b1728201`**, while §61's session 23 nulldev run used the
+**stock ICD `68f90ad8`** and crashed — so the crash-vs-silent switch correlates with the ICD build,
+not with the shim mode. The instrumented ICD differs from stock only by per-PID WSI logging
+(`add0052`) — logging that changes GPU-process timing/lifetime is the hypothesis; it also means
+**the §61 open question (does activation flip hidden→visible?) is answerable with a configuration
+we already know keeps the BP gen alive long enough**: nulldev shim + instrumented ICD + v7.3
+observer with a SHORT first hold and a second readback (+2 s, +4 s) inside the observed ~900 ms-10 s
+window. That is the single next run; no new flags, same one-variable discipline.
