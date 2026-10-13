@@ -2804,7 +2804,7 @@ recorded; all conclusions PID-filtered). One CDP caveat: **CEF's `/json/list` ti
 - The page at UP: `document.readyState=complete`, `visibilityState=visible`,
   **`innerWidth×innerHeight = 1×1`**, dpr=1, body has 2 children - the SteamUI document IS loaded and
   thinks its window is one pixel square.
-- **The one bounded screenshot: 759 bytes, decodes to a 1×769-pixel blank** (text-parsed SOF0;
+- **The one bounded screenshot: 759 bytes, decodes to a **1×1 blank** (text-parsed SOF: height=1 width=1
   no login pixels). A 404 resource error, no JS exceptions logged in the attach window.
 - So: **the first loss of progress = the CEF page viewport.** The Big-Picture X window is mapped and
   2404×1080 (§56/§58), but Chromium's web contents never learn any size - viewport 1×1 - so no login

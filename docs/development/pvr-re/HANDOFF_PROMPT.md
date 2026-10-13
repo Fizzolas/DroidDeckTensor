@@ -70,7 +70,7 @@ Protocol 1.3; endpoint `127.0.0.1` only, owner = the steamwebhelper browser; gue
 forwarded) shows exactly ONE page target (`SharedJSContext` @ `steamloopback.host/index.html` —
 **title/url identical for all CEF pages; the login UI lives inside that document**). At attach:
 `readyState=complete`, `visibilityState=visible`, **`innerWidth×innerHeight = 1×1`**, body has 2
-children; ONE bounded screenshot = 759 B, decodes to a **1×769 blank** (no login pixels). One 404
+children; ONE bounded screenshot = 759 B, decodes to a **1×1 blank** (SOF height=1 width=1, no login pixels). One 404
 resource; no JS exceptions in the window. The instrumented run then: **webhelper exits are ALL clean
 `_exit(0)`** (LD_PRELOAD `_exit`/`exit`/`abort` tracer, separate session) - no crash signal; the
 "Disabling sandbox due to a previous crash in CefInitialize" line is persisted config, not this run.
