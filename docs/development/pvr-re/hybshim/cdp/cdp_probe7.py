@@ -64,7 +64,8 @@ class WS:
 _id = [0]
 def call(ws, method, params=None, timeout=3):
     _id[0] += 1; mid = _id[0]
-    ws.send({"id": mid, "method": method, "params": params or {}})
+    try: ws.send({"id": mid, "method": method, "params": params or {}})
+    except Exception: return ("ERR", method, "send-io")
     end = time.time() + timeout
     while time.time() < end:
         try: o = ws.recv(end)
@@ -168,7 +169,10 @@ def main():
                 if tid not in known:
                     kind = describe(t)
                     known[tid] = (kind, t)
-                    inspect(t, hold=(6.0 if kind == "BP" else 1.5))
+                    # v6's guard, restored: an io exception inside inspect must not kill the whole
+                    # observer (sessions 22/23/25 lost all later rounds to an unguarded send).
+                    try: inspect(t, hold=(6.0 if kind == "BP" else 1.5))
+                    except Exception as e: p("inspect-exc", kind, tid, repr(e)[:70])
         time.sleep(0.5)
     p("done")
 
