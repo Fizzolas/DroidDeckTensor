@@ -2668,3 +2668,56 @@ client does not rebuild the swapchain at the real size, presents nothing, and ex
 to trace why the client never recreates its swapchain at the (now correct) window size — i.e. whether
 it receives the `VK_ERROR_SUBOPTIMAL_KHR`/resize signal it expects, or gives up on the run of
 gamescope `vkCreateComputePipelines failed (-13)` / `Error getting buffer` seen around the same time.
+
+## 57. Phases 1-3 re-run with per-PID WSI logging: who fails what (2026-10-13, sessions 13-01..13-05)
+
+The instrumented ICD (every WSI call now logs `pvr_wsi[pid]`, plus new acquire/get_images/destroy/
+present-entry logs) was run on the NULL-create baseline, reproduced: shim loads in 7-8
+`steamwebhelper` procs, `gbm_create_device -> NULL` reached, **GPU-process crashes 0-3** (stock ~48),
+update UI presenting. Attribution, per PID:
+
+- **`vkCreateComputePipelines failed (-13)`**: all 6 lines carry the `[gamescope]` prefix - gamescope's
+  own compositor context through our ICD, at update-UI window-destroy time. They interleave with
+  *successful* 2404x1080 update-UI presents - **not on the main-UI path, and not blocking frames**
+  (the same failures occur while update-UI frames present fine). Not Steam, not our ICD's decision.
+- **`Error getting buffer`**: this string lives **only in Xwayland** (pulled the binary and read the
+  string's neighbourhood: `xwayland-present.c`, "present: Error getting buffer"). "Buffer" here is an
+  **X Present vblank buffer**, not GBM/AHB. Causal chain, per-PID: steamwebhelper pids (12551/12553)
+  present 32x32 X11 utility windows -> our `xcb_dri3_pixmap_from_buffers` fails **BadAlloc** (Xwayland
+  cannot import our dma-buf - the no-GEM wall seen from its side, §40-41) -> the following
+  PresentPixmap references the never-created pixmap -> `BadPixmap` -> Xwayland logs the error.
+- **The 1x1 swapchain churn**: the **steam** pid (12319, `pEngineName: mesa zink`) creates 1x1
+  swapchains on surfaces whose caps *it was just told* `currentExtent=2404x1080` (xids 0x1200002,
+  0x1400002, 0x2c00002), calls `get_images`, and **destroys without ever acquiring or presenting** -
+  the shape of a size/compatibility probe. Its only real present is a 64x24 overlay window.
+- **Never happens anywhere**: a swapchain for the Big-Picture CEF window (class `steamwebhelper`,
+  `Steam Big Picture Mode`, §52/§56); any acquire/present at 2404x1080 for a main-UI surface.
+
+**Answer to the objective.** The compute-pipeline failure does **not** prevent the main UI's first
+frame (gamescope-owned, interleaves with successful presents). The 1x1 churn is **not the root
+either**: it is the *steam* process's own probing on surfaces it then abandons; the window that
+matters (the CEF Big-Picture window) never gets any Vulkan surface from any process, and the CEF
+**browser keeps restarting** (`Restart webhelper process, counter 2`) with **residual
+`Buffer handle is null` (~17)** even under NULL-create. The first failed transition is **before**
+any main-UI window/swapchain: CEF's browser-side shared-image/GpuMemoryBuffer allocation still fails
+and its GPU-side process keeps restarting, so the login/Big-Picture content never commits a frame to
+present - while steam's client loop probes-and-aborts its swapchains and exits `rc=0` at ~14-30 s.
+
+**Causal test run (external resize, xresize tool):** executed in-guest at probe rounds 3/5/7/9.
+At 3/5 it reported "no small steam window found" (only the update UI's 2404x1080 window was live; the
+steam helper windows' lifetimes are shorter than the 4 s probe cadence / fall inside the webhelper
+restart churn). Per the handoff's step-5 rule ("if no acquisition happens, do not add resize logic
+as the first fix") this closes the resize-invalidation idea for now.
+
+**Open sub-question for next session (one variable each):** (a) the residual ~17 null handles and
+the webhelper restarts co-occur under NULL-create - confirm by pid/timestamp correlation (shim log
+vs `webhelper_gpu.txt` "start count") whether they are one loop or two; (b) the shim matrix so far -
+stock(null~350,crash~48) vs AHB(null 0, crash ~48-57) vs NULL-create(null ~17, crash 0-1) shows the
+GPU-process crash tracks **device creation**, not the buffer path - a fourth row, **valid stub device
++ failing `gbm_bo_create`** (import-only fallback), would separate "device missing" from "allocation
+missing" and is the cheap next run.
+
+Rollback of the two instrumentation changes: they are additive logging (`pvr_wsi[pid]` in
+`pvr_wsi.c`, probe rounds gated on `BL_UI_PROBE=1` in `droiddeck-session`); `git revert` both or
+rebuild the ICD from the previous commit. Guest is restored stock (ICD `68f90ad8`, no shim, env
+cleared, all probe binaries removed).

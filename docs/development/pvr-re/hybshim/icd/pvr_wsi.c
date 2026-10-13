@@ -27,7 +27,7 @@
 #include <fcntl.h>
 #include <pthread.h>
 
-#define WSI_LOG(...) do { fprintf(stderr, "pvr_wsi: " __VA_ARGS__); fputc('\n', stderr); } while (0)
+#define WSI_LOG(fmt, ...) fprintf(stderr, "pvr_wsi[%d]: " fmt, (int)getpid(), ##__VA_ARGS__)
 
 /* Resolve a device entrypoint through the HAL (never the global vkGetDeviceProcAddr). */
 extern void *pvr_icd_resolve(void *instance, const char *name);
@@ -497,6 +497,7 @@ fail:
 static void wsi_destroy_swapchain(VkDevice device, VkSwapchainKHR sw, const VkAllocationCallbacks *alloc) {
     struct wsi_swapchain *sc = (struct wsi_swapchain *)sw;
     if (!sc) return;
+    WSI_LOG("destroy_swapchain: sw=%p %dx%d", (void *)sw, sc->width, sc->height);
     /* The compositor may still hold a wl_buffer on a presented image; drop our reference without
      * waiting, then release everything we own. fds, images and memory are closed/destroyed so a
      * swapchain teardown does not leak one per resize. */
@@ -515,6 +516,7 @@ static void wsi_destroy_swapchain(VkDevice device, VkSwapchainKHR sw, const VkAl
 static VkResult wsi_get_swapchain_images(VkDevice device, VkSwapchainKHR sw, uint32_t *count, VkImage *images) {
     (void)device;
     struct wsi_swapchain *sc = (struct wsi_swapchain *)sw;
+    WSI_LOG("get_images: sw=%p want=%u have=%u -> %s", (void *)sw, images ? *count : 0, sc->count, images ? "fill" : "count");
     if (!images) { *count = sc->count; return VK_SUCCESS; }
     uint32_t n = *count < sc->count ? *count : sc->count;
     for (uint32_t i = 0; i < n; i++) images[i] = sc->images[i].image;
@@ -525,6 +527,7 @@ static VkResult wsi_get_swapchain_images(VkDevice device, VkSwapchainKHR sw, uin
 static VkResult wsi_acquire_next_image(VkDevice device, VkSwapchainKHR sw, uint64_t timeout,
                                        VkSemaphore sem, VkFence fence, uint32_t *index) {
     (void)timeout;
+    WSI_LOG("acquire: enter sw=%p sem=%p fence=%p", (void *)sw, (void *)sem, (void *)fence);
     if (!sw || !index) return VK_ERROR_INITIALIZATION_FAILED;
     struct wsi_swapchain *sc = (struct wsi_swapchain *)sw;
     pthread_mutex_lock(&sc->lock);
@@ -538,6 +541,7 @@ static VkResult wsi_acquire_next_image(VkDevice device, VkSwapchainKHR sw, uint6
         return VK_ERROR_INITIALIZATION_FAILED;
     }
     *index = idx;
+    WSI_LOG("acquire: sw=%p -> image %u", (void *)sw, idx);
     return VK_SUCCESS;
 }
 
@@ -581,6 +585,9 @@ static VkResult wsi_wait_binary(VkDevice dev, VkQueue queue, VkSemaphore sem) {
 
 static VkResult wsi_queue_present(VkQueue queue, const VkPresentInfoKHR *pi) {
     (void)queue;
+    WSI_LOG("present: enter count=%u sw0=%p image0=%u", pi->swapchainCount,
+            pi->swapchainCount ? (void *)pi->pSwapchains[0] : NULL,
+            pi->swapchainCount ? pi->pImageIndices[0] : 0);
     pthread_mutex_lock(&wsi_lock);
     for (uint32_t i = 0; i < pi->swapchainCount; i++) {
         struct wsi_swapchain *sc = (struct wsi_swapchain *)pi->pSwapchains[i];
