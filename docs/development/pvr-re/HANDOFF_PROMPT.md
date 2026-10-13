@@ -63,7 +63,38 @@ testkey so it installs over any build; bump `versionCode` when a bundled asset c
 - **The Steam client reaches its login screen** (`steamui_login.txt`: `SetLoginState:
   WaitingForCredentials`).
 
-### UPDATE 2026-10-13c (CDP page observation + lifecycle, §59) — read this FIRST
+### UPDATE 2026-10-13d (sessions 18-20, §60) — read this FIRST, supersedes 13c's framing
+
+**SharedJSContext is confirmed the headless controller — the user's warning was right.** Its 1×1
+outer/inner/screen and blank screenshot are NOT the login page's state. CDP observer v6
+(`hybshim/cdp/cdp_probe.py`, HTTP-lifecycle diff + read-only page attach; wired into the session
+probe block `BL_UI_PROBE=1` in `droiddeck-session` — commit `2cfe8db`) attached to the **second**
+page target (`about:blank?createflags=...&useragent=Valve Steam Gamepad`, title mutates to
+**`Steam Big Picture Mode`**): **outer=1280x800, inner=1281x800, screen=2404x1080, readyState=complete,
+`visibilityState=HIDDEN`**, bridge `SteamClient.{Browser,Window,BrowserView,...}`. The SharedJSContext
+console shows the whole login-app JS booting fully (`SteamApp Init - Before Login` ~681 ms, transport
+connected, `OnLoginUsersChanged`) inside the 1×1 controller — the controller's job (requesting the BP
+window) completes; its params appear in the BP page's own title (`createflags=6292738 minwidth=853
+minheight=534 browserType=4`).
+
+**So the first-frame failure = the BP browser view is loaded but CHROMIUM-HIDDEN; Chromium does not
+produce frames for hidden pages.** That explains: no swapchain on the BP surface (§57), nothing
+presents, helper `_exit(0)` ~10-15 s, client `rc=0`. GBM/shim: closed chapter; session 20 ran on
+**stock graphics** and still showed this — visibility, not GPU, is the wall now.
+
+**UNRESOLVED (proven/inferred boundary — §60 caveat):** config split. With nulldev shim + old observer,
+xinspect saw the native BP X window VIEWABLE (2404x1080, §56/§58) but the BP web view wasn't visible
+to CDP (v2 attach races, `handshake-closed` on second page). Stock + v6: BP web view (hidden) seen,
+no BP X window in xinspect rounds (may be lifecycle race: BP window lived only ~10 s in gen2's death
+sequence). **One clean run resolves it: same stock setup, v6 observer (already repo-persisted),
+full-session sampling; correlate xinspect's BP-window round with CDP attach of the same moment** — did
+the native window exist while hidden, or was it never mapped? Then trace WHO decides visibility
+(ozone-X11 window activation: `_NET_ACTIVE_WINDOW`/WM state vs gamescope never making it
+focus — `focused app: none` is constant) — the fix target is CEF widget->window activation, not any
+extent/resize knob. Also keep: helper `_exit(0)` after ~10 s = Steam's own shutdown path; find its
+trigger if the BP-visibility answer doesn't subsume it.
+
+### UPDATE 2026-10-13c (CDP page observation + lifecycle, §59) — read this before 13b
 
 **The login page EXISTS and is ALIVE - its viewport is 1×1.** CDP (`Chrome/126.0.6478.183`,
 Protocol 1.3; endpoint `127.0.0.1` only, owner = the steamwebhelper browser; guest-local, never
