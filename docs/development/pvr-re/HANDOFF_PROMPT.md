@@ -63,6 +63,39 @@ testkey so it installs over any build; bump `versionCode` when a bundled asset c
 - **The Steam client reaches its login screen** (`steamui_login.txt`: `SetLoginState:
   WaitingForCredentials`).
 
+### UPDATE 2026-10-13c (CDP page observation + lifecycle, §59) — read this FIRST
+
+**The login page EXISTS and is ALIVE - its viewport is 1×1.** CDP (`Chrome/126.0.6478.183`,
+Protocol 1.3; endpoint `127.0.0.1` only, owner = the steamwebhelper browser; guest-local, never
+forwarded) shows exactly ONE page target (`SharedJSContext` @ `steamloopback.host/index.html` —
+**title/url identical for all CEF pages; the login UI lives inside that document**). At attach:
+`readyState=complete`, `visibilityState=visible`, **`innerWidth×innerHeight = 1×1`**, body has 2
+children; ONE bounded screenshot = 759 B, decodes to a **1×769 blank** (no login pixels). One 404
+resource; no JS exceptions in the window. The instrumented run then: **webhelper exits are ALL clean
+`_exit(0)`** (LD_PRELOAD `_exit`/`exit`/`abort` tracer, separate session) - no crash signal; the
+"Disabling sandbox due to a previous crash in CefInitialize" line is persisted config, not this run.
+Browser gen1 lives ~7-10 s (CDP UP then DOWN one round later), gen2 launches, client exits `rc=0`
+~14-30 s (`socket disconnected`). **Ordering: the page is 1×1 from the first moment it is visible -
+before the replacement - so the gen swap is downstream, not the cause.**
+
+**So the failure = web viewport size delivery.** X11 window: mapped, 2404x1080 (§56). The CEF page
+never learns it. The client's own Vulkan swapchains (zink UI windows) are probe-then-abandon 1x1
+(§57) — same "nothing sized" shape on two independent backends, pointing at **the window->contents
+size signal, not the GPU stack**. Note (§57) the Big-Picture CEF window NEVER got a swapchain at all;
+and the `--type=zygote`-labeled GBM callers are the GPU-process forks (constructor-inherited role
+string; no LOAD line).
+
+**NEXT STEP (narrow, one run):** attach CDP to the page (same observer set, now repo-persisted at
+`hybshim/cdp/`: `cdp_watch.sh`, `cdp_page.py`, `proc_watch.sh`) and evaluate
+`window.outerWidth/outerHeight`, `document.documentElement.clientWidth/Height` + a 5 s `onresize`
+recorder: separates "CEF never told" (proceed to CEF surface/window-size plumbing: ozone-X11
+GetWindowRect/ConfigureNotify -> views::NativeWidgetAura path, and/or gamescope configure of the
+CEF window) from "told but ignored" (CEF ozone bug - escalate differently). Do NOT ship
+`vk_wsi_force_swapchain_to_current_extent` or any WSI sizing change before the login-content path is
+proven to touch that surface. Do not reopen GBM (matrix closed, §58). Rollback/baseline docs:
+`ROLLBACK_BASELINE.md`; observer scripts in `hybshim/cdp/`; probe shim in `hybshim/gbm/`
+(gbm_probe.c, GBM_SHIM_MODE=env nulldev|stub). Device stock at session end (ICD 68f90ad8).
+
 ### UPDATE 2026-10-13b (matched-control experiments, §58) — read this FIRST
 
 Two runs, ONE byte-identical probe shim (`hybshim/gbm/gbm_probe.c`, mode via `GBM_SHIM_MODE` env),
