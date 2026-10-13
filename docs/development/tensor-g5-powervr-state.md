@@ -2834,3 +2834,40 @@ until the login path is proven to use that surface).
 
 **Device restored to stock at session end** (probe shim + observers + ICD instrumented build removed;
 stock ICD `68f90ad8` verified; env deleted; logs archived not deleted).
+
+## 60. Session 20 (STOCK, no shim): the Big-Picture browser view exists, sized 1280x800, but `visibilityState=hidden` (2026-10-13, sessions 13-18..20)
+
+CDP observer v5/v6 (HTTP-only lifecycle diff + read-only page attach; in-session, guest-local
+endpoint, all URLs query-stripped). NOTE: session 20 ran on fully STOCK graphics (the probe shim had
+been removed) — so everything here is independent of GBM and of the shim matrix.
+
+**The target list settles the SharedJSContext question exactly as the user warned.** At
+1791927452 (gen2 browser) `/json/list` holds **two pages**:
+1. `SharedJSContext @ steamloopback.host/index.html` — the **headless SteamUI controller** (its
+   own title carries `createflags=6292738&minwidth=853&minheight=534&browserType=4` params for the
+   window it will request; its 1×1 outer/inner/screen is *normal for an offscreen controller*, and
+   its console log shows the whole login-app JS booting: transport connected, `SteamApp Init -
+   Before Login`, `OnLoginUsersChanged`, all stores async).
+2. **`about:blank?createflags=...&useragent=Valve Steam Gamepad`** — the **Big Picture browser
+   view itself**, attached: title becomes **`Steam Big Picture Mode`**, **`outer=1280x800,
+   inner=1281x800, screen=2404x1080, dpr=1, readyState=complete, visibilityState=HIDDEN, kids=1`**,
+   bridge: `SteamClient.{_internal,Browser,OpenVR,Input,Window,Compat,BrowserView}`.
+
+**So:** the login/Big-Picture renderer DOES get created (CEF `browserType=4`, UA "Valve Steam
+Gamepad", the same window whose X top-level was `0x1c00033` VIEWABLE in §56/§59 — the
+1280x800 children). It has real geometry (1280x800), loaded document, and a populated bridge — but
+**Chromium considers it HIDDEN**, and Chromium does not produce frames for hidden renderers. That
+connects §56's "window VIEWABLE but no swapchain for it": the page exists on the web side,
+visibility is the blocker; the X focus/configure chain is the remaining boundary (gamescope's WM
+never makes it the focus window — `== focused app: none` in every session).
+
+**Correction/retirement of §59's framing:** the 1×1 SharedJSContext screenshot/geometry was NOT the
+login page's state (controller context — exactly as flagged). The real first-frame failure is:
+**BP browser view created+loaded → stays hidden → never renders → no swapchain → nothing presents →
+Steam shuts the helper down ~10-15 s later (clean `_exit(0)`, session 13), client `rc=0`.**
+The 1x1-vs-2404 X window sizing (§56/§58) and hidden-visibility are now the same question: who
+tells a top-level X window it is visible/focused in this gamescope+ozone-X11 stack. Next
+instrumentation (single variable, next session): X `CreateNotify/ConfigureNotify/MapNotify` +
+`_NET_ACTIVE_WINDOW`/WM_STATE deltas around the BP window from the moment it is created, plus
+Chromium-side visibility reasons — not a WSI extent change (§58/§59 warnings stand: the BP view
+already has geometry; extent hacks would not touch visibility).

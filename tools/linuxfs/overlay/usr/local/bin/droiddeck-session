@@ -899,13 +899,14 @@ BUSCONF
       # Diagnostic only (BL_UI_PROBE=1): sample the client's X windows while it runs, to see what
       # size gamescope gives them and whether they are ever mapped. off by default.
       if [ "${BL_UI_PROBE:-0}" = 1 ]; then
-        # Pure observation (no X writes) unless BL_XRESIZE=1, which adds the external map+resize
-        # intervention at rounds 3/5/7/9. Keep it off for matched-control experiments.
-        ( for _round in $(seq 1 12); do nap 4; \
+        # Observer set (read-only; no X writes unless BL_XRESIZE=1). Clock anchor printed once so
+        # guest wall clock and uptime-based ages can be reconciled (guest /proc/stat btime is faked).
+        ( echo "== probe anchor: date=$(date +%s) uptime=$(awk '{print int($1)}' /proc/uptime) =="; \
+          timeout 90 python3 /tmp/cdp_probe.py "$BL_CDP_PORT" 85 2>&1 & \
+          for _round in $(seq 1 12); do nap 4; \
             echo "== ui-probe round $_round DISPLAY=$DISPLAY =="; \
             /tmp/xinspect 2>&1 | grep -avE "^proot" | head -40; \
             /tmp/proc_watch.sh 2>/dev/null; \
-            /tmp/cdp_watch.sh "$BL_CDP_PORT" 2>/dev/null; \
             if [ "${BL_XRESIZE:-0}" = 1 ] && { [ "$_round" = 3 ] || [ "$_round" = 5 ] || [ "$_round" = 7 ] || [ "$_round" = 9 ]; }; then echo "== xresize CAUSAL TEST round $_round =="; /tmp/xresize 2>&1 | head -20; fi; \
           done ) >> "$BL_LOG" 2>&1 &
       fi
