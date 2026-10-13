@@ -94,6 +94,42 @@ focus — `focused app: none` is constant) — the fix target is CEF widget->win
 extent/resize knob. Also keep: helper `_exit(0)` after ~10 s = Steam's own shutdown path; find its
 trigger if the BP-visibility answer doesn't subsume it.
 
+### UPDATE 2026-10-13e (sessions 21-23, §61) — read this FIRST; 13d's open question is ANSWERED
+
+**Same-run correlation DONE and PROVEN.** Two clean runs (session 22 STOCK, session 23 labelled
+NULL-create, identical observer set) captured web attach + native tail in one CLOCK_MONOTONIC stream
+(v7.2 `hybshim/cdp/cdp_probe7.py` spawns `xinspect2 --events` the instant the BP attach lands;
+commits `057d488` `7efbc7a` `a374d0d`). Result: the BP web target (`title=Steam Big Picture Mode`,
+`hidden/hidden/focus=false`, inner 1281x800 outer 1280x800, readyState=complete, kids=1
+`DIV#popup_target`, innerText len=0) and its native window **coexist in the same second**:
+`0x1c00033` 'Steam Big Picture Mode'/'steamwebhelper' **2404x1080 d=32 VIEWABLE WM_STATE=Normal
+_NET_WM_PID=26590 child 1280x800 VIEWABLE**, gamescope set `_NET_ACTIVE_WINDOW` to it +530 ms after
+attach (input focus = helper window, never entered BP). Association proven by **PID (proc_watch
+pins 26590 as the CDP-owner browser) + geometry + title** — HIGH confidence, title-match caveat
+satisfied. Branch A (unmapped/minimized) and E (no association) are **refuted**. §60's stock
+"no BP window ever" was pure sampling lifetime: the BP window lives ~0.9 s per generation, 4 s
+rounds missed it (the "one-sample absence" warning was right).
+
+**New binding constraint (both runs):** ~850 ms after the BP window maps/activates, the GPU process
+crashes: fresh PID-filtered cef_log shows 12x `shared_image_interface_proxy 'Buffer handle is null'`
++ `one_copy_raster_buffer_provider` staging failure + `gpu_process_host exit_code=11` — under STOCK
+ICD (22: `[20532]` exit 11; 23: `[26590]` exit 11) **and under nulldev shim + stock ICD (23)**,
+contradicting §58's "nulldev GPU silent" (that run used the instrumented ICD `b1728201` — record,
+don't harmonize). Window dies with the gen → Steam orderly `_exit(0)` ~10-15 s → rc=0. Whether
+activation flips hidden→visible is still UNOBSERVED: the page dies before the 6 s readback (the
+window lifetime is <1 s — attach V7BP at T, T+2 s poll for a second readback, or shorten hold).
+Session 21 was OBSERVER-DEFECTIVE (two fixed tooling bugs: CEF list `"id"` vs `"targetId"` key
+collision; xinspect2 BadWindow default handler death) — its numbers are recorded in §61 but NOT
+merged.
+
+**Next one-variable run (STEP 6 direction, still unexecuted — no causal intervention has run):**
+AHB shim `gbm_ahb.c` (the §50 artifact, cut crashes ~70→1, gives Chromium a real gralloc dma-buf)
++ stock ICD + same v7.2 observers, `cef_log` truncated fresh. Question it answers: if the GPU process
+survives BP first-raster, does the BP page flip hidden→visible and produce swapchain/presents (→
+branch D, compositor path), or stay hidden (→ branch B, CEF visibility propagation). Rollback:
+delete `steamrtarm64/libgbm.so.1`. Device is STOCK + clean (ICD `68f90ad8…`, libgbm `e28a74e1…`,
+no shim/env/observers, IDLE — sha256-verified on-device 2026-10-13 after session 23).
+
 ### UPDATE 2026-10-13c (CDP page observation + lifecycle, §59) — read this before 13b
 
 **The login page EXISTS and is ALIVE - its viewport is 1×1.** CDP (`Chrome/126.0.6478.183`,
