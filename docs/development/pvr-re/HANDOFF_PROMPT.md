@@ -130,6 +130,45 @@ branch D, compositor path), or stay hidden (→ branch B, CEF visibility propaga
 delete `steamrtarm64/libgbm.so.1`. Device is STOCK + clean (ICD `68f90ad8…`, libgbm `e28a74e1…`,
 no shim/env/observers, IDLE — sha256-verified on-device 2026-10-13 after session 23).
 
+### UPDATE 2026-10-13f (sessions 24-25, §62) — read this FIRST; the STEP 6 intervention ran, FAILED, and is rolled back
+
+**The one permitted causal intervention (AHB shim `a75d1af0…` + hybris `058bdaed…`/`q.so ba9b7904…`
++ stock ICD + `HYBRIS_LINKER_DIR` env, fresh logs) was executed twice (24 outcome-only, 25 with
+observers) and FAILED on every STEP 6 axis:** shim serves real AHB buffers (`gbm_bo_create -> ok`
+x157), Chromium's GPU process crashes USING them (174 `exit_code=11` in 4 min), **no BP web target
+and no BP native window ever appear** (gens cycle ~6 s, update-UI presents only, `firstFrame=false`),
+helper lifetime WORSE than nulldev (crash-loop, never orderly `_exit(0)`). Manual-stopped, fully
+rolled back, stock re-verified on-device (ICD `68f90ad8…`, `/usr/lib/libgbm.so.1` resolves, no
+shim/env/observers, IDLE). This confirms §53-54's wall (crash in CEF's post-import buffer use) and
+means the §60/§61 "BP hidden-but-sized" state is only reachable in configs where the gen lives:
+nulldev (or instrumented-ICD) paths.
+
+**Observer v7.3 (`9a1bbd7`):** sessions 22/23/25 all lost their observer at the first BP
+detach — my v7 rewrite dropped v6's `try` around `inspect()` and `call()` didn't guard `ws.send`;
+a dying websocket killed the loop (the interleaved `Traceback` fragments in the logs). Fixed.
+Consequence recorded honestly: session 23's missing second visibility readback (V7B BP) was
+*partly* tooling — but the 850 ms native death explains the first loss regardless.
+
+**Crash-vs-silent switch (§62 cross-check):** §58's nulldev "GPU silent, full 30 s run" used the
+**instrumented ICD `b1728201…`** (per-PID WSI logging, `add0052`); §61's session 23 nulldev used
+**stock `68f90ad8…`** and crashed at BP first raster. The switch correlates with the ICD build, not
+shim mode.
+
+**NEXT RUN (the one that can close the open question; diagnostic config already known to extend
+gen life, not a new intervention):** **nulldev probe shim `839ac0b4…` + instrumented ICD `b1728201…`
+(rebuild via `hybshim/build_icd.sh` from the committed instrumented sources; verify sha) + v7.3
+observers + `HYBRIS_LINKER_DIR` env + fresh logs**, with the BP hold SPLIT: read at T, native tail
+running, second readback at ~+2 s and ~+4 s (window: activation lands ~+530 ms after attach;
+§58's silent-ICD gen lived 10+ s). Question it answers: **does `_NET_ACTIVE_WINDOW` activation flip
+BP `hidden`→`visible` (→ then branch D: frames/swapchain for that view), or does Chromium keep it
+hidden (→ branch B: CEF `WasHidden`/widget visibility propagation)?** If visible+frames appear,
+follow with the device-frame check (§48 vkcube precedent shows the path works). Also keep open: WHY
+the GPU process SIGSEGVs at BP first raster under stock ICD (the actual earliest observed device
+boundary — siginfo still uncapturable in-guest; §54) — and Steam's `_exit(0)` shutdown chain
+confirmed as DOWNSTREAM of the crash (session 23), trigger of the crash itself still unestablished.
+Handoff 13e's AHB-shim proposal is SUPERSEDED (executed, failed). Device STOCK + clean, sessions
+20-25 archived in `/d/GUH/audit/`.
+
 ### UPDATE 2026-10-13c (CDP page observation + lifecycle, §59) — read this before 13b
 
 **The login page EXISTS and is ALIVE - its viewport is 1×1.** CDP (`Chrome/126.0.6478.183`,
