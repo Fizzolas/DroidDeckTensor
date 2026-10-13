@@ -63,6 +63,22 @@ testkey so it installs over any build; bump `versionCode` when a bundled asset c
 - **The Steam client reaches its login screen** (`steamui_login.txt`: `SetLoginState:
   WaitingForCredentials`).
 
+### UPDATE 2026-10-13 (per-PID attribution, §57) — read this before everything below
+
+With per-PID WSI logging (`pvr_wsi[pid]` in `pvr_wsi.c`, `BL_UI_PROBE=1` in the session script) on the
+reproduced NULL-create baseline, **every attribution question from the 2026-10-12 review is answered**:
+`vkCreateComputePipelines failed (-13)` is gamescope's own context (interleaves with successful
+update-UI presents — **benign to the main UI**); `Error getting buffer` is an **Xwayland** message
+("present: Error getting buffer", vblank buffer, downstream of our DRI3 BadAllocs); the 1x1
+swapchain churn is **steam itself** (zink) probing-and-abandoning surfaces told `2404x1080`, never
+acquiring/presenting them. **No process ever creates a swapchain on the Big-Picture CEF window.**
+The residual blocker is CEF's browser-side shared-image loop (`~17 Buffer handle is null` +
+`Restart webhelper process, counter 2` persist under NULL-create) — the crash tracks **device
+creation** (matrix: stock 350null/48crash; AHB 0null/48crash; NULL-dev ~17null/0-1crash), so the
+**next cheap one-variable experiment is row 4: valid stub device + failing `gbm_bo_create`** (and/or
+hardening `gbm_bo_import`), i.e. separate "device missing" from "allocation missing". Device left
+stock (ICD `68f90ad8`); all probes/shim removed; rollback in `ROLLBACK_BASELINE.md`.
+
 ### UPDATE 2026-10-12 (Phase 1-3) — read this before §45-55 below
 
 The NULL-create shim (`libgbm.so.1` at `steamrtarm64/`, padded to 2046456 B) makes CEF's GPU process
