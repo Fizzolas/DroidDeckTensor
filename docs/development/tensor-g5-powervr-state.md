@@ -2788,3 +2788,49 @@ time): read the LIVE per-run `webhelper.txt`/`cef_log` browser-exit lines, and C
 open by default in these sessions, reachable in-guest via proot curl to 127.0.0.1:<port>/json) to
 see whether the login page loaded/painted; (b) CEF's own window->compositor path (the 64x24 overlay
 presenting fine shows our WSI works). Do not touch WSI sizing, do not package.
+
+## 59. CDP: the login page IS alive and visible - and its viewport is 1×1 (2026-10-13, sessions 10-13)
+
+Baseline re-verified before use (probe shim `73bde3bc`, instrumented ICD `b1728201` rebuilt
+byte-identical, `GBM_SHIM_MODE=nulldev`, Steam logs archived to `archive-13b/` pre-run, inodes/sizes
+recorded; all conclusions PID-filtered). One CDP caveat: **CEF's `/json/list` title/url is
+`SharedJSContext / index.html` for ALL pages** - the login UI lives inside that page's document, so
+"the target" is the whole SteamUI, not a separate login target.
+
+**Sessions 10+11 (passive + one-shot bounded page probe; CDP v2 works):**
+- CDP endpoint: DOWN until browser generation-1 (steamwebhelper pid 8279, launched ~+4 s) exists;
+  `Chrome/126.0.6478.183, Protocol 1.3`, **one page target**, UP at ~T+26 s, DOWN one round later
+  (~7 s). Gen2 browser (13116 at 16:22:53, `-startcount=1`) never exposes CDP before `rc=0`.
+- The page at UP: `document.readyState=complete`, `visibilityState=visible`,
+  **`innerWidth×innerHeight = 1×1`**, dpr=1, body has 2 children - the SteamUI document IS loaded and
+  thinks its window is one pixel square.
+- **The one bounded screenshot: 759 bytes, decodes to a 1×769-pixel blank** (text-parsed SOF0;
+  no login pixels). A 404 resource error, no JS exceptions logged in the attach window.
+- So: **the first loss of progress = the CEF page viewport.** The Big-Picture X window is mapped and
+  2404×1080 (§56/§58), but Chromium's web contents never learn any size - viewport 1×1 - so no login
+  pixels exist to present, consistent with "no swapchain ever created for the Big-Picture window".
+
+**Session 13 (exit lifecycle, LD_PRELOAD `_exit/exit`/abort tracer - separate run, not mixed into
+the passive control):** every `steamwebhelper` exit caught was **`_exit code=0`** - clean exits,
+no signals, no nonzero statuses. Steam's `Disabling sandbox due to a previous crash in CefInitialize`
+is a persisted config line (same text on 2026-10-11 runs), not a crash this run. So the "browser
+disappearance" is Steam's own **orderly shutdown sequence** (webhelper exits 0; client exits 0),
+preceded by the page sitting at 1×1 for its whole (short) life - not a crash loop.
+
+**Reading of the generation swap:** gen1 browser lived ~7-10 s from CDP-UP to disappearance with
+`exit(0)`; gen2 launched immediately and the client gave up ~14 s in (`socket disconnected` then
+`Shutdown`). Whether Steam's own logic terminates gen1 (a size/timeout check) or the page-1×1 wedges
+the UI bootstrap until Steam's watchdog quits is **still unproven** - but ordering is clear: the page
+is 1×1 from the first moment CDP can see it, i.e. **before** the replacement. The replacement is
+therefore *downstream* of the stalled first page, not its cause.
+
+**Branch chosen for the next step (STEP 5, evidence = branch C/E):** content exists but its
+delivery never starts because the web viewport is 1×1. Next targeted diagnostic, still via the same
+bounded CDP attach (one evaluate, no ops): read `window.outerWidth/outerHeight`,
+`document.documentElement.clientWidth/Height`, and install a 5 s `window.onresize` recorder to see
+whether a resize event ever reaches the page - distinguishing "CEF was never told" from "told but
+ignored". Only then revisit WSI/extent (and per §58, not `vk_wsi_force_swapchain_to_current_extent`
+until the login path is proven to use that surface).
+
+**Device restored to stock at session end** (probe shim + observers + ICD instrumented build removed;
+stock ICD `68f90ad8` verified; env deleted; logs archived not deleted).

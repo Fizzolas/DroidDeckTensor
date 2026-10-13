@@ -904,6 +904,8 @@ BUSCONF
         ( for _round in $(seq 1 12); do nap 4; \
             echo "== ui-probe round $_round DISPLAY=$DISPLAY =="; \
             /tmp/xinspect 2>&1 | grep -avE "^proot" | head -40; \
+            /tmp/proc_watch.sh 2>/dev/null; \
+            /tmp/cdp_watch.sh "$BL_CDP_PORT" 2>/dev/null; \
             if [ "${BL_XRESIZE:-0}" = 1 ] && { [ "$_round" = 3 ] || [ "$_round" = 5 ] || [ "$_round" = 7 ] || [ "$_round" = 9 ]; }; then echo "== xresize CAUSAL TEST round $_round =="; /tmp/xresize 2>&1 | head -20; fi; \
           done ) >> "$BL_LOG" 2>&1 &
       fi
