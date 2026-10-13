@@ -2884,3 +2884,86 @@ xinspect's rounds never saw any BP-sized/named X window. Both observations can b
 longer CDP uptime + same-round xinspect is needed to say whether the native BP window coexists with
 the hidden web view — i.e., whether "hidden" is CEF-side (window created, never activated) or the
 native window was never mapped at all.
+
+## 61. Sessions 21-23 (same-run correlation): BP web target ↔ native window PROVEN by PID+geometry+title; the page stays hidden at read time, the native window IS mapped/active, and the GPU process segfaults ~0.85 s after activation at BP's first raster (2026-10-13)
+
+Objective: correlate the BP browser target with its native window in ONE run and say why the
+document reports hidden. Tooling: CDP observer v7.2 (`hybshim/cdp/cdp_probe7.py`) + native
+observer `xinspect2` (`hybshim/x11/xinspect2.c`: fixes v1's ATOM-array mis-decode, adds parent,
+override-redirect, legacy WM_STATE, _NET_ACTIVE_WINDOW vs input focus as SEPARATE observations,
+plus a `--events` Create/Map/Unmap/Destroy/Reparent/Configure/Property tail; BadWindow races
+non-fatal). v7.2 spawns the event tail the same instant the BP attach succeeds, so web and X
+observations share one CLOCK_MONOTONIC line stream in `session.log`. Commits `057d488`,`7efbc7a`.
+
+**Session 21 (STOCK, v7.1 — run recorded as OBSERVER-DEFECTIVE, not merged):** two tooling bugs
+(mine, fixed in `7efbc7a`): CEF `/json/list` carries `"id"` not `"targetId"` → both pages hashed
+to key `"?"`, the BP page collided with the inspected controller and was never attached; and
+xinspect2 round 3 died via the default X error handler (update-UI window destroyed mid-walk,
+BadWindow serial 18), rounds 3-5 empty. Surviving evidence: xinspect2's first proper decodes —
+update-UI `0x800002` is **override-redirect=1, WM_STATE=Normal**; controller page visible at 1x1.
+PID-filtered fresh cef_log: GPU process `[9245]` exit_code=11 + 15x shared_image null-buffer —
+stock crash profile. Verdict: unusable for the BP question; NOT mixed into the stock conclusion.
+
+**Session 22 (STOCK, v7.2 — first clean correlation, crash-compressed):** attach-ok BP at
+mono=329023.98 (`about:blank?createflags=...` → title `Steam Big Picture Mode`):
+**hidden=true, vis=hidden, focus=false, inner=1280x800, outer=1280x800, dpr=1, readyState=complete,
+kids=1 childTags=["DIV#popup_target"], innerText len=0, all login markers 0.** The event tail then
+recorded, same stream: mono=329024.52 FOCUSDIFF **active=0x1a00033('Steam Big Picture Mode'/'steamwebhelper')
+input=0x1a00033** — the native BP window EXISTED, mapped, gamescope-activated ~0.54 s AFTER our
+hidden read; mono=329024.94 UNMAP+DESTROY 0x1a00033 (browser pid 20532 died: fresh cef_log
+[20532] GPU process exited exit_code=11 at the same instant; PID-filtered). The 6 s BP hold never
+completed a second readback (websocket died with gen1). V7EV/V7B exist only for the controller page
+(visible, 1x1, DIV#root — the SteamUI document).
+
+**Session 23 (separately labelled NULL-CREATE: padded probe shim `839ac0b4...` (2046456 B) at
+`steamrtarm64/libgbm.so.1`, `GBM_SHIM_MODE=nulldev` in env, cef_log truncated fresh, everything
+else identical to session 22):** THE decisive same-run capture:
+- mono=329687.98 attach-ok BP; 329688.02 **V7 BP: hidden=true, vis=hidden, focus=false,
+  inner=1281x800, outer=1280x800, readyState=complete, kids=1 DIV#popup_target, innerText len=0,
+  marks all 0** (identical shape to session 22 → not a one-run artifact).
+- 329688.01 event tail start. 329688.53 FOCUSDIFF **active=0x1c00033('Steam Big Picture Mode'/'steamwebhelper')**;
+  input focus = 0x1400006 (gamescope helper, revert-to-parent) — **X input focus NEVER entered the
+  BP window**; active-window and input-focus are different observations.
+- 329688.56 snapshot: **0x1c00033 par=0x310 2404x1080+0+0 d=32 or=0 VIEWABLE pid=26590
+  wmt=[_NET_WM_WINDOW_TYPE_NORMAL] wmst=Normal+0 'Steam Big Picture Mode'/'steamwebhelper'**, child
+  **0x1400005 par=0x1c00033 1280x800+0+0 d=32 VIEWABLE pid=26590** (no WM hints on the child).
+- **Association PROVEN three ways** (not title-match alone): (1) `_NET_WM_PID=26590` on both windows
+  = the steamwebhelper browser, and proc_watch's `cdpport=28386` line pins 26590 as the CDP endpoint
+  owner = the web-side browser process; (2) child window geometry 1280x800 == web outer 1280x800
+  (and inner 1281x800 = client-area +1 border pattern); (3) exact title + class at the same second.
+  Confidence: HIGH.
+- 329688.85: UNMAP+DESTROY 0x1c00033 — fresh cef_log: **[26590] 12x shared_image_interface_proxy
+  'Buffer handle is null' + one_copy_raster_buffer_provider staging failure, then gpu_process_host
+  exit_code=11** at 19:23:09.18, i.e. **~850 ms after the BP window mapped/activated**, precisely at
+  the first BeginFrame/raster of the BP view. Shim log: gbm_create_device->NULL both gens, no other
+  GBM entry reached (matches §58); the crash is NOT inside the shim — it is Chromium's shared-image
+  raster path. gen2 repeats the cycle (CREATE/CONFIG 329692-94), client exits rc=0 ~+14 s.
+
+**Reading (branches kept distinct, per STEP 5):** §60's config split collapses to one fact: the BP
+native window DOES coexist with the hidden web view — stock sessions 20/22 "no BP window seen" was
+sampling lifetime (window lives <1 s per gen, rounds are 4 s apart), exactly the "one-sample absence
+is not proof" caveat. Branch A (unmapped/minimized) is REFUTED: WM_STATE=Normal, mapped, active.
+Branch E (no association) is REFUTED: proven above. Between B and D: the page is hidden at read
+(+4 ms), activation lands +530 ms, and the gen dies +850 ms BEFORE any second visibility readback
+is possible — so "does activation flip hidden->visible" remains UNOBSERVED, and the binding
+constraint moved: **the GPU process segfaults at BP's first raster under BOTH stock and nulldev+
+stock-ICD** (identical shared_image null-buffer signature, PID-filtered fresh logs). Note §58's
+nulldev "GPU silent" was under the instrumented ICD `b1728201`; with the stock ICD `68f90ad8` the
+crash returns — the ICD/graphics variable is NOT closed after all, contradiction recorded, not
+harmonized. Login content: the BP page is an empty shell (`DIV#popup_target` container only, zero
+text) while the SteamUI/login document lives in the CONTROLLER page (DIV#root, visible 1x1, full
+JS boot per §60) — so "readyState=complete" on BP never implied login mount; it is the popup/
+backstack host, waiting to paint. Shutdown cause: NOT a watchdog claim — observed chain is GPU
+SIGSEGV at BP first-frame → web target + native window die with the gen → Steam's orderly
+`_exit(0)` recovery (~10-15 s, unchanged from session 13); the trigger of that chain is the crash.
+
+**Earliest divergence (this run):** between web attach (hidden, fine, activation pending) and
++850 ms: the BP view's first raster buffer creation fails (shared image null handle) and the GPU
+process segfaults. Responsible boundary: **Chromium GPU-process buffer/sharing path over our WSI**
+(§49-53 territory re-adjacent), not WM activation, not extent, not focus. Next fix candidate (one,
+reversible, labelled run): AHB shim `gbm_ahb.c` (the §50 artifact that cut crashes ~70->1 and hands
+Chromium a real gralloc dma-buf) under the SAME v7.2 observer set — does the BP gen now survive
+first-activation, does the second visibility readback (V7B BP) flip hidden->visible, do frames
+present. Rollback = delete `steamrtarm64/libgbm.so.1` (stock libgbm is at /usr/lib). Device restored
+to stock after sessions 21-23 and re-verified on-device: ICD `68f90ad8...`, libgbm `e28a74e1...`,
+no shim/env/observers, IDLE (sha256-checked same-day).
