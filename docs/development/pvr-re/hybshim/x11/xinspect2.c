@@ -26,6 +26,19 @@
 
 static Display *dpy;
 static Atom a_pid, a_nname, a_name, a_class, a_nstate, a_wmstate, a_wtype, a_act, a_utf8, a_wn;
+static volatile int xerrors = 0;
+
+/* The tree changes under us (clients die mid-walk: session 21 round 3 died on the destroyed
+ * update-UI window via the DEFAULT handler, which exits()). Ignore async errors; requests then
+ * fail their round trip and the walk simply moves on. */
+static int ignore_errors(Display *d, XErrorEvent *e) {
+    (void)d;
+    if (e->error_code != BadWindow && e->error_code != BadDrawable)
+        fprintf(stderr, "XERR code=%d req=%d.%d res=0x%lx\n", e->error_code,
+                e->request_code, e->minor_code, (unsigned long)e->resourceid);
+    xerrors++;
+    return 0;
+}
 
 static void mono(char *out, size_t n) {
     struct timespec ts;
@@ -210,6 +223,7 @@ static void events(int secs) {
 }
 
 int main(int argc, char **argv) {
+    XSetErrorHandler(ignore_errors);
     dpy = XOpenDisplay(NULL);
     if (!dpy) { printf("cannot open display\n"); return 1; }
     a_pid = XInternAtom(dpy, "_NET_WM_PID", False);

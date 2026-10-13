@@ -110,14 +110,18 @@ def describe(t):
     if url.startswith("about:blank") or "Gamepad" in title or "Big Picture" in title: return "BP"
     return "page"
 
+def tid_of(t):
+    ws = t.get("webSocketDebuggerUrl") or ""
+    return t.get("targetId") or t.get("id") or (ws.rsplit("/", 1)[-1] if ws else "?")
+
 def inspect(t, hold=6.0):
-    wsid = t.get("webSocketDebuggerUrl"); tid = t.get("targetId", "?")[:10]
+    wsid = t.get("webSocketDebuggerUrl"); tid = tid_of(t)[:10]
     kind = describe(t)
-    if not wsid: p("attach-skip", kind, tid); return None
-    s = None
-    for k in range(10):
+    if not wsid: p("attach-skip", kind, tid, "no-ws-url"); return None
+    s = None; tend = time.time() + 4.0 if kind == "BP" else time.time() + 3.0
+    while time.time() < tend:
         try: s = WS(wsid); break
-        except Exception: time.sleep(0.3)
+        except Exception: time.sleep(0.15)
     if s is None: p("attach-fail", kind, tid); return None
     p("attach-ok", kind, tid, str(t.get("title", ""))[:34], san(t.get("url", ""))[:56])
     if kind == "BP": spawn_events(25)
@@ -155,12 +159,12 @@ def main():
         if now_up and isinstance(lst, list):
             pages = [t for t in lst if t.get("type") == "page"]
             kinds = sorted(describe(t) for t in pages)
-            cur = set(t.get("targetId", "?") for t in pages)
+            cur = set(tid_of(t) for t in pages)
             for tid in list(known):
                 if tid not in cur: p("T-GONE", tid[:10], known[tid][0]); known.pop(tid)
             p("LIST", "pages=%d" % len(pages), ",".join(kinds))
             for t in pages:
-                tid = t.get("targetId", "?")
+                tid = tid_of(t)
                 if tid not in known:
                     kind = describe(t)
                     known[tid] = (kind, t)
