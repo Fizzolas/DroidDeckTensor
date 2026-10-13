@@ -2727,7 +2727,7 @@ cleared, all probe binaries removed).
 Built one probe shim (`hybshim/gbm/gbm_probe.c`, exports a superset of stock libgbm's 38 `gbm_*`
 symbols, verified with llvm-nm; mode selected at load by env `GBM_SHIM_MODE=nulldev|stub` so both
 runs use the **byte-identical artifact** `73bde3bc...` padded to 2046456, same instrumented ICD
-`b1728201...`, same gated `BL_UI_PROBE` script `f64e72f3...` - matched control, one variable).
+`b1728201...`, same staged probe script (both runs launched from the one 14:46 APK build; `BL_XRESIZE` unset and `/tmp/xresize` absent, so no X writes in either run) - matched control, one variable).
 Shim log = epoch-ms + pid.tid + comm/role + caller module+file-offset (dladdr) + args + return +
 errno, at `/root/.local/share/Steam/logs/gbma.log` (O_CLOEXEC; caller fds only readlink'd, never
 closed). Device/observer hashes recorded; rollback = delete the file (stock libgbm is in /usr/lib).
