@@ -2857,8 +2857,12 @@ been removed) — so everything here is independent of GBM and of the shim matri
 Gamepad", the same window whose X top-level was `0x1c00033` VIEWABLE in §56/§59 — the
 1280x800 children). It has real geometry (1280x800), loaded document, and a populated bridge — but
 **Chromium considers it HIDDEN**, and Chromium does not produce frames for hidden renderers. That
-connects §56's "window VIEWABLE but no swapchain for it": the page exists on the web side,
-visibility is the blocker; the X focus/configure chain is the remaining boundary (gamescope's WM
+connects §56's "no swapchain for it": the page exists on the web side, visibility is the
+blocker. **Within session 20's own run** (xinspect rounds + the attach above), no X top-level of
+1280x800/1281x800 and no window named 'Steam Big Picture Mode' ever existed in the tree the whole
+session - only the root (2404x1080) and the update UI - while the web side held a *hidden*,
+loaded, 1280x800 BP view. CEF believes the widget is 1280x800-but-hidden; the WM never received
+(or refused to map) that window. So BP-window creation between controller and X11 is the gap; the X focus/configure chain is the remaining boundary (gamescope's WM
 never makes it the focus window — `== focused app: none` in every session).
 
 **Correction/retirement of §59's framing:** the 1×1 SharedJSContext screenshot/geometry was NOT the
