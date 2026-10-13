@@ -2854,8 +2854,7 @@ been removed) — so everything here is independent of GBM and of the shim matri
    bridge: `SteamClient.{_internal,Browser,OpenVR,Input,Window,Compat,BrowserView}`.
 
 **So:** the login/Big-Picture renderer DOES get created (CEF `browserType=4`, UA "Valve Steam
-Gamepad", the same window whose X top-level was `0x1c00033` VIEWABLE in §56/§59 — the
-1280x800 children). It has real geometry (1280x800), loaded document, and a populated bridge — but
+Gamepad"). It has real geometry (1280x800), loaded document, and a populated bridge — but
 **Chromium considers it HIDDEN**, and Chromium does not produce frames for hidden renderers. That
 connects §56's "no swapchain for it": the page exists on the web side, visibility is the
 blocker. **Within session 20's own run** (xinspect rounds + the attach above), no X top-level of
@@ -2875,3 +2874,13 @@ instrumentation (single variable, next session): X `CreateNotify/ConfigureNotify
 `_NET_ACTIVE_WINDOW`/WM_STATE deltas around the BP window from the moment it is created, plus
 Chromium-side visibility reasons — not a WSI extent change (§58/§59 warnings stand: the BP view
 already has geometry; extent hacks would not touch visibility).
+
+**Association caveat + config split (proven/inferred boundary).** The link "BP web view ↔
+`0x1c00033` X window" is **inferred** (title/class match), not proven: sessions §56/§58 ran WITH the
+nulldev shim, where xinspect saw the BP X window VIEWABLE (2404x1080) but CDP showed only the
+controller page; session 20 ran STOCK, where CDP showed the BP web view (hidden, 1280x800) while
+xinspect's rounds never saw any BP-sized/named X window. Both observations can be lifecycle races
+(attach-fails were real: `handshake-closed` on second pages in 17/18). A single stock run with
+longer CDP uptime + same-round xinspect is needed to say whether the native BP window coexists with
+the hidden web view — i.e., whether "hidden" is CEF-side (window created, never activated) or the
+native window was never mapped at all.
