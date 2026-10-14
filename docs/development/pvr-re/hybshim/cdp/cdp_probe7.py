@@ -109,7 +109,10 @@ def describe(t):
     url = t.get("url", ""); title = str(t.get("title", ""))
     if "SharedJSContext" in title: return "controller"
     if url.startswith("about:blank") or "Gamepad" in title or "Big Picture" in title: return "BP"
-    return "page"
+    # Arm-A run 26 showed the second page appears with EMPTY title+url (attach raced before CEF
+    # mutates them). There are only ever two page targets: controller + the BP view. Classify any
+    # non-controller page as BP so it gets the 6 s hold and the native event tail.
+    return "BP"
 
 def tid_of(t):
     ws = t.get("webSocketDebuggerUrl") or ""
