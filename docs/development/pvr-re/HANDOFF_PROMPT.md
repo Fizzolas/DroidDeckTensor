@@ -130,6 +130,59 @@ branch D, compositor path), or stay hidden (→ branch B, CEF visibility propaga
 delete `steamrtarm64/libgbm.so.1`. Device is STOCK + clean (ICD `68f90ad8…`, libgbm `e28a74e1…`,
 no shim/env/observers, IDLE — sha256-verified on-device 2026-10-13 after session 23).
 
+### UPDATE 2026-10-13g (sessions 29-34, §63) — read this FIRST; 13f's instrumented-ICD hypothesis is DEADLINE-tested and RETIRED
+
+**Matched ICD A/B (§63 STEP 1-2), four clean alternating runs + two labelled crash-capture runs,
+one variable (ICD file only), everything else byte-fixed (nulldev shim `839ac0b4`, v7.6 observers,
+same env):** **the shipped-vs-instrumented contrast does not exist.** Both arms die the same way:
+BP window CREATE/MAP ~+550 ms after web attach, gamescope activates it, UNMAP+DESTROY +0.4–1.0 s,
+web target dies with it (`V7M-fail ('Runtime.evaluate','io')` recorded AS death). `exit_code=11`
+log-line presence varies per run (r29/33/34 yes, r30/31/32 zero fresh-log), the DEATH does not —
+`-startcount=1` relaunch in every arm. The §58 "instrumented ICD → 30 s silent gen" result is
+**retired for the current configuration** (recorded deltas: §58's shim built `73bde3bc` vs today's
+`839ac0b4` same-source rebuild; no v7-era BP CDP attach existed there). Load was proven per-run by
+stderr signature (`pvr_wsi[pid]:` vs `pvr_wsi:`), not by installed hash. Audit detail: the arms
+are NOT "logging only" — A's caps path adds a per-call xcb round-trip for X11 surfaces (§63 STEP 1).
+
+**STEP 3 answered, the big open question CLOSED: activation DOES flip BP visible.** With the 0.35 s
+multi-read (v7.6 `V7M`): `V7 hidden/hidden/1281x800` at attach → **+0.5–0.7 s `V7M1
+hidden=false vis=visible focus=TRUE`** in every run reaching it (29–34). Branch B (stays-hidden)
+**refuted**. The BP page is a visible, focused, EMPTY shell at death: `kids=1 DIV#popup_target`,
+innerText len=0, zero login markers — and NO swapchain was ever created for a BP-window surface in
+any arm (the instrumented logs would show it; they show only update-UI 2404x1080, 1x1 probes,
+64x24, 32x32). So the wall is strictly: **GPU process dies at BP first composite → no frames for a
+visible, correctly-sized page.** Login content itself lives in the controller page (unchanged).
+
+**STEP 5 crash capture (labelled runs 33/34, crashcatch extended: per-pid files +
+install-at-load `cad6dd4`):** captured cleanly: Xwayland teardown fault (known §47) and a NEW
+reproducible crash — Steam's `vulkandriverquery` children SIGSEGV `si_addr=0x308` with pc/lr both
+in **bionic libc** (pc file-off `0x80944`=`__errno+0x34` region, lr `0x91c54`=`__open_2+0x54`;
+libc pulled base64-verified and symbolized via dynsym). The **GPU process fault itself remains
+UNCAPTURED — with the mechanism now measured**: r34 logged 159 `Buffer handle is null` then GPU
+`exit_code=11` with NO crash.txt for that pid; the GPU process is forked from the Chromium zygote,
+which resets signal dispositions after fork, and (breakpad disabled) never re-arms via sigaction —
+so LD_PRELOAD load-time handlers structurally cannot reach it. Honest negative, not silence.
+
+**NEXT (priority order, per §63 STEP 6):**
+1. **Capture the GPU-process fault.** Extend crashcatch to survive the zygote reset: the practical
+   in-guest hook is wrapping `clone()`/`fork()` in the preload to re-install handlers in the child
+   (sigaction-wrap alone won't fire — the child never calls it, and the reset isn't a sigaction
+   with non-DFL handler). Alternative: `PR_SET_PDEATHSIG`-style ptrace is unavailable; a
+   `LD_PRELOAD` `sigaction` wrapper that ALSO treats `SIG_DFL` registrations as re-front points
+   (current code skips exactly that case). Labelled run only, then symbolize pc/lr against the
+   pulled libc + guest modules to answer: libcef vs our ICD/WSI vs HAL.
+2. Attach-off control run (does CDP attach's own first-frame request influence composite timing?
+   all §63 runs attached).
+3. Only after localization: a targeted fix at the proven fault site. NOT queued: extent knobs,
+   focus forcing, AHB shim (13f failed), broad flags.
+
+Device state note (accuracy): sessions 33-34 ran with **arm B ICD `68f90ad8` + nulldev shim +
+crashcatch**; the rollback command ran while the device was flapping and FAILED (no devices/
+emulators). Until re-verified on device, assume the shim, libhybris/q.so copies, observers,
+crashcatch.so and `/sdcard/Download/droiddeck-env` are STILL INSTALLED. The completed rollback +
+hash verification (ICD `68f90ad8`, no `steamrtarm64/libgbm.so.1`, tmp clean, env absent, IDLE) is
+recorded below once confirmed on-device.
+
 ### UPDATE 2026-10-13f (sessions 24-25, §62) — read this FIRST; the STEP 6 intervention ran, FAILED, and is rolled back
 
 **The one permitted causal intervention (AHB shim `a75d1af0…` + hybris `058bdaed…`/`q.so ba9b7904…`
