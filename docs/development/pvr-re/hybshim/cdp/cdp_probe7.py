@@ -190,11 +190,12 @@ def main():
                 if tid not in known:
                     kind = describe(t)
                     known[tid] = (kind, t)
-                    # v6's guard, restored: an io exception inside inspect must not kill the whole
-                    # observer (sessions 22/23/25 lost all later rounds to an unguarded send).
-                    try: inspect(t, hold=(6.0 if kind == "BP" else 1.5))
+                    # Runs 27/28: LIST polling is frozen during any inspect() — the BP page lived
+                    # ~2 s and died unlisted. Controller: one read, ~0.3 s. BP: V7 + first multi-read
+                    # happen BEFORE the hold loop (they cost ~0.1 s), then LIST resumes every 0.2 s.
+                    try: inspect(t, hold=(2.0 if kind == "BP" else 0.3))
                     except Exception as e: p("inspect-exc", kind, tid, repr(e)[:70])
-        time.sleep(0.5)
+        time.sleep(0.2)
     p("done")
 
 if __name__ == "__main__": main()
