@@ -3101,3 +3101,12 @@ armed; until the completed cleanup is verified on-device, assume the shim, libhy
 observers, crashcatch.so, and Download/droiddeck-env are STILL INSTALLED. The verified rollback
 (ICD hash re-check, steamrtarm64 clean, /tmp clean, env absent, session IDLE) is recorded in
 UPDATE 13g's closing paragraph with the command outputs.
+
+**63-addendum (vulkandriverquery backtrace, symbolized after fixing the stack-word regex - crashcatch
+writes 0x-prefixed tokens):** fault path: vulkendriverquery+0x3458/0x349c -> glibc ->
+libvulkan.so.1+0x307e0 -> **our ICD/WSI region (vkEnumerate*/instance path) -> libhybris.so+0x2c4e4
+-> HAL vulkan.powervr.so entries at file offsets 0xd5a10, 0xdcf08/0xdcf2c/0xdd000 -> bionic
+__open_2/errno helper -> SIGSEGV at 0x308.** So Steam's GPU driver query crashes inside the bionic
+HAL while enumerating/opening something (probably a sysfs/drm path) through our hybris bridge -
+a SECOND, independent fault, distinct from the GPU-process composite crash (whose capture is fixed
+in e15bead and awaits a labelled run).
