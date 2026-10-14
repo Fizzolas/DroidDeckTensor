@@ -106,13 +106,13 @@ def spawn_events(secs=25):
         p("EV-SPAWN-FAIL", repr(e)[:60]); return "fail"
 
 def describe(t):
+    # LIST-time facts (run 27 lesson: title can be EMPTY on the first list; the controller then
+    # must be told apart by URL): controller url = steamloopback.host; BP url = about:blank?...
     url = t.get("url", ""); title = str(t.get("title", ""))
     if "SharedJSContext" in title: return "controller"
     if url.startswith("about:blank") or "Gamepad" in title or "Big Picture" in title: return "BP"
-    # Arm-A run 26 showed the second page appears with EMPTY title+url (attach raced before CEF
-    # mutates them). There are only ever two page targets: controller + the BP view. Classify any
-    # non-controller page as BP so it gets the 6 s hold and the native event tail.
-    return "BP"
+    if "steamloopback.host" in url: return "controller"
+    return "BP"   # anything else non-controller: give it the long hold + native tail
 
 def tid_of(t):
     ws = t.get("webSocketDebuggerUrl") or ""
@@ -142,12 +142,30 @@ def inspect(t, hold=6.0):
     if r0[0] == "OK": p("V7", kind, red(str(r0[1].get("result", {}).get("value"))[:560]))
     else: p("V7-fail", kind, r0[1:])
     if r1[0] == "OK": p("V7TXT", kind, red(str(r1[1].get("result", {}).get("value"))[:260]))
-    end = min(time.time() + hold, DEADLINE)
-    while time.time() < end: time.sleep(0.5)
+    # Multi-read (STEP 3): native BP death lands ~0.4-0.9 s after activation (runs 23/27), so read
+    # visibility repeatedly on a fast cadence instead of one delayed read. V7M-fail lines are
+    # informative: an io error here = target/generation died between reads (NOT "still hidden").
+    t0 = time.time()
+    next_read = t0 + 0.35
+    end = min(t0 + hold, DEADLINE)
+    n = 0
+    while time.time() < end:
+        if time.time() >= next_read:
+            n += 1
+            rm = call(s, "Runtime.evaluate", {"expression": READ, "returnByValue": True}, timeout=1.5)
+            if rm[0] == "OK": p("V7M%d" % n, kind, red(str(rm[1].get("result", {}).get("value"))[:300]))
+            else:
+                p("V7M%d-fail" % n, kind, str(rm[1:])[:60])
+                if str(rm[1:]).startswith("('io'") or "'io'" in str(rm[1:]): break
+            next_read = time.time() + 0.35
+        else:
+            time.sleep(0.1)
     r = call(s, "Runtime.evaluate", {"expression": EVS, "returnByValue": True}, timeout=3)
     if r[0] == "OK": p("V7EV", kind, red(str(r[1].get("result", {}).get("value"))[:400]))
+    else: p("V7EV-fail", kind, str(r[1:])[:60])
     r = call(s, "Runtime.evaluate", {"expression": READ, "returnByValue": True}, timeout=3)
     if r[0] == "OK": p("V7B", kind, red(str(r[1].get("result", {}).get("value"))[:300]))
+    else: p("V7B-fail", kind, str(r[1:])[:60])
     try: s.s.close()
     except Exception: pass
     return kind
