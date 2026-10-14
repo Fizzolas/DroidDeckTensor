@@ -3017,3 +3017,87 @@ not with the shim mode. The instrumented ICD differs from stock only by per-PID 
 we already know keeps the BP gen alive long enough**: nulldev shim + instrumented ICD + v7.3
 observer with a SHORT first hold and a second readback (+2 s, +4 s) inside the observed ~900 ms-10 s
 window. That is the single next run; no new flags, same one-variable discipline.
+
+## 63. Matched ICD A/B (sessions 29-32) + labelled crash capture (33-34): the shipped-vs-instrumented contrast does NOT exist; activation DOES flip BP visible; GPU-process death is universal at first BP composite (2026-10-13)
+
+Objective: establish whether the ICD artifact controls CEF GPU-process survival, completing the BP
+visibility readback if it survives. All runs: NULL-create shim 839ac0b4 (padded), same v7.6
+observers, same env (BL_UI_PROBE=1 GBM_SHIM_MODE=nulldev HYBRIS_LINKER_DIR=...), same session
+build; ONLY the ICD file at files/linux_vulkan_drivers/powervr-g5x/libvulkan_powervr.so differed.
+
+**STEP 1 audit (actual artifacts, not assumed):** Arm A b1728201 = HEAD pvr_wsi.c (commit add0052);
+Arm B 68f90ad8 = e60ba95 pvr_wsi.c, rebuilt in-tree and byte-identical to the shipped file;
+pvr_icd.c, pvr_wsi.h, protocols, build_icd.sh, zig target/flags identical. The diff is: log-macro
+gains pid prefix; caps logging moved from once-per-process to EVERY call, and for X11 surfaces the
+log path performs an extra xcb_get_window_attributes round-trip per caps query (a NON-diagnostic
+behavioural addition - not "logging only"); single log lines at create/destroy/get_images/acquire/
+present entry. Dependencies/load env identical (support libs 058bdaed/ba9b7904, same icd.json).
+Actual-load proof per run used the stderr signature, not the installed hash: A prints
+"pvr_wsi[pid]: caps: surf=... map=..." (r29: 15 prefixed lines, 0 old-format); B prints old-format
+"pvr_wsi: caps:" (r30: 6 old lines, 0 prefixed).
+
+**STEP 2 matched sequence A,B,A,B (runs 29,30,31,32; precursors 27,28=A):** Primary outcome:
+the GPU process survives BP map+activation in NEITHER arm. Every run: BP native window CREATE/MAP
+~+550 ms after web attach, gamescope activation lands (r27/r31: X INPUT FOCUS lands ON the BP
+window itself, input=0x2a00033 revert=0), then UNMAP+DESTROY +0.4-1.0 s; CDP-DOWN with it;
+"V7M-fail ... ('Runtime.evaluate','io')" = target/generation death recorded AS death, not as
+"still hidden". GPU "exited unexpectedly exit_code=11" logged in r29,r33,r34 (pids 21690,16397)
+but 0 such lines in r30,r31,r32 fresh logs - the exit-LINE varies, the DEATH does not: Steam
+relaunches webhelper with -startcount=1 in all arms within seconds. Verdict: the 62 crash-vs-
+silent contrast was NOT reproducible and does not control survival. 58's "instrumented ICD keeps
+the gen alive 30 s" is retired for the current config; differences recorded honestly (58 used a
+shim build hashing 73bde3bc vs today's 839ac0b4 rebuild of the same source, and no v7-era BP
+attach was performed there). One caveat for the next cycle: all four matched runs attached the BP
+page via CDP; an attach-triggered first-composite remains a possible common cause, separable by
+an attach-off control arm.
+
+**STEP 3 readback COMPLETED - the open question answered:** with a 0.35 s multi-read cadence the
+flip is captured in EVERY run that reached it (r29-34): V7 at attach shows hidden/hidden/focus=
+false 1281x800, and V7M1 at +0.5-0.7 s shows **hidden=false vis=VISIBLE focus=TRUE**, same
+1281x800, readyState=complete, kids=1 DIV#popup_target, innerText len=0, marks all 0 - right
+before target death. _NET_ACTIVE_WINDOW activation DOES flip the BP document hidden->visible and
+Chromium grants it document focus: branch B ("stays hidden") is REFUTED. Login content is absent
+at the visible instant, but that is the same instant the GPU process dies; no swapchain was ever
+created for the BP surface in ANY run (the instrumented arm logs every create_swapchain - sizes
+seen: 2404x1080 update-UI, 1x1 probes, 64x24, 32x32 utility; never a BP-window surface). The
+controller page stays visible-1x1 throughout (normal, 60).
+
+**STEP 5 labelled crash-capture (r33,r34; never mixed into the A/B table):** crashcatch extended
+(per-pid report files; install-at-load for fatal signals, since the GPU process runs
+--disable-breakpad and the sigaction-wrap design waits for an app registration that never comes).
+Captured with siginfo+registers+stack-scan+maps:
+1. crash.txt-15507 comm=Xwayland SIGSEGV si_addr=0xfffffffffffffff0 pc=0x3f00010648 - the known
+   Mesa/gallium teardown fault (47), benign, session end.
+2. crash.txt-16504/16509 comm=vulkandriverquery (Steam's own GPU driver-query child; main
+   executable steamrtarm64/vulkandriverquery per its maps) SIGSEGV si_addr=0x308 (NULL+0x308),
+   pc AND lr both in bionic libc (pulled /apex/com.android.runtime/lib64/bionic/libc.so, base64-
+   verified, 1375440 B): pc file-offset 0x80944 = __errno+0x34 region (nearest dynsym; an errno/
+   TLS helper), lr 0x91c54 = __open_2+0x54 return site - the query process faults dereferencing a
+   bad pointer on an open/errno path. NEW, reproduced 2/2 in r34.
+3. The GPU-process fault itself: STILL NOT CAPTURED, mechanism now measured. r34 logs GPU exit 11
+   at 21:24:47 (same instant as V7M2-fail) preceded by 159 "Buffer handle is null" attempts, yet
+   NO crash.txt for the gpu pid exists. Consistent explanation (54 + this run): the GPU process is
+   forked from the Chromium zygote, whose fork path resets signal dispositions in the child; an
+   LD_PRELOAD load-time handler does not survive into it, and the breakpad-disabled child never
+   calls sigaction for SIGSEGV - preload capture cannot reach it as designed. Honest negative
+   result. Recorded next capture variant (NOT run): intercept the DISPOSITION RESET too (wrap
+   clone/fork paths is not feasible; instead have the shim's constructor install handlers AND wrap
+   execve-scope... practical option: wrap sigaction to re-front even when act->sa_handler==SIG_DFL
+   - today the wrapper skips exactly that case).
+
+**STEP 6 reading + next step from evidence:** branch "both crash" holds - the stable-build
+assumption is retired; follow the fault. Device-frame work sequences AFTER GPU-process survival:
+first BP frames require the GPU process to live past first composite, which happens in NO
+configuration tried today (stock; nulldev x either ICD; AHB dies earlier). Evidence points at
+Chromium's shared-image/raster path dereferencing a null handle (159 attempts -> SIGSEGV) over this
+node's no-GBM/no-GEM export, plus Steam's vulkendriverquery crash as a secondary, newly localized
+fault. Priority order: (1) gpu-process capture fix in crashcatch (handle the SIG_DFL re-registration
+case) in a labelled run, to localize libcef vs our ICD/WSI vs HAL; (2) attach-off control run;
+(3) then a targeted code fix at the proven site. No WSI extent, no focus, no new GBM matrices.
+
+**Rollback/cleanup status (accurate):** the first rollback command ran while the device was flaking
+off USB and FAILED. Runs 33-34 executed with arm B ICD (68f90ad8) + nulldev shim + crashcatch + env
+armed; until the completed cleanup is verified on-device, assume the shim, libhybris/q.so copies,
+observers, crashcatch.so, and Download/droiddeck-env are STILL INSTALLED. The verified rollback
+(ICD hash re-check, steamrtarm64 clean, /tmp clean, env absent, session IDLE) is recorded in
+UPDATE 13g's closing paragraph with the command outputs.
