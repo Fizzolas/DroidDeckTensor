@@ -39,6 +39,14 @@ static int fd = -1;
 /* The process's own handler for each signal we wrap, so it still runs after the report. */
 static struct sigaction app_act[NSIG];
 static volatile sig_atomic_t have_app[NSIG];
+/* Run 34 lesson: we install at load, but the Chromium zygote child resets fatal signals to
+ * SIG_DFL through sigaction() - and the wrapper used to PASS THROUGH that reset, un-installing
+ * us before the fault ever happened (captured: vulkendriverquery dies with reports - it execs,
+ * so the constructor re-runs after the reset; the GPU process forks without exec and never
+ * reports). We track which signals we own and RE-FRONT ourselves when someone sets them to
+ * DFL/IGN. The chain target becomes the requested disposition; after reporting we still re-raise
+ * or _exit(139) as before. */
+static volatile sig_atomic_t we_own[NSIG];
 
 static void w(const char *s) { if (fd >= 0) { ssize_t r = write(fd, s, strlen(s)); (void)r; } }
 static void wc(int c) { if (fd >= 0) { char b = (char)c; ssize_t r = write(fd, &b, 1); (void)r; } }
@@ -71,6 +79,9 @@ static void handler(int sig, siginfo_t *si, void *ctx) {
             w("comm=");
             { int cf = open("/proc/self/comm", O_RDONLY); if (cf >= 0) { char cb[64]; ssize_t cn = read(cf, cb, sizeof(cb)); close(cf);
                 if (cn > 0) { if (cb[cn-1] == 10) cn--; ssize_t r = write(fd, cb, (size_t)cn); (void)r; } } }
+            w("  role/cmdline=");
+            { int cf = open("/proc/self/cmdline", O_RDONLY); if (cf >= 0) { char cb[4096]; ssize_t cn = read(cf, cb, sizeof(cb)); close(cf);
+                if (cn > 0) { for (ssize_t i = 0; i < cn; i++) if (cb[i] == 0 || cb[i] == 10) cb[i] = ' '; cb[cn-1] = 0; ssize_t r = write(fd, cb, (size_t)cn); (void)r; } } }
             w("  caught signal "); wd(sig);
             w("  si_addr="); wx((unsigned long long)(uintptr_t)(si ? si->si_addr : 0));
             w("  tid="); wd((long long)syscall(SYS_gettid));
@@ -191,12 +202,25 @@ static void handler(int sig, siginfo_t *si, void *ctx) {
             if (fd >= 0) { close(fd); fd = -1; }
         }
     }
-    /* Let the process die the way it would have: restore its own handler and re-raise. */
-    if (have_app[sig]) {
-        sigaction(sig, &app_act[sig], NULL);
-        raise(sig);
-        /* A handler that returns (breakpad's usually does not) falls through to the default. */
-        signal(sig, SIG_DFL);
+    /* Let the process die the way it would have. Restore through the REAL sigaction: going
+     * through our own wrapper would re-front us (we still own this signal) and with SA_NODEFER
+     * the re-raise would re-enter this handler forever. A recorded SIG_DFL (the reset-capture
+     * case) restores plain default death -> the parent still sees exit_code=11. */
+    {
+        static int (*real_sa)(int, const struct sigaction *, struct sigaction *);
+        if (!real_sa) real_sa = (int (*)(int, const struct sigaction *, struct sigaction *))dlsym(RTLD_NEXT, "sigaction");
+        struct sigaction dfl;
+        memset(&dfl, 0, sizeof dfl);
+        dfl.sa_handler = SIG_DFL;
+        we_own[sig] = 0;
+        if (have_app[sig]) {
+            real_sa(sig, &app_act[sig], NULL);
+            raise(sig);
+            /* A handler that returns (breakpad's usually does not) falls through to the default. */
+            real_sa(sig, &dfl, NULL);
+        } else {
+            real_sa(sig, &dfl, NULL);
+        }
         raise(sig);
     }
     _exit(139);
@@ -219,16 +243,32 @@ int sigaction(int signum, const struct sigaction *act, struct sigaction *oldact)
         for (char *q = comm; *q; q++) if (*q == 10) { *q = 0; break; }
         mine = strcmp(comm, "steam") == 0 || getenv("CRASHCATCH_ALL") != NULL;
     }
-    if (mine && signum > 0 && signum < NSIG && is_fatal(signum) && act && act->sa_handler != SIG_DFL && act->sa_handler != SIG_IGN) {
-        /* The process wants a handler for a fatal signal - keep it, and put ours in front of it. */
-        app_act[signum] = *act;
-        have_app[signum] = 1;
-        struct sigaction mine;
-        memset(&mine, 0, sizeof(mine));
-        mine.sa_sigaction = handler;
-        mine.sa_flags = SA_SIGINFO | SA_NODEFER;
-        sigemptyset(&mine.sa_mask);
-        return real(signum, &mine, oldact);
+    if (mine && signum > 0 && signum < NSIG && is_fatal(signum) && act) {
+        if (act->sa_handler != SIG_DFL && act->sa_handler != SIG_IGN) {
+            /* The process wants a handler for a fatal signal - keep it, and put ours in front. */
+            app_act[signum] = *act;
+            have_app[signum] = 1; we_own[signum] = 1;
+            struct sigaction mm;
+            memset(&mm, 0, sizeof(mm));
+            mm.sa_sigaction = handler;
+            mm.sa_flags = SA_SIGINFO | SA_NODEFER;
+            sigemptyset(&mm.sa_mask);
+            return real(signum, &mm, oldact);
+        }
+        if (we_own[signum]) {
+            /* A reset of a signal we had installed (zygote child SignalActions::Reset sets fatal
+             * signals to SIG_DFL after fork; run 34 proved passing this through un-installs us
+             * before the GPU process can ever fault). Keep the requested disposition as the chain
+             * target and re-front ourselves; death-after-report still happens via the tail. */
+            struct sigaction want = *act;   /* records SIG_DFL/SIG_IGN handler + flags */
+            app_act[signum] = want; have_app[signum] = 1;
+            struct sigaction mm;
+            memset(&mm, 0, sizeof(mm));
+            mm.sa_sigaction = handler;
+            mm.sa_flags = SA_SIGINFO | SA_NODEFER;
+            sigemptyset(&mm.sa_mask);
+            return real(signum, &mm, oldact);
+        }
     }
     return real(signum, act, oldact);
 }
@@ -251,7 +291,7 @@ __attribute__((constructor)) static void install(void) {
             mine.sa_sigaction = handler;
             mine.sa_flags = SA_SIGINFO | SA_NODEFER;
             sigemptyset(&mine.sa_mask);
-            if (real(sig, &mine, &old) == 0) { app_act[sig] = old; have_app[sig] = (old.sa_sigaction != NULL); }
+            if (real(sig, &mine, &old) == 0) { app_act[sig] = old; have_app[sig] = (old.sa_sigaction != NULL); we_own[sig] = 1; }
         }
     }
     int f = open("/tmp/crashcatch.loaded", O_WRONLY | O_CREAT | O_TRUNC, 0644);
