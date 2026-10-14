@@ -62,7 +62,9 @@ static void fsync_out(void) { if (fd >= 0) fsync(fd); }
 static void handler(int sig, siginfo_t *si, void *ctx) {
     if (!entered) {
         entered = 1;
-        fd = open(OUT, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+        char path[64];
+        snprintf(path, sizeof path, "%s-%d-%d.txt", OUT, (int)getpid(), sig);
+        fd = open(path, O_WRONLY | O_CREAT | O_TRUNC, 0644);
         if (fd >= 0) {
             ucontext_t *uc = (ucontext_t *)ctx;
             mcontext_t *m = uc ? &uc->uc_mcontext : NULL;
@@ -232,9 +234,26 @@ int sigaction(int signum, const struct sigaction *act, struct sigaction *oldact)
 }
 
 __attribute__((constructor)) static void install(void) {
-    /* No handler of our own yet - sigaction() above installs it the moment the process asks for one,
-     * which is what makes this survive breakpad's later call. Mark loaded so a log shows the shim is
-     * in the process. */
+    /* Historically we installed NOTHING here and let the process ask first (the sigaction wrap
+     * survives breakpad). Run 33 showed why that misses the GPU process: it runs
+     * --disable-breakpad and never registers a fatal handler, so SIGSEGV went to the default
+     * action with no wrapper in place (exit_code=11 as observed by the browser). For the labelled
+     * crash-capture runs, install our handler directly at load, keeping whatever is there (NULL
+     * in practice for this process) as the chain target. The sigaction wrapper still re-fronts
+     * us if the app later installs its own. */
+    if (getenv("CRASHCATCH_ALL") || 1) {   /* preload is the scoping; this build is opt-in by file */
+        static int (*real)(int, const struct sigaction *, struct sigaction *);
+        if (!real) real = (int (*)(int, const struct sigaction *, struct sigaction *))dlsym(RTLD_NEXT, "sigaction");
+        for (int sig = 1; sig < NSIG; sig++) {
+            if (!is_fatal(sig)) continue;
+            struct sigaction mine, old;
+            memset(&mine, 0, sizeof(mine));
+            mine.sa_sigaction = handler;
+            mine.sa_flags = SA_SIGINFO | SA_NODEFER;
+            sigemptyset(&mine.sa_mask);
+            if (real(sig, &mine, &old) == 0) { app_act[sig] = old; have_app[sig] = (old.sa_sigaction != NULL); }
+        }
+    }
     int f = open("/tmp/crashcatch.loaded", O_WRONLY | O_CREAT | O_TRUNC, 0644);
     if (f >= 0) { ssize_t r = write(f, "loaded\n", 7); (void)r; close(f); }
 }
