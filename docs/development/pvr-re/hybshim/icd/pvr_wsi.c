@@ -641,17 +641,22 @@ static VkResult wsi_queue_present(VkQueue queue, const VkPresentInfoKHR *pi) {
             continue;
         }
         if (!surf->dmabuf || sc->images[idx].fd < 0) { if (pi->pResults) pi->pResults[i] = VK_ERROR_SURFACE_LOST_KHR; continue; }
-        /* A buffer for this image that the compositor has not released yet: drop our reference
-         * (destroying it also frees the binding the release listener would have) so the slot is ours. */
-        if (sc->images[idx].buffer) { wl_buffer_destroy(sc->images[idx].buffer); sc->images[idx].buffer = NULL; }
-        struct zwp_linux_buffer_params_v1 *params = zwp_linux_dmabuf_v1_create_params(surf->dmabuf);
-        zwp_linux_buffer_params_v1_add(params, sc->images[idx].fd, 0, 0, sc->stride, 0, 0);
-        struct wl_buffer *buf = zwp_linux_buffer_params_v1_create_immed(params, sc->width, sc->height, sc->drm_format, 0 /* LINEAR modifier */);
-        zwp_linux_buffer_params_v1_destroy(params);
-        if (!buf) { if (pi->pResults) pi->pResults[i] = VK_ERROR_OUT_OF_HOST_MEMORY; continue; }
-        struct wsi_buffer_binding *b = calloc(1, sizeof(*b)); b->sc = sc; b->index = idx;
-        sc->images[idx].buffer = buf;
-        wl_buffer_add_listener(buf, &g_buffer_listener, b);
+        /* One wl_buffer per swapchain image, reused for that image's whole life. A wl_buffer
+         * describes an fd, a size and a format, all fixed once the image exists, so minting a new
+         * one per present only leaks pool entries in the compositor. Measured before this fix:
+         * presents=24 bufs_created=24 releases=0 - then gamescope stopped committing frames
+         * because every buffer it had was held. */
+        struct wl_buffer *buf = sc->images[idx].buffer;
+        if (!buf) {
+            struct zwp_linux_buffer_params_v1 *params = zwp_linux_dmabuf_v1_create_params(surf->dmabuf);
+            zwp_linux_buffer_params_v1_add(params, sc->images[idx].fd, 0, 0, sc->stride, 0, 0);
+            buf = zwp_linux_buffer_params_v1_create_immed(params, sc->width, sc->height, sc->drm_format, 0 /* LINEAR modifier */);
+            zwp_linux_buffer_params_v1_destroy(params);
+            if (!buf) { if (pi->pResults) pi->pResults[i] = VK_ERROR_OUT_OF_HOST_MEMORY; continue; }
+            struct wsi_buffer_binding *b = calloc(1, sizeof(*b)); b->sc = sc; b->index = idx;
+            wl_buffer_add_listener(buf, &g_buffer_listener, b);
+            sc->images[idx].buffer = buf;
+        }
         wl_surface_attach(surf->surface, buf, 0, 0);
         wl_surface_damage_buffer(surf->surface, 0, 0, sc->width, sc->height);
         wl_surface_commit(surf->surface);
