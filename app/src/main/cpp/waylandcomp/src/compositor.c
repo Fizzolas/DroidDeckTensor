@@ -259,6 +259,7 @@ struct surface {
 
     /* Toplevel placement on the scene. */
     int mapped;                             /* in g_toplevels */
+    int64_t empty_since_ns;                 /* mapped with no content in the tree since */
     struct wl_list toplevel_link;
     int x, y, placed;
     uint32_t hwnd;
@@ -608,6 +609,36 @@ static struct dmabuf_buffer *get_dmabuf(struct wl_resource *buffer) {
 
 /* ------------------------------------------------------------------ surface state */
 
+/* A window's picture need not be on the window's own wl_surface: gamescope keeps the one it
+ * shows in a SUBSURFACE (its toplevel only ever commits a 1x1 placeholder). A toplevel maps, and
+ * counts for the scene's size, when anything in its tree has content. */
+static void surface_size(const struct surface *s, int *w, int *h);
+
+static int tree_has_content(const struct surface *s, int depth) {
+    const struct surface *c;
+    if (s->has_content) return 1;
+    if (depth > 8) return 0;
+    wl_list_for_each(c, &s->children, child_link)
+        if (tree_has_content(c, depth + 1)) return 1;
+    return 0;
+}
+
+/* The size of what a window actually shows: its own surface when that has content, else the
+ * largest content-bearing descendant (subsurfaces are positioned relative to the parent, so
+ * their own sizes are the best available extent). */
+static void tree_size(const struct surface *s, int *w, int *h) {
+    const struct surface *c;
+    int best = 0;
+    if (s->has_content) { surface_size(s, w, h); return; }
+    *w = *h = 0;
+    if (s->buf_w > 0 && s->buf_h > 0) { *w = s->buf_w; *h = s->buf_h; }
+    wl_list_for_each(c, &s->children, child_link) {
+        int cw, ch;
+        tree_size(c, &cw, &ch);
+        if ((long long)cw * ch > best) { best = (long long)cw * ch; *w = cw; *h = ch; }
+    }
+}
+
 static void surface_size(const struct surface *s, int *w, int *h) {
     if (s->dst_set) { *w = s->dst[0]; *h = s->dst[1]; }
     else if (s->src_set) { *w = (int)(s->src[2] + 0.5f); *h = (int)(s->src[3] + 0.5f); }
@@ -646,7 +677,7 @@ static void map_toplevel(struct surface *s) {
     int w, h;
     if (s->mapped) return;
     s->mapped = 1;
-    surface_size(s, &w, &h);
+    tree_size(s, &w, &h);
     {
         char name[160];
         describe(s, name, sizeof(name));
@@ -1137,8 +1168,19 @@ static void surface_commit(struct wl_client *c, struct wl_resource *r) {
     droiddeck_color_commit(s->resource); /* wp_color_management_surface_v1 state (returns at once when HDR is off) */
 
     if (s->role == ROLE_TOPLEVEL && s->xdg_toplevel) {
-        if (s->has_content) map_toplevel(s);
-        else unmap_toplevel(s);
+        /* A client that draws into a SUBSURFACE (gamescope) commits its toplevel empty between
+         * frames, and a null attach clears has_content on that surface - but the picture is
+         * still in the children. Map on any content in the tree, and only unmap once the whole
+         * tree has been empty for a moment, or the window would close and reopen every frame
+         * (measured: "window closed gamescope" 12 s into a vkcube run, then a black screen). */
+        if (tree_has_content(s, 0)) {
+            s->empty_since_ns = 0;
+            map_toplevel(s);
+        } else if (s->mapped) {
+            int64_t now = now_ns();
+            if (!s->empty_since_ns) s->empty_since_ns = now;
+            else if (now - s->empty_since_ns > 500000000LL) unmap_toplevel(s);
+        }
     }
     schedule_render();
 }
@@ -1774,7 +1816,8 @@ static void scene_size(int *w, int *h) {
     *w = *h = 0;
     wl_list_for_each(s, &g_toplevels, toplevel_link) {
         int sw, sh;
-        surface_size(s, &sw, &sh);
+        if (!tree_has_content(s, 0)) continue;
+        tree_size(s, &sw, &sh);
         if ((long long)sw * sh > best) { best = (long long)sw * sh; *w = sw; *h = sh; }
     }
     if (*w <= 0 || *h <= 0) { *w = INPUT_SPACE_W; *h = INPUT_SPACE_H; }

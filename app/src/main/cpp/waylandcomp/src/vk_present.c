@@ -951,6 +951,11 @@ struct vkp_image *vkp_image_import_dmabuf(int fd, uint32_t drm_format, uint64_t 
     img->sampled = !as_blit_dst && g_vk.GetPhysicalDeviceImageFormatProperties2 &&
                    modifier_importable(img->fmt, modifier, sampled_usage);
 
+    /* The buffer's own row pitch has to reach the image, or every row is read from the wrong
+     * offset. Measured on this HAL: importing a 2404x1080 dma-buf as a plain LINEAR image gave
+     * the image a 9616 pitch for the buffer's 16384-byte rows (scrambled picture); the
+     * DRM-format-modifier path hands the pitch over and gets 16384 back. "Linear" is a DRM
+     * modifier value here, so a linear buffer keeps this path rather than the plain linear one. */
     VkSubresourceLayout plane = {.offset = offset, .rowPitch = stride};
     VkImageDrmFormatModifierExplicitCreateInfoEXT modInfo = {
         .sType = VK_STRUCTURE_TYPE_IMAGE_DRM_FORMAT_MODIFIER_EXPLICIT_CREATE_INFO_EXT,

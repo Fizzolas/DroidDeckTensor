@@ -20,8 +20,9 @@ if [ -e /tmp/crashcatch.so ] || [ -e /tmp/mmwatch.so ] || [ -e /tmp/symwatch.so 
   done
   LD_PRELOAD="${_rig}${LD_PRELOAD:+ $LD_PRELOAD}"
   export LD_PRELOAD
-  CRASHCATCH_ALL=1
-  export CRASHCATCH_ALL
+  # Not CRASHCATCH_ALL: the catcher stays gated on comm=steam (rig README, note 2). Preloading it
+  # into every process caught a fault LuaJIT takes and recovers in gamescope and turned it into a
+  # kill, so the compositor died loading its first script and the client never started.
   # The ICD dumps the HAL PLT to this file at open, so it can be compared with the same table at a
   # crash - the difference tells whether a PLT slot is rewritten during the process or was already
   # wrong when the HAL loaded.
