@@ -44,6 +44,13 @@ library list, before anything is published.
   read the window's attributes first, it kept the window as override-redirect and left it out of
   `GAMESCOPE_FOCUSABLE_WINDOWS`, so the client kept its loading screen over the running game
   (Skyrim SE, A Plague Tale: Innocence, on the games' own Xwayland). MapNotify now refreshes the flag.
+- `0115-steam-client-not-a-sdl-fullscreen-shell.patch` - this app. `set_size_hints` treats any
+  override-redirect window with exactly one InputOutput child as an old SDL fullscreen shell and
+  marks it `ignoreOverrideRedirect`. The Steam client's CEF window has exactly that shape here
+  (override-redirect, 2404x1080, one child), so it was marked too and left out of
+  `GAMESCOPE_FOCUSABLE_APPS`: `focused app: none` for the whole session, no composite, `0 GPU
+  frames from games` and no swapchain anywhere. A window Steam identifies (appID 769 or any
+  `STEAM_GAME` atom) is skipped now, so its own geometry stands and it stays a focus candidate.
 
 Sixteen more of Armada's patches are DRM/lease/HDR-on-KMS work for a native display, which this
 app's Wayland-hosted gamescope never reaches, or need a newer gamescope than the runtime has.

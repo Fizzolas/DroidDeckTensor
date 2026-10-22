@@ -1,0 +1,42 @@
+From: DroidDeck
+Subject: [PATCH] steamcompmgr: the Steam client's window is not an SDL fullscreen shell
+
+set_size_hints treats any override-redirect window with exactly one
+InputOutput child as an old SDL fullscreen shell: it takes the child's size as
+the window's size and sets ignoreOverrideRedirect. On this device the Steam
+client's CEF window matches that shape - it is override-redirect (X12B
+"or=1" in xinspect), 2404x1080, with one child - so the client gets
+ignoreOverrideRedirect, which keeps it out of GAMESCOPE_FOCUSABLE_APPS and
+leaves "focused app: none". gamescope then never composites, and a session
+logs 0 GPU frames from games with no swapchain of its own.
+
+Two things distinguish the client from an SDL shell and both hold here only
+for the latter:
+
+  * an SDL shell sizes itself from its child because it has no size hints of
+    its own. The Steam client's window is already exactly the output size and
+    carries Steam's STEAM_GAME atom, so its own geometry is the truth.
+  * SDL reparents its game window under the shell. The client's child is its
+    own render surface.
+
+So leave a window that Steam identifies (appID 769, or any STEAM_GAME atom)
+alone: keep its geometry and do not mark it ignoreOverrideRedirect.
+
+Verified on the Pixel 10 (Tensor G5): before, "focused app: none" for the
+whole session and 0 GPU frames from games; a Steam window with STEAM_GAME=769
+is now a focus candidate.
+
+--- a/src/steamcompmgr.cpp
++++ b/src/steamcompmgr.cpp
+@@ -5598,7 +5598,10 @@
+ 		// SDL creates a fullscreen override-redirect window and reparents the game
+ 		// window under it, centered. We get rid of the modeswitch and also want that
+ 		// black border gone.
+-		if (w->xwayland().a.override_redirect)
++		// The Steam client's CEF window is also override-redirect with one child; it is not
++		// an SDL shell (it carries STEAM_GAME and is already the output size), and taking it
++		// for one leaves "focused app: none" so nothing is composited.
++		if (w->xwayland().a.override_redirect && !window_is_steam( w ) && !win_has_game_id( w ))
+ 		{
+ 			Window	    root_return = None, parent_return = None;
+ 			Window	    *children = NULL;
