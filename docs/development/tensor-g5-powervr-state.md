@@ -3338,3 +3338,46 @@ investigation - §65's 64-row period, §66's root cause, §67's falsification - 
 `vkp_pitch_dump`, which copies through `vkp_image_readback()`, the CURSOR helper sized for 256x256.
 `screencap` later showed the client frame was complete all along (24 black rows of 1080, at the
 edges). Validate an instrument before reasoning from it.
+
+## 70. The boundary is now measured: SurfaceFlinger's image is coherent, the panel is not (2026-10-23)
+
+After §68 retracted the readback-based findings, the next step was to establish which side of the
+pipeline the corruption is on, using only instruments that are known-good.
+
+**Method:** `screencap` at full resolution from the live vkcube session. `screencap` reads what
+SurfaceFlinger has composed, through SurfaceFlinger's own GPU path - it touches none of our code.
+
+**Result - the composed image is a real picture, not noise:**
+
+```
+2404x1080; top colours 000000 41.1%, 333333 35.5% (vkcube's clear), then a long tail
+within-row smoothness  at y=120/540/900 : 0.84 / 0.87 / 0.87   (4 px apart, +-12 tolerance)
+adjacent rows 40 px apart               : 0.67 - 0.99 similar
+pixel runs per row                      : ~400-500 runs, mean 5-6 px, max 368 px
+distinct RGB in one row                 : 239
+```
+
+Short runs next to long runs, high row-to-row similarity and a dominant clear colour is the profile
+of a rendered 3D scene. It is not the "each line unique, no vertical structure" the panel shows.
+
+**So the fault is downstream of SurfaceFlinger's composition**, i.e. in the handoff to the display
+(composition type / DPU read), and NOT in the client's pixels, the dma-buf export, our import, or the
+compositor's scene blit - every one of those is upstream of a coherent `screencap`.
+
+**The specific boundary to test.** §69 moved our layer from `composition=CLIENT` to
+`composition=DEVICE` (GPU-composed to hardware-composed). Those are the two possible paths and only
+one of them can be showing the static:
+
+- if the static appears only when `composition=DEVICE`, the DPU is misreading our buffer (a geometry
+  or format the DPU accepts but reads with a different stride/layout than SF's GPU path does);
+- if it appears in both, it is in the buffer itself and `screencap` is not reading the same memory
+  the DPU is.
+
+That is a one-variable experiment: force client composition (`debug.sf.*` / a SurfaceView property)
+and compare the panel. It has NOT been run yet.
+
+**Instruments now known-good:** `screencap` (independent of our code), and the driver's own log lines
+(`declared=16384 honoured=16384`, `alloc=... need=... ok`, `surface transform: current=... supported=...`).
+**Known-bad, do not reason from:** `vkp_pitch_dump` / `vkp_image_readback` (cursor helper, 256x256),
+and the scanout dump's read of `g_images[img]` after `vkQueuePresentKHR` re-acquires the image, so
+its "all-zero" reading is not evidence about what was presented.

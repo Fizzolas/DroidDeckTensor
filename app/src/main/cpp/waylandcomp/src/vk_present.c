@@ -1825,6 +1825,128 @@ static int render_impl(int scene_w, int scene_h, const struct vkp_draw *draws, i
         if (k < ngen) presented_gen++;
         if (pr == VK_ERROR_OUT_OF_DATE_KHR || pr == VK_ERROR_SURFACE_LOST_KHR || pr == VK_ERROR_DEVICE_LOST) break;
     }
+    /* DIAGNOSTIC (files/scanout_dump present): read back the image just presented, with a staging
+     * image built at ITS OWN size. The cursor helper (vkp_image_readback) is sized for 256x256 and
+     * must not be used for a full frame - that mistake produced three false findings already
+     * (state doc 68). This view sits between "screencap is coherent" and "the panel is corrupt",
+     * so it is the measurement that decides where the fault is. */
+    {
+        static int dump_n = -1;
+        if (dump_n < 0)
+            dump_n = access("/data/user/0/com.droiddeck.launcher/files/scanout_dump", F_OK) == 0 ? 0 : -2;
+        if (dump_n >= 0 && dump_n < 3 && fence_submitted) {
+            dump_n++;
+            if (g_vk.WaitForFences(g_dev, 1, &g_fence, VK_TRUE, 2000000000ULL) == VK_SUCCESS) {
+                uint32_t w = (uint32_t)g_extent.width, h = (uint32_t)g_extent.height;
+                VkImageCreateInfo rci = { VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO };
+                rci.imageType = VK_IMAGE_TYPE_2D; rci.format = g_swap_fmt;
+                rci.extent = (VkExtent3D){ w, h, 1 }; rci.mipLevels = 1; rci.arrayLayers = 1;
+                rci.samples = VK_SAMPLE_COUNT_1_BIT; rci.tiling = VK_IMAGE_TILING_LINEAR;
+                rci.usage = VK_IMAGE_USAGE_TRANSFER_DST_BIT;
+                rci.sharingMode = VK_SHARING_MODE_EXCLUSIVE; rci.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+                VkImage ri = VK_NULL_HANDLE;
+                if (g_vk.CreateImage(g_dev, &rci, NULL, &ri) == VK_SUCCESS) {
+                    VkMemoryRequirements rmr; g_vk.GetImageMemoryRequirements(g_dev, ri, &rmr);
+                    int mt = memory_type(rmr.memoryTypeBits, VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
+                                                               VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
+                    VkMemoryAllocateInfo mai = { VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO };
+                    mai.allocationSize = rmr.size; mai.memoryTypeIndex = (uint32_t)mt;
+                    VkDeviceMemory rmem = VK_NULL_HANDLE;
+                    if (mt >= 0 && g_vk.AllocateMemory(g_dev, &mai, NULL, &rmem) == VK_SUCCESS) {
+                        g_vk.BindImageMemory(g_dev, ri, rmem, 0);
+                        VkImageSubresource subr = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0 };
+                        VkSubresourceLayout rlay; memset(&rlay, 0, sizeof(rlay));
+                        g_vk.GetImageSubresourceLayout(g_dev, ri, &subr, &rlay);
+                        void *map = NULL;
+                        if (g_vk.MapMemory(g_dev, rmem, 0, VK_WHOLE_SIZE, 0, &map) == VK_SUCCESS) {
+                            VkCommandBuffer c2 = g_cmds[0];
+                            g_vk.ResetCommandBuffer(c2, 0);
+                            VkCommandBufferBeginInfo b2 = { VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO };
+                            b2.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+                            g_vk.BeginCommandBuffer(c2, &b2);
+                            VkImageSubresourceRange rng = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1 };
+                            VkImageMemoryBarrier bb[2];
+                            memset(bb, 0, sizeof(bb));
+                            bb[0].sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
+                            bb[0].oldLayout = VK_IMAGE_LAYOUT_PRESENT_SRC_KHR;
+                            bb[0].newLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
+                            bb[0].srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+                            bb[0].dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+                            bb[0].image = g_images[img]; bb[0].subresourceRange = rng;
+                            bb[0].dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
+                            bb[1].sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
+                            bb[1].oldLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+                            bb[1].newLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+                            bb[1].srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+                            bb[1].dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+                            bb[1].image = ri; bb[1].subresourceRange = rng;
+                            bb[1].dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+                            g_vk.CmdPipelineBarrier(c2, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
+                                                    VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, NULL, 0, NULL, 2, bb);
+                            /* 1:1 blit: vk_api has CmdBlitImage, not CmdCopyImage. */
+                            VkImageBlit cp;
+                            memset(&cp, 0, sizeof(cp));
+                            cp.srcSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+                            cp.srcSubresource.layerCount = 1;
+                            cp.dstSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+                            cp.dstSubresource.layerCount = 1;
+                            cp.srcOffsets[1].x = (int32_t)w; cp.srcOffsets[1].y = (int32_t)h; cp.srcOffsets[1].z = 1;
+                            cp.dstOffsets[1].x = (int32_t)w; cp.dstOffsets[1].y = (int32_t)h; cp.dstOffsets[1].z = 1;
+                            g_vk.CmdBlitImage(c2, g_images[img], VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+                                              ri, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &cp, VK_FILTER_NEAREST);
+                            VkImageMemoryBarrier rb;
+                            memset(&rb, 0, sizeof(rb));
+                            rb.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
+                            rb.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+                            rb.newLayout = VK_IMAGE_LAYOUT_GENERAL;
+                            rb.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+                            rb.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+                            rb.image = ri; rb.subresourceRange = rng;
+                            rb.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+                            rb.dstAccessMask = VK_ACCESS_HOST_READ_BIT;
+                            g_vk.CmdPipelineBarrier(c2, VK_PIPELINE_STAGE_TRANSFER_BIT,
+                                                    VK_PIPELINE_STAGE_HOST_BIT, 0, 0, NULL, 0, NULL, 1, &rb);
+                            g_vk.EndCommandBuffer(c2);
+                            VkSubmitInfo s2 = { VK_STRUCTURE_TYPE_SUBMIT_INFO };
+                            s2.commandBufferCount = 1; s2.pCommandBuffers = &c2;
+                            if (g_vk.QueueSubmit(g_queue, 1, &s2, g_fence) == VK_SUCCESS &&
+                                g_vk.WaitForFences(g_dev, 1, &g_fence, VK_TRUE, 2000000000ULL) == VK_SUCCESS) {
+                                const unsigned char *b = (const unsigned char *)map + rlay.offset;
+                                int zero = 0, nr = 0;
+                                char runs[200]; int ro = 0;
+                                runs[0] = 0;
+                                for (int y = 0; y < (int)h && nr < 10; ) {
+                                    const unsigned char *row = b + (size_t)y * rlay.rowPitch;
+                                    int nz = 0;
+                                    for (uint32_t x = 0; x < w; x++) {
+                                        if (row[x*4] | row[x*4+1] | row[x*4+2]) { nz++; if (nz > (int)w/100) break; }
+                                    }
+                                    if (nz > (int)w/100) { y++; continue; }
+                                    int y0 = y;
+                                    while (y < (int)h) {
+                                        const unsigned char *q = b + (size_t)y * rlay.rowPitch; int z = 0;
+                                        for (uint32_t x = 0; x < w; x++) {
+                                            if (q[x*4] | q[x*4+1] | q[x*4+2]) { z++; if (z > (int)w/100) break; }
+                                        }
+                                        if (z > (int)w/100) break;
+                                        y++;
+                                    }
+                                    zero += y - y0; nr++;
+                                    ro += snprintf(runs + ro, sizeof(runs) - ro, "[%d,%d]", y0, y - y0);
+                                }
+                                droiddeck_log("scanout", "presented image %ux%u pitch=%llu all-zero rows %d/%u runs:%s",
+                                              w, h, (unsigned long long)rlay.rowPitch, zero, h, runs);
+                            }
+                            g_vk.UnmapMemory(g_dev, rmem);
+                        }
+                        g_vk.FreeMemory(g_dev, rmem, NULL);
+                    }
+                    g_vk.DestroyImage(g_dev, ri, NULL);
+                }
+            }
+        }
+    }
+
     if (!fence_submitted) {
         /* Ended early: an empty submit carrying the fence is ordered after everything queued
          * above, so the wait below still means "this frame's work is done". */
