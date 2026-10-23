@@ -744,7 +744,14 @@ static int swap_init_locked(void) {
      * engine answered VK_SUBOPTIMAL_KHR on every frame and SurfaceFlinger made our layer
      * composition=CLIENT; with currentTransform (0x8) the swapchain agrees with the surface,
      * SUBOPTIMAL stops, and every layer is composition=DEVICE. Follow the surface. */
-    VkSurfaceTransformFlagBitsKHR pretrans = caps.currentTransform;
+    /* REVERTED to the surface-listed value, see state doc 71: declaring currentTransform told
+     * SurfaceFlinger the content was ALREADY rotated, so it stopped applying the rotation
+     * (bufferTransform ROT_270 -> 0) and instead NON-UNIFORMLY SCALED the landscape buffer into the
+     * portrait panel (toDisplayTransform scale x=2.2259 y=0.4493) - a scanline-smearing transform.
+     * Follow the listed transform, which is what the engine composes for. */
+    VkSurfaceTransformFlagBitsKHR pretrans =
+        (caps.supportedTransforms & VK_SURFACE_TRANSFORM_IDENTITY_BIT_KHR)
+            ? VK_SURFACE_TRANSFORM_IDENTITY_BIT_KHR : caps.currentTransform;
     droiddeck_log("gpu", "swapchain preTransform=0x%x (current=0x%x)", (unsigned)pretrans,
                   (unsigned)caps.currentTransform);
 
