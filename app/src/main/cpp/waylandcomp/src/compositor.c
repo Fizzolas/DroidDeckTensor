@@ -831,7 +831,7 @@ static void take_dmabuf(struct surface *s, struct dmabuf_buffer *b, struct wl_re
         char name[160];
         s->announced_vulkan = 1;
         describe(s, name, sizeof(name));
-        if (b->img)
+        if (b->img) {
             /* Imported for the copy path. Whether its frames ALSO go on the display layer without a copy
              * is decided per frame (fullscreen, zero-copy on) and counted in the 10 s lines. */
             droiddeck_log("vulkan", "%s is presenting GPU frames through Wayland: %dx%d, format %c%c%c%c, %s (%s)",
@@ -840,6 +840,16 @@ static void take_dmabuf(struct surface *s, struct dmabuf_buffer *b, struct wl_re
                        vkp_modifier_name(b->modifier),
                        ahb_swapchain_has_ahb(b) ? "gralloc buffers: can go on the display layer without a copy"
                                                 : "dma-buf: copied into the screen swapchain");
+            /* DIAGNOSTIC: fingerprint the client's rows as the GPU samples them, to separate "the client
+             * wrote garbage" from "we read its rows at the wrong offset". The compositor is an Android
+             * process, so a guest variable cannot reach it: the switch is a file in the app's own dir. */
+            static int dump_on = -1;
+            if (dump_on < 0) {
+                dump_on = access("/data/user/0/com.droiddeck.launcher/files/pitch_dump", F_OK) == 0;
+                if (dump_on) droiddeck_log("dmabuf", "pitch dump armed (files/pitch_dump present)");
+            }
+            if (dump_on) vkp_pitch_dump(b->img, "client-frame", 8);
+        }
         else if (ahb_swapchain_has_ahb(b))
             droiddeck_log("vulkan", "%s is presenting GPU frames through Wayland: %dx%d on its own display layer only "
                        "(gralloc buffers the compositor cannot import for the copy path)",

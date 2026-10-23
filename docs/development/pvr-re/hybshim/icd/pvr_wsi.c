@@ -473,6 +473,19 @@ static VkResult wsi_create_swapchain(VkDevice device, const VkSwapchainCreateInf
         VkSubresourceLayout layout; memset(&layout, 0, sizeof(layout));
         if (sc->GetImageSubresourceLayout) sc->GetImageSubresourceLayout(device, sc->images[i].image, &sl, &layout);
         sc->stride = (uint32_t)(layout.rowPitch > 0 ? layout.rowPitch : (uint32_t)(sc->width * 4));
+        /* Is the allocation big enough for the rows we are about to describe? A dma-buf whose
+         * memory is smaller than pitch*height leaves the tail unpopulated (reads as zeros), which
+         * shows up on screen as scanlines of garbage that never settle. Measured on the Pixel 10:
+         * 2404x1080 at pitch 16384 needs 17694720 bytes. */
+        {
+            VkMemoryRequirements mr2; memset(&mr2, 0, sizeof(mr2));
+            sc->GetImageMemoryRequirements(device, sc->images[i].image, &mr2);
+            unsigned long long need = (unsigned long long)sc->stride * (unsigned long long)sc->height;
+            WSI_LOG("swapchain img%u alloc=%llu need(pitch*h)=%llu offset=%llu pitch=%llu %s", i,
+                    (unsigned long long)mr2.size, need, (unsigned long long)layout.offset,
+                    (unsigned long long)layout.rowPitch,
+                    (mr2.size < need) ? "SHORT - tail of the image is outside the allocation" : "ok");
+        }
         VkMemoryGetFdInfoKHR gfi = { VK_STRUCTURE_TYPE_MEMORY_GET_FD_INFO_KHR };
         gfi.memory = sc->images[i].mem; gfi.handleType = VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT;
         sc->images[i].fd = -1;

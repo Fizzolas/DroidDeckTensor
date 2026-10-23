@@ -1019,6 +1019,34 @@ struct vkp_image *vkp_image_import_dmabuf(int fd, uint32_t drm_format, uint64_t 
         g_vk.FreeMemory(g_dev, img->mem, NULL); g_vk.DestroyImage(g_dev, img->image, NULL);
         free(img); return NULL;
     }
+    /* What pitch did the driver ACTUALLY give this image? The buffer declares `stride` and that is
+     * what the image was asked for, but nothing has ever read the answer back. If the two differ,
+     * every scanline the compositor samples comes from the wrong offset in the client's buffer -
+     * which presents as each displayed row being unrelated noise: thin horizontal lines, no
+     * vertical structure, no recognisable picture. Logged once per distinct (size, declared,
+     * honoured) triple, so a session says whether the pitch handed over is the pitch honoured
+     * without flooding. */
+    {
+        VkImageSubresource subr = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0};
+        VkSubresourceLayout lay;
+        memset(&lay, 0, sizeof(lay));
+        if (g_vk.GetImageSubresourceLayout) {
+            g_vk.GetImageSubresourceLayout(g_dev, img->image, &subr, &lay);
+            img->row_pitch = lay.rowPitch;
+            static unsigned long long seen[16][3]; static int nseen;
+            unsigned long long key0 = (unsigned long long)w << 32 | (unsigned)h, key1 = stride,
+                               key2 = lay.rowPitch;
+            int i, dup = 0;
+            for (i = 0; i < nseen; i++)
+                if (seen[i][0] == key0 && seen[i][1] == key1 && seen[i][2] == key2) { dup = 1; break; }
+            if (!dup) {
+                if (nseen < 16) { seen[nseen][0] = key0; seen[nseen][1] = key1; seen[nseen][2] = key2; nseen++; }
+                droiddeck_log("dmabuf", "pitch %dx%d declared=%u honoured=%llu (%s)%s", w, h, stride,
+                              (unsigned long long)lay.rowPitch, vkp_modifier_name(modifier),
+                              (lay.rowPitch && lay.rowPitch != stride) ? " MISMATCH" : "");
+            }
+        }
+    }
     return img;
 }
 
@@ -2053,6 +2081,134 @@ int vkp_image_readback(struct vkp_image *src, uint32_t *out, int max_px) {
         memcpy(out + (size_t)y * src->w, (const uint8_t *)g_rb->map + g_rb->offset + (size_t)y * g_rb->row_pitch,
                (size_t)src->w * 4);
     return 0;
+}
+
+/* DIAGNOSTIC (DROIDDECK_PITCH_DUMP=1): fingerprint the rows of an image as the GPU samples it.
+ *
+ * The point is to tell these apart by measurement rather than by looking at the panel:
+ *   - a coherent frame  -> neighbouring rows are similar, and row fingerprints are all distinct;
+ *   - a wrong-row-stride read -> rows are still "distinct", but the CONTENT of consecutive rows is
+ *     unrelated even where the source is flat, and the same source row reappears every pitch/gap rows;
+ *   - a coherent frame sampled into the WRONG image geometry -> the per-row fingerprint sequence
+ *     shows a strong periodicity (a repeat every src_w*dst_stride/src_stride rows or similar).
+ *
+ * It copies the image into the same linear readback image the cursor path uses, so it measures what
+ * the GPU actually samples, not what the client claims to have written. Called at most `limit` times
+ * per process so a 60 fps session cannot flood. */
+void vkp_pitch_dump(struct vkp_image *src, const char *tag, int limit) {
+    static int calls;
+    if (!src || src->w <= 0 || src->h <= 0) return;
+    if (limit > 0 && calls >= limit) return;
+    calls++;
+    const int rows = src->h < 64 ? src->h : 64;   /* only a slice of rows is fingerprinted */
+    /* The readback copies the WHOLE image (that is what it does), so the staging buffer is the whole
+     * image; only the first `rows` of it are hashed. Refuse anything unreasonable. */
+    if ((int64_t)src->w * src->h > 64 * 1024 * 1024 / 4) return;
+    uint32_t *buf = malloc((size_t)src->w * src->h * 4);
+    if (!buf) return;
+    if (vkp_image_readback(src, buf, src->w * src->h) != 0) { free(buf); return; }
+
+    /* Does the frame change if we read it again a moment later? A buffer that is still being written
+     * (no fence wait on the client's dma-buf) fills in as we watch. Count how many rows of the first
+     * read were all-zero, and the same after a short settle. */
+    {
+        int zero_rows_a = 0, zero_rows_b = 0;
+        for (int y = 0; y < src->h; y++) {
+            const uint32_t *r = buf + (size_t)y * src->w; int z = 1;
+            for (int x = 0; x < src->w; x += 13) if (r[x]) { z = 0; break; }
+            zero_rows_a += z;
+        }
+        struct timespec ts = {0, 60 * 1000 * 1000}; nanosleep(&ts, NULL);
+        if (vkp_image_readback(src, buf, src->w * src->h) == 0) {
+            for (int y = 0; y < src->h; y++) {
+                const uint32_t *r = buf + (size_t)y * src->w; int z = 1;
+                for (int x = 0; x < src->w; x += 13) if (r[x]) { z = 0; break; }
+                zero_rows_b += z;
+            }
+        }
+        droiddeck_log("dmabuf", "%s settle: all-zero rows %d/%d -> %d/%d after 60ms",
+                      tag, zero_rows_a, src->h, zero_rows_b, src->h);
+        /* WHERE does the content end? Walk down and report the last row with any non-zero pixel, then
+         * the first few row-values across that boundary - the shape says whether the client wrote a
+         * shorter image than it declared, or wrote it at a stride we are not accounting for. */
+        int last = -1;
+        for (int y = 0; y < src->h; y++) {
+            const uint32_t *r = buf + (size_t)y * src->w;
+            for (int x = 0; x < src->w; x++) if (r[x]) { last = y; break; }
+        }
+        droiddeck_log("dmabuf", "%s content ends at row %d of %d (%.1f%%)", tag, last, src->h,
+                      100.0 * (last + 1) / src->h);
+        /* Are the zero runs FIXED or do they MOVE? Fixed offsets => missing/never-populated pages.
+         * Moving runs => a write/copy race. Report the first 8 zero-row runs as [start,len]. */
+        {
+            char runs[256]; int off = 0, nruns = 0;
+            for (int y = 0; y < src->h && nruns < 8; ) {
+                const uint32_t *r = buf + (size_t)y * src->w; int z = 1;
+                for (int x = 0; x < src->w; x += 13) if (r[x]) { z = 0; break; }
+                if (!z) { y++; continue; }
+                int y0 = y;
+                while (y < src->h) {
+                    const uint32_t *q = buf + (size_t)y * src->w; int zz = 1;
+                    for (int x = 0; x < src->w; x += 13) if (q[x]) { zz = 0; break; }
+                    if (!zz) break;
+                    y++;
+                }
+                off += snprintf(runs + off, sizeof(runs) - off, "[%d,%d]", y0, y - y0); nruns++;
+            }
+            droiddeck_log("dmabuf", "%s zero-runs: %s", tag, off ? runs : "none");
+        }
+        for (int y = last - 2; y <= last + 2; y++) {
+            if (y < 0 || y >= src->h) continue;
+            const uint32_t *r = buf + (size_t)y * src->w;
+            droiddeck_log("dmabuf", "%s   row %d: %08x %08x %08x %08x", tag, y,
+                          r[0], r[src->w / 4], r[src->w / 2], r[src->w - 1]);
+        }
+    }
+
+    /* Sample rows spread over the WHOLE height, not the first N rows: a game's top strip is very
+     * often uniform background, and sampling only there makes every frame look like one flat row. */
+    int ys[64]; int nrows = 0;
+    for (int k = 0; k < rows; k++) ys[nrows++] = (int)((long long)k * (src->h - 1) / (rows - 1));
+    unsigned long long h[64];
+    for (int k = 0; k < nrows; k++) {
+        unsigned long long hh = 1469598103934665603ULL;
+        const uint32_t *r = buf + (size_t)ys[k] * src->w;
+        for (int x = 0; x < src->w; x++) hh = (hh ^ r[x]) * 1099511628211ULL;
+        h[k] = hh;
+    }
+    int distinct = 0;
+    for (int k = 0; k < nrows; k++) {
+        int dup = 0;
+        for (int j = 0; j < k; j++) if (h[j] == h[k]) { dup = 1; break; }
+        if (!dup) distinct++;
+    }
+    /* Neighbouring sampled rows: on a coherent picture they stay similar (except across an edge). */
+    double sum = 0; int n = 0;
+    for (int k = 1; k < nrows; k++) {
+        double d = 0;
+        const uint32_t *a = buf + (size_t)ys[k - 1] * src->w, *b = buf + (size_t)ys[k] * src->w;
+        for (int x = 0; x < src->w; x += 7) {
+            int pa = (int)(a[x] & 0xff), pb = (int)(b[x] & 0xff);
+            d += pa > pb ? pa - pb : pb - pa;
+        }
+        sum += d / (double)((src->w + 6) / 7); n++;
+    }
+    droiddeck_log("dmabuf", "%s %dx%d sampled=%d distinct=%d neighbour-mean-diff=%.1f pitch=%llu",
+                  tag, src->w, src->h, nrows, distinct, n ? sum / n : 0.0,
+                  (unsigned long long)src->row_pitch);
+    /* Raw evidence, spread over the height: plausible colour vs uninitialised memory, and whether a
+     * column repeats down the frame (the row-stride signature). */
+    {
+        char line[400]; int off = 0;
+        const int xa = src->w / 3, xb = src->w / 2;
+        for (int k = 0; k < nrows && k < 8; k += 2) {
+            int y = ys[k * nrows / 8];
+            off += snprintf(line + off, sizeof(line) - off, " y%d=%08x/%08x",
+                            y, buf[(size_t)y * src->w + xa], buf[(size_t)y * src->w + xb]);
+        }
+        droiddeck_log("dmabuf", "%s raw%s", tag, line);
+    }
+    free(buf);
 }
 
 /* ---------------------------------------------------------------- the compositor pass, off-screen

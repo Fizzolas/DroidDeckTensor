@@ -150,6 +150,8 @@ int vkp_blit_image(struct vkp_image *src, struct vkp_image *dst, int wait_fd);
 /* A client's GPU cursor (an imported dma-buf, often UBWC) read back as w*h 0xAARRGGBB pixels through a
  * linear host-visible copy; waited for on the CPU. Compositor thread, between frames. 0 = ok. */
 int vkp_image_readback(struct vkp_image *src, uint32_t *out, int max_px);
+/* DIAGNOSTIC: fingerprint rows of an image as the GPU samples it (DROIDDECK_PITCH_DUMP). */
+void vkp_pitch_dump(struct vkp_image *src, const char *tag, int limit);
 /* Refresh the scene -> output mapping for this scene size without presenting (creates the
  * swapchain if needed, since the mapping is in output pixels). 0 = mapping valid. */
 int vkp_update_map(int scene_w, int scene_h);
