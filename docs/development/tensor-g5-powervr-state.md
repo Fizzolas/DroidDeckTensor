@@ -3237,3 +3237,37 @@ image, or by putting the swapchain images in a state where the app's first rende
 first writer, the ICD can transfer-clear each image once at creation (`vkCmdClearColorImage` on the
 first use), which is measured to cover the whole image. Verify by re-running the probe with the
 render pass and by watching vkcube's frames for zero runs.
+
+## 67. The transfer clear is NOT the answer: the ICD's own clear runs, succeeds, and changes nothing (2026-10-23)
+
+§66 ended with "a render-pass clear misses the top 128 rows, so have the ICD transfer-clear each
+image once". That was implemented and measured, and **it does not work.**
+
+The ICD now transfer-clears every swapchain image at creation, and the log says it succeeds:
+`create_swapchain: transfer-cleared 2404x1080 image once (ok)` - three times, one per image.
+The client's frames are **unchanged**: still `all-zero rows 492/1080 -> 492/1080 after 60ms`, still
+`zero-runs: [514,2][518,10][530,2][534,42][578,2][582,10][594,2][598,170]`.
+
+So the zeros are not "rows nobody ever wrote". The ICD wrote every row, through the transfer path
+that §66 measured to cover the whole image, and the rows are still zero where the app rendered.
+Introducing the clear at the producer therefore cannot fix this; the change was reverted.
+
+**What this rules out, and what it points at.** It rules out "the app's first writer path leaves the
+top unwritten" as the explanation of what the COMPOSITOR sees. Two possibilities remain, and they are
+distinguishable:
+
+1. The app's render pass writes the rows, but writes them to memory the export does not describe
+   (i.e. the app renders correctly and the dma-buf aliasing is wrong) - then the compositor's view
+   is zeros while the app's own view is a correct picture.
+2. The compositor's zero-row counting is itself reading the wrong thing - the `vkp_pitch_dump`
+   copies through `vkp_image_readback`, which builds a SEPARATE staging image; a fault in that copy
+   would look exactly like this.
+
+(2) is the cheaper one to eliminate and should be done first: dump rows from the compositor's own
+scene/swapchain image path rather than through the cursor readback helper, or compare the same frame
+via the app's own screencap, which is independent of both.
+
+**Also note (procedure):** `probes/pvr_linear_layout_test.c` reproduced 128 zero rows with a render
+pass and 0 with a transfer clear. Since the ICD clear demonstrably does NOT change what the
+compositor sees, that probe's two arms differ in something other than "who wrote first" - so treat
+its "root cause" reading in §66 as a hypothesis that this section has falsified, not a finding.
