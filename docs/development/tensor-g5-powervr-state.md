@@ -3306,3 +3306,35 @@ SurfaceFlinger, or in the display path - not in the client's pixels. Compare, fo
 `screencap` (coherent), (b) a readback of the compositor's own swapchain image taken with a
 correctly sized staging image, (c) what the panel shows. Only (b) is missing, and it must not reuse
 the cursor helper.
+
+## 69. preTransform now follows the surface (2026-10-23, commit `677ea217`)
+
+The swapchain forced `VK_SURFACE_TRANSFORM_IDENTITY_BIT_KHR` whenever the surface listed it, with a
+comment arguing that our blit does not rotate so the engine should not either. That reasoning is
+incomplete, and it is measurable.
+
+Measured on the Pixel 10:
+```
+surface transform: current=0x8 supported=0x1ff extent=2404x1080
+```
+`0x8` is `ROTATE_270`, and the extent the surface reports is **already** 2404x1080 - i.e. already in
+the rotated orientation. Declaring IDENTITY against that is a claim the surface contradicts:
+
+| preTransform | engine's answer | SurfaceFlinger's composition |
+|---|---|---|
+| IDENTITY (old) | `VK_SUBOPTIMAL_KHR` every frame, "presenting as is" | `composition=CLIENT` |
+| `caps.currentTransform` (0x8) | no SUBOPTIMAL | `composition=DEVICE` |
+
+`preTransform` now follows `caps.currentTransform`.
+
+**Important scope note.** This is a real, measured defect fixed - the app was telling the
+presentation engine something the surface contradicted - but it is **not yet established** that it
+is the cause of the user's horizontal-scanline symptom. That symptom predates this change and the
+panel was not confirmed clean after it. Do not record it as fixed until someone has looked at the
+screen and said so; the logs improving is not the same as the picture improving.
+
+**Procedure note for whoever continues (this cost hours):** three separate "findings" in this
+investigation - §65's 64-row period, §66's root cause, §67's falsification - rested on
+`vkp_pitch_dump`, which copies through `vkp_image_readback()`, the CURSOR helper sized for 256x256.
+`screencap` later showed the client frame was complete all along (24 black rows of 1080, at the
+edges). Validate an instrument before reasoning from it.
