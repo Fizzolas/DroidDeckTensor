@@ -3271,3 +3271,38 @@ via the app's own screencap, which is independent of both.
 pass and 0 with a transfer clear. Since the ICD clear demonstrably does NOT change what the
 compositor sees, that probe's two arms differ in something other than "who wrote first" - so treat
 its "root cause" reading in §66 as a hypothesis that this section has falsified, not a finding.
+
+## 68. CORRECTION: the "492 zero rows" were an artefact of the probe's own readback (2026-10-23)
+
+§65-67 built a chain of conclusions on one number: `vkp_pitch_dump` reporting
+`all-zero rows 492/1080`. **That number is wrong, and the chain above it is void.**
+
+`screencap` of the same live vkcube session - an entirely independent path, SurfaceFlinger's, which
+never touches our readback helper - reports **24 all-black rows of 1080**, and they are at the frame
+edges (`runs: [(0,4),(1060,20)]`). The client's frame is essentially complete. It is not missing 492
+rows and it does not have 64-row-periodic holes.
+
+`vkp_pitch_dump` copies the client image through `vkp_image_readback()`, which is the CURSOR helper:
+it builds its own 256x256-sized staging image and its own barriers, and it was never written to copy
+a 2404x1080 frame correctly. Whatever it reports about rows beyond its own scale is not evidence
+about the client's buffer. I should have validated the measurement before reasoning from it - the
+same mistake as sampling only the top 64 rows an hour earlier, in the same instrument.
+
+**What therefore stands and what does not:**
+
+- §65's table of "ruled out" measurements is still valid where it relied on the ICD's and the
+  compositor's own logs (`declared=16384 honoured=16384`, `alloc=33554432 need=17694720`), because
+  those come from the driver, not from my copy.
+- §65's "492 of 1080 rows wholly zero", §66's 64-row/1 MiB arithmetic, §66's root cause, and §67's
+  conclusions about it are **withdrawn**. The probe that produced them
+  (`pvr_linear_layout_test.c`) also needs re-checking for the same defect before it is trusted.
+- The user's original symptom - horizontal lines of shifting noise, no recognisable image - is
+  unexplained by any of this and is still the thing to solve.
+
+**Next, and it must start from a trustworthy measurement.** The compositor already copies each client
+frame into its scene image with `vkCmdBlitImage` and presents that; if the panel is corrupt while
+`screencap` is coherent, the disagreement is *downstream of the frame* - in what the app hands to
+SurfaceFlinger, or in the display path - not in the client's pixels. Compare, for one frame: (a)
+`screencap` (coherent), (b) a readback of the compositor's own swapchain image taken with a
+correctly sized staging image, (c) what the panel shows. Only (b) is missing, and it must not reuse
+the cursor helper.
