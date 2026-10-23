@@ -3110,3 +3110,48 @@ __open_2/errno helper -> SIGSEGV at 0x308.** So Steam's GPU driver query crashes
 HAL while enumerating/opening something (probably a sysfs/drm path) through our hybris bridge -
 a SECOND, independent fault, distinct from the GPU-process composite crash (whose capture is fixed
 in e15bead and awaits a labelled run).
+
+## 64. The Steam window was never focused, so nothing composited - settled with a zero-rebuild switch (2026-10-23, commit `a0b6973`)
+
+Frame of reference: the "focused app: none" line in every session is not cosmetic. gamescope only
+composites the window it has given the baselayer focus; while that is none, the client's frames reach
+gamescope and stop there. Measured in `2026-10-22-30/33/34-steam` (the newest sessions before this):
+the client had a live 2404x1080 swapchain and committed 20 frames, and DroidDeck's compositor
+reported `0 GPU frames from games | 0 windows open` for the whole run. The GPU path was never the
+blocker for those runs.
+
+**Cause.** The client's CEF window is override-redirect. gamescope's own focus selection never makes
+an override-redirect window the baselayer by itself, so `GAMESCOPE_FOCUSED_APP` is unset and
+`determine_and_apply_focus` keeps `focusWindow` NULL for the session. The earlier record blamed
+`set_size_hints`/`ignoreOverrideRedirect` (patch `0115`), but the reported focusable list filters on
+the RAW `xwayland().a.override_redirect` (`steamcompmgr.cpp`, the `focusable_appids` loop), which
+`ignoreOverrideRedirect` does not touch - so that patch could not have changed it, and it was never
+in a shipped binary anyway (pin p9; p12 predates it). The patch stays in the tree unmeasured, not as
+the fix.
+
+**Fix, no gamescope rebuild.** gamescope already carries a fallback (patch `0002`, in the shipped
+binary): when no baselayer window is focusable, it picks the window whose `STEAM_GAME` appID matches
+`GAMESCOPE_FALLBACK_APPID`. Steam sets 769 on its interface window - the value `window_is_steam()`
+compares against. `droiddeck-session` now exports `GAMESCOPE_FALLBACK_APPID=769` for `mode=steam`
+only (an environment value wins, so it stays an experiment knob). Measured three times
+(`2026-10-23-02`, `-03`, `-07-steam`): `focused app: 769` ~3-5 s after launch, `1 windows open`, and
+the compositor taking the client's GPU frames for the rest of the session. `mode=run` (vkcube) is
+unchanged - "baselayer fallback appID none", 60 fps, no regression.
+
+**Also shipped: the ICD the tree had built but the asset never carried.** The asset held the
+2026-10-11 build `68f90ad8`; the tree's is `28d39597` with `13c291d`'s one-wl_buffer-per-image fix.
+Proved the shipped one was the old code from the logs, not the hash: `2026-10-22-32-vkcube` presents
+fd 19 with three different wl_buffer pointers, i.e. a new buffer minted per present. versionCode 25
+is what makes the asset reach an existing install (`installedByVersionCode` gate). After install the
+device's ICD is `28d39597` and the logs carry the per-pid `pvr_wsi[N]:` lines.
+
+**Next wall, and it is not the GPU.** The client now composites, but what is on screen is the
+update-UI installer, not Big Picture: `steamwebhelper` never starts because the updater loops. Its
+bootstrap log shows `Found pending update -> Installing update... -> BCommitUpdatedFiles: failed to
+rename ... (error 38) -> Failed to apply update, reverting...`, twice in a row, and the update UI
+keeps repainting "Installing update...". ENOSYS is not a blanket block here - a directory rename of
+the same shape under proot succeeds (`2026-10-23-09-rtprobe3-sh`: `libc.rename dir rc=0`), so the
+failing step is narrower than "rename is broken" and is the next thing to localise (the error is per
+`BCommitUpdatedFiles`, on a directory being committed into `steamrt64/pv-runtime/...`).
+The GPU-process fault capture (`e15bead`) and the attach-off control from §63 remain unrun; they
+become reachable again only once the client gets past the updater.
