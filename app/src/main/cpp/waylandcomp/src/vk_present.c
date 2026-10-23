@@ -664,6 +664,12 @@ static int swap_init_locked(void) {
      * to decide whether a second layer is affordable - see sc_layer_present_overlay(). */
     g_surface_transform = caps.currentTransform;
     g_surface_transform_known = 1;
+    /* What the presentation engine says it does to everything we hand it, and what we are allowed
+     * to say instead. Logged because the swapchain's preTransform is chosen from these and a wrong
+     * choice shows up as a corrupt picture rather than as an error. */
+    droiddeck_log("gpu", "surface transform: current=0x%x supported=0x%x extent=%ux%u",
+                  (unsigned)caps.currentTransform, (unsigned)caps.supportedTransforms,
+                  (unsigned)caps.currentExtent.width, (unsigned)caps.currentExtent.height);
     g_caps_extent = caps.currentExtent; /* check_surface_changed() compares against this */
     g_surface_checked_ns = perf_now();
     /* Every format/colour-space pair the surface lists. With VK_EXT_swapchain_colorspace the Android
@@ -727,14 +733,20 @@ static int swap_init_locked(void) {
     uint32_t want = caps.minImageCount + 1 + (uint32_t)g_swap_extra;
     if (caps.maxImageCount && want > caps.maxImageCount) want = caps.maxImageCount;
 
-    /* Use IDENTITY preTransform when the surface supports it. Setting preTransform =
-     * currentTransform tells the presentation engine our content is ALREADY pre-rotated by
-     * that amount - but our blit doesn't rotate, so on a device whose surface reports a 90°
-     * currentTransform the display then rotates our upright frame 90° (game shows sideways).
-     * IDENTITY = "don't rotate what I present", which is what we want. */
-    VkSurfaceTransformFlagBitsKHR pretrans =
-        (caps.supportedTransforms & VK_SURFACE_TRANSFORM_IDENTITY_BIT_KHR)
-            ? VK_SURFACE_TRANSFORM_IDENTITY_BIT_KHR : caps.currentTransform;
+    /* preTransform declares "my content is already rotated by this much", and the presentation
+     * engine then does NOT apply that rotation again. Get it wrong and the picture is wrong rather
+     * than an error.
+     *
+     * This used to force IDENTITY whenever the surface listed it, on the reasoning that our blit
+     * does not rotate, so we should tell the engine not to rotate either. MEASURED on the Pixel 10
+     * (2026-10-23): this surface reports current=0x8 (ROTATE_270) with supported=0x1ff and
+     * currentExtent 2404x1080 - the extent is ALREADY in the rotated orientation. With IDENTITY the
+     * engine answered VK_SUBOPTIMAL_KHR on every frame and SurfaceFlinger made our layer
+     * composition=CLIENT; with currentTransform (0x8) the swapchain agrees with the surface,
+     * SUBOPTIMAL stops, and every layer is composition=DEVICE. Follow the surface. */
+    VkSurfaceTransformFlagBitsKHR pretrans = caps.currentTransform;
+    droiddeck_log("gpu", "swapchain preTransform=0x%x (current=0x%x)", (unsigned)pretrans,
+                  (unsigned)caps.currentTransform);
 
     VkSwapchainCreateInfoKHR sci = {
         .sType = VK_STRUCTURE_TYPE_SWAPCHAIN_CREATE_INFO_KHR, .surface = g_surface,
