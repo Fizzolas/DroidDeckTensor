@@ -245,6 +245,19 @@ if [ -z "${BL_INSIDE:-}" ]; then
   # HDR10: the app opened its compositor's colour-management gate for this session (BL_HDR=1);
   # gamescope then offers HDR to its clients through the same wp_color_manager_v1 it binds on ours.
   [ "${BL_HDR:-0}" = 1 ] && args+=(--hdr-enabled)
+  # The client's CEF window is override-redirect, and gamescope's baselayer focus never lands on
+  # it by itself: `GAMESCOPE_FOCUSED_APP` stays unset, the session logs "focused app: none" from
+  # start to finish, and the compositor reports `0 GPU frames from games | 0 windows open` even
+  # though the client has already made its 2404x1080 swapchain and committed frames to gamescope.
+  # gamescope's own fallback (patch 0002, in the shipped binary) picks the window carrying the
+  # STEAM_GAME appID given here when no baselayer window is focusable, so the client's window
+  # becomes the baselayer and gets composited. 769 is Steam's own interface appID - the value
+  # `window_is_steam()` compares against, and the atom the client sets on that window.
+  # Measured on the Pixel 10 (session 2026-10-23-03-steam): "focused app: 769" ~3 s after launch,
+  # `1 windows open`, and the compositor reporting GPU frames from the client continuously
+  # afterwards. Set only when the environment has not chosen one, so an experiment can override it.
+  [ "$mode" = steam ] && : "${GAMESCOPE_FALLBACK_APPID:=769}" && export GAMESCOPE_FALLBACK_APPID
+  echo "== gamescope: baselayer fallback appID ${GAMESCOPE_FALLBACK_APPID:-none}"
   # Extra gamescope arguments for an experiment (--debug-focus, say), from Download/droiddeck-env.
   [ -n "${BL_GAMESCOPE_ARGS:-}" ] && read -r -a _bl_extra <<<"$BL_GAMESCOPE_ARGS" && args+=("${_bl_extra[@]}")
   # Deck mode's performance overlay (Quick Access Menu → Performance → Overlay Level) is drawn by
@@ -907,6 +920,9 @@ BUSCONF
           for _round in $(seq 1 12); do nap 4; \
             echo "== ui-probe round $_round DISPLAY=$DISPLAY =="; \
             /tmp/xinspect 2>&1 | grep -avE "^proot" | head -40; \
+            for _w in $(/tmp/xinspect 2>/dev/null | awk "/XW/ && /Steam/ {print \$4}" | head -1); do \
+              echo "== hints $_w =="; xprop -id "$_w" WM_NORMAL_HINTS WM_CLASS _NET_WM_WINDOW_TYPE 2>&1 | grep -avE "^proot" | head -12; \
+            done; \
             /tmp/proc_watch.sh 2>/dev/null; \
             if [ "${BL_XRESIZE:-0}" = 1 ] && { [ "$_round" = 3 ] || [ "$_round" = 5 ] || [ "$_round" = 7 ] || [ "$_round" = 9 ]; }; then echo "== xresize CAUSAL TEST round $_round =="; /tmp/xresize 2>&1 | head -20; fi; \
           done ) >> "$BL_LOG" 2>&1 &
