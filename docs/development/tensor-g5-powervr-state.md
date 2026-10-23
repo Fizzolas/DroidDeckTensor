@@ -3155,3 +3155,48 @@ failing step is narrower than "rename is broken" and is the next thing to locali
 `BCommitUpdatedFiles`, on a directory being committed into `steamrt64/pv-runtime/...`).
 The GPU-process fault capture (`e15bead`) and the attach-off control from §63 remain unrun; they
 become reachable again only once the client gets past the updater.
+
+## 65. Where the horizontal-scanline corruption actually stands, by measurement (2026-10-23)
+
+Symptom, in the reporter's words: "each line is unique, left to right, no vertical structure,
+no recognisable image; some lines static colour, some rapidly shifting - like TV static."
+Every capture of the panel shows it; `screencap`-read buffers do not look like pure noise.
+
+Everything below is measured on the Pixel 10 with vkcube (a pure Vulkan client), so no GL, no CEF,
+no X11 is involved.
+
+**Ruled out, each by a direct measurement:**
+1. **Row-pitch mismatch** - the long-standing suspect (§42). The compositor's import logs the pitch
+   it DECLARED against the pitch the driver HONOURED: `declared=16384 honoured=16384 (linear)`.
+   Equal. The stride theory is retired.
+2. **A short allocation** (image tail outside the allocation). The ICD now logs it per image:
+   `alloc=33554432 need(pitch*h)=17694720 offset=0 pitch=16384 ok`. Ample.
+3. **A write race** (buffer read while the GPU is still filling it). Re-reading the same buffer
+   after 60 ms changes nothing: `all-zero rows 492/1080 -> 492/1080`.
+4. **A truncated frame.** Content reaches row 1075 of 1080 (99.6%), so the client did render a
+   full-height frame.
+5. **Top-of-frame sampling artefact.** The first version of the probe hashed only the top rows,
+   where vkcube's clear colour is uniform, and reported "all rows identical". That was a defect in
+   the probe, not in the pipeline; it now samples rows across the whole height.
+
+**What the corruption actually is.** 492 of 1080 rows are all-zero. The rows are *wholly* written
+or *wholly* zero - never partially - and the zero runs are **fixed**, not moving, and repeat with a
+period of exactly **64 rows**:
+`[514,2][518,10][530,2][534,42][578,2][582,10][594,2][598,170]`
+(514+64=578, 518+64=582, 530+64=594, 534+64=598.)
+
+The arithmetic that matters: the HAL reports `rowPitch=16384` for a 2404-wide RGBA image, where
+2404*4 = 9616. 16384 is exactly 16 KiB, and **16384 * 64 rows = 1 MiB**. The allocation is exactly
+**32 MiB = 32 x 1 MiB**. So the unpopulated runs align exactly to 1 MiB blocks of the imported
+dma-buf.
+
+That is not a sampling error and not a race: it is **1 MiB-granular memory that was never
+populated**, while the image advertises 1080 rows. The ICD declares the buffer LINEAR (modifier 0)
+to every client, so the compositor reads it as plain rows and lands in the gaps.
+
+**Next step, not yet done:** the probe that would confirm this from inside the producer
+(`probes/pvr_linear_layout_test.c`) cannot `mmap` the HAL's dma-buf from the `shell` uid
+(`mmap: Permission denied`) - it has to run as the app. Then the fix is either (a) make the HAL
+populate the whole allocation, or (b) stop declaring LINEAR for a buffer whose real layout is
+padded to 16 KiB rows, and hand the compositor a modifier that describes what the HAL actually
+produced. Do not re-run the pitch theory; it is measured equal.

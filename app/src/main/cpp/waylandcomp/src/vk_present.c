@@ -2157,6 +2157,19 @@ void vkp_pitch_dump(struct vkp_image *src, const char *tag, int limit) {
             }
             droiddeck_log("dmabuf", "%s zero-runs: %s", tag, off ? runs : "none");
         }
+        /* THE DECISIVE TEST for "tiled layout declared as linear": if the producer wrote the image
+         * in 64-row blocks, the block that starts at row 512 lives further down the buffer than a
+         * linear read expects. So compare the zero rows against the rows 64*pixels further on: if
+         * buf[zero_y] is zero but buf[zero_y + 64] holds plausible content, the data is there but
+         * filed at a tile stride - a layout disagreement, not missing writes. Report the exact
+         * offsets so the answer is a measurement, not an interpretation. */
+        for (int y = 512; y < 512 + 96 && y < src->h; y += 16) {
+            const uint32_t *r = buf + (size_t)y * src->w;
+            unsigned z = 0, nz = 0;
+            for (int x = 0; x < src->w; x += 17) { if (r[x]) nz++; else z++; }
+            droiddeck_log("dmabuf", "%s probe row %d: %u nonzero / %u zero of %d sampled",
+                          tag, y, nz, z, nz + z);
+        }
         for (int y = last - 2; y <= last + 2; y++) {
             if (y < 0 || y >= src->h) continue;
             const uint32_t *r = buf + (size_t)y * src->w;
