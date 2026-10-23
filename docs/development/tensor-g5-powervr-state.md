@@ -3200,3 +3200,40 @@ to every client, so the compositor reads it as plain rows and lands in the gaps.
 populate the whole allocation, or (b) stop declaring LINEAR for a buffer whose real layout is
 padded to 16 KiB rows, and hand the compositor a modifier that describes what the HAL actually
 produced. Do not re-run the pitch theory; it is measured equal.
+
+## 66. ROOT CAUSE: a render-pass clear does not reach the top of a LINEAR exportable image (2026-10-23)
+
+§65 narrowed the scanline corruption to "492 of 1080 rows wholly zero, fixed runs, period exactly
+64 rows". This section names the mechanism, by experiment rather than inference.
+
+New probe `probes/pvr_linear_layout_test.c` does the one thing that separates producer from consumer:
+it creates a LINEAR **exportable** image exactly like the ICD's swapchain image, writes to it, copies
+it on the GPU into a host-visible LINEAR image, and counts all-zero rows in the result. It runs as
+the app uid (the HAL's dma-buf cannot be mmap'd at all - `mmap: Permission denied` even for the app -
+so the readback must go through the GPU).
+
+**Two runs, identical but for how the image is written:**
+
+| how the image is filled | exportable pitch | result |
+|---|---|---|
+| `vkCmdClearColorImage` (transfer clear) | 16384 | **0 zero rows of 1080** - complete |
+| render pass, `loadOp = CLEAR` (what a game does) | 16384 | **128 zero rows, run [0,128] = the whole top** |
+
+So the export is fine and the read path is fine: a **render-pass clear does not reach the top 128
+rows** of this image. The transfer clear does. That is the defect, and it is in the HAL's render-pass
+path on this image configuration.
+
+This matches the real frames exactly: vkcube's frames had whole-row zero runs (never partial rows),
+fixed, at a 64-row period - i.e. whole tile rows of a render target that the clear never touched.
+128 = 2 x 64, the same 64-row granularity.
+
+**Why this was never seen before:** every earlier test of the dma-buf path used transfer operations
+(`vkCmdClearColorImage`, `vkCmdCopyImage`) - `probes/vk_dmabuf_test.c`, the WSI probes, all of them.
+A game's first write to a swapchain image is a render pass. The gap between those two paths is
+exactly where this hid.
+
+**Fix direction (not yet applied):** make the ICD do the clear itself. Before handing the app the
+image, or by putting the swapchain images in a state where the app's first render pass is not the
+first writer, the ICD can transfer-clear each image once at creation (`vkCmdClearColorImage` on the
+first use), which is measured to cover the whole image. Verify by re-running the probe with the
+render pass and by watching vkcube's frames for zero runs.
