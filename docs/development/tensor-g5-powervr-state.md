@@ -3766,3 +3766,57 @@ python3 tools/diag compare <run> <run> --frame --panel panel.json
 
 If the correlation comes back `not discriminating`, the digest says which side is flat and at what
 extent, which is itself the finding.
+
+## 79. ROOT CAUSE: the updater loop was a missing hard-link shim (2026-10-24, `1d7a046`)
+
+§64 recorded the Steam path's next wall as "steamwebhelper never starts because the updater loops",
+with the failure narrowed to `BCommitUpdatedFiles: failed to rename (error 38)` and a note that a
+plain directory rename under proot demonstrably succeeds. That note was correct, and it was also
+the reason the loop resisted diagnosis: **the rename was a symptom, not the failing call.**
+
+**The measurement.** This cycle's bootstrap log shows what the previous summary had lost:
+
+```
+[11:40:14] Extracting package...
+[11:41:50] Error: Failed to unzip item 3732 (package/tmp/steamrt64/pv-runtime/
+          steam-runtime-steamrt/steamrt3c_platform_3c.0.20261021.266024/files/
+          share/i18n/locales/anp_IN_)
+[11:41:50] Error: Failed to unzip package (runtime_steamrt_linuxarm64.zip.vz...)
+```
+
+The archive extraction fails, the update reverts, and Steam starts over on every launch. The
+rename error belongs to a different phase.
+
+**Ruled out, by test at the exact failing path, not by inference:**
+
+| Suspect | Test | Result |
+|---|---|---|
+| Path too long | `mkdir -p` that 193-character path | succeeds |
+| Cannot create | `echo > anp_IN_` there | succeeds |
+| Cannot rename | `mv` there | succeeds |
+| **Hard link** | `ln a b` there | **Permission denied** |
+
+Android's app sandbox denies `link()`/`linkat()` outright. The Steam runtime archive uses hard
+links as its dedup mechanism, so extraction dies at the first link entry it meets - an i18n locale
+file, which is why the error names something that looks unrelated.
+
+**Why it only bit sessions.** `GuestCommand` has passed `--link2symlink` since it was written; the
+session's `LinuxRuntime.prootPrefix` never did. proot's flag answers a guest `link()` with a symlink
+plus an entry its loader resolves, which is the standard answer to this sandbox restriction.
+
+**Fix.** `--link2symlink` moved into `prootPrefix`, so every proot the app builds carries it, and
+the session names `PROOT_L2S_DIR` under the app's own files directory, cleared at session start
+(left unnamed, proot keeps the stand-ins inside the guest rootfs, where they accumulate).
+
+**Verified on the device.** Same session, same archives, versionCode 42:
+
+```
+[15:42:41] Verifying installation...
+[15:42:41] Verifying file sizes only
+[15:42:53] Verification complete
+```
+
+No unzip error; the update completes instead of reverting. `steamwebhelper` now starts, and its log
+immediately shows the **GBM wall of §45-55** (`Failed to get fd for plane`,
+`Failed to export buffer to dma_buf`) rather than never launching at all. That is the next problem,
+and it is the one §50's AHB-backed GBM shim was built for.
