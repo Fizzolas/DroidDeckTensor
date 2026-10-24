@@ -271,6 +271,12 @@ int vkp_apply_window_request(void) {
         return 0;
     }
     sc_layer_window_gone();  /* the layer (if any) belongs to the old window */
+    /* The mapping is expressed in the OLD window's output pixels, and update_map() short-circuits
+     * on an unchanged (scene, output, mode, align) tuple - so without this a new window that happens
+     * to report the same size keeps a rectangle derived for the previous one, and a rotation change
+     * (a fold, a different display) is silently ignored. */
+    g_map.valid = 0;
+    g_map_scene_swapped = 0;
     destroy_swapchain(); /* recreated against the new window on the next frame */
     g_swap_hdr_unavailable = 0; /* a new surface (another display, say) may offer HDR10 */
     if (g_window) ANativeWindow_release(g_window);
@@ -1469,7 +1475,36 @@ int vkp_render_plain(int scene_w, int scene_h) {
  * 100 ms, on the compositor thread - and tear the swapchain down when it no longer matches; the next
  * frame rebuilds it (and, in layer mode, puts one black frame on it). */
 static void check_surface_changed(void) {
-    if (!g_swapchain || !g_surface || g_dev_state != 1) return;
+    /* No swapchain is not "nothing to check": the display path has no swapchain BY DESIGN, and the
+     * surface's size or rotation can still change under it (a fold, a rotation lock, another
+     * display). In that case the mapping has to be rebuilt instead of the swapchain. */
+    if (g_dev_state != 1 || !g_window) return;
+    if (!g_swapchain) {
+        const int64_t t = perf_now();
+        if (t - g_surface_checked_ns < 100000000LL) return;
+        g_surface_checked_ns = t;
+        VkExtent2D e = {0, 0};
+        int tr = 0;
+        if (!vkp_surface_caps(&e, &tr)) return;
+        /* Before the first mapping there is no baseline to compare against: let
+         * ensure_extent_from_window() establish it (it logs its own line) instead of reporting a
+         * change from nothing. */
+        if (g_extent.width == 0 || g_extent.height == 0) return;
+        int was = (g_extent.width << 16) ^ g_extent.height;
+        VkExtent2D parent = e;
+        int rot = (tr == 0x4 || tr == 0x8);
+        if (rot) { uint32_t x = parent.width; parent.width = parent.height; parent.height = x; }
+        int now_ = (parent.width << 16) ^ parent.height;
+        if (now_ == was && rot == g_map_scene_swapped) return;
+        droiddeck_log("gpu", "display surface changed (%ux%u rot=%d -> %ux%u rot=%d): rebuilding the mapping",
+                      g_extent.width, g_extent.height, g_map_scene_swapped,
+                      parent.width, parent.height, rot);
+        g_extent = parent;
+        g_map.valid = 0;
+        g_map_scene_swapped = rot;
+        return;
+    }
+    if (!g_surface) return;
     const int64_t now = perf_now();
     if (now - g_surface_checked_ns < 100000000LL) return;
     g_surface_checked_ns = now;
@@ -2198,7 +2233,10 @@ int vkp_surface_caps(VkExtent2D *extent, int *transform) {
     if (g_vk.GetPhysicalDeviceSurfaceCapabilitiesKHR(g_pd, g_surface, &caps) != VK_SUCCESS) return 0;
     g_surface_transform = caps.currentTransform;
     g_surface_transform_known = 1;
-    g_caps_extent = caps.currentExtent;
+    /* g_caps_extent is the value swap_init_locked records for check_surface_changed()'s swapchain
+     * comparison. Do NOT write it here: this function is the display path's, and on that path
+     * g_extent holds the ROTATED parent extent while g_caps_extent must keep matching what a
+     * swapchain build would see, or the first fallback frame rebuilds a swapchain it did not need. */
     if (extent && caps.currentExtent.width != 0xFFFFFFFF) *extent = caps.currentExtent;
     if (transform) *transform = (int)caps.currentTransform;
     return 1;
