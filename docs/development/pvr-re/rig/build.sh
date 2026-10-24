@@ -10,4 +10,9 @@ for f in mmwatch symwatch crashcatch; do
     "$ZIG" cc -target aarch64-linux-gnu.2.31 -fPIC -shared -O1 -o "$D/dist/$f.so" "$D/$f.c" -ldl
     echo "built $f.so"
 done
+# The known-answer probe: an executable, not a preload, so it is built on its own.
+if [ -f "$D/calibrate.c" ]; then
+    "$ZIG" cc -target aarch64-linux-gnu.2.31 -O1 -o "$D/dist/calibrate" "$D/calibrate.c"
+    echo "built calibrate"
+fi
 ls -la "$D/dist"
