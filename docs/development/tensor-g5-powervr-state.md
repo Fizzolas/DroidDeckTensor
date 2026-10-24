@@ -3512,3 +3512,50 @@ wait in the present path).
 the panel itself. If the picture is correct this closes the whole §65-73 thread; if it is not, the
 one number that matters is in that geometry line - whether the destination rectangle is in the
 display's space or the window's.
+
+## 75. The display path was placing the picture for the wrong aspect — found and fixed without a device (2026-10-24, commit `9fba8825`)
+
+Verifying §74 against the authoritative docs, rather than against my own reasoning, found two
+defects in it. Both would have shown a visibly wrong picture.
+
+**The docs** (`$NDK/.../include/android/surface_control.h`) say of `ASurfaceTransaction_setGeometry`:
+
+> `destination` — "the rect in the **parent's** space where this surface will be drawn"
+> `transform` — "the transform applied after the source rect is applied to the buffer... set to 0
+> for no transform. To specify a transform use the `NATIVE_WINDOW_TRANSFORM_*` enum."
+
+**The device** (`dumpsys SurfaceFlinger`, the config that ships) shows SurfaceFlinger composing our
+buffer with:
+
+```
+sourceCrop=[0 0 2404 1080]   bufferTransform=ROT_270
+```
+
+**Bug 1 - no rotation was passed.** §74 passed `transform = 0` on the comment's claim that "the DPU
+scales, never rotates". It rotates: a 2404x1080 buffer on a 1080x2404 panel. Without it the DPU reads
+the buffer as though it were already portrait - a per-scanline misread, i.e. the exact symptom this
+work exists to remove. Fixed with `vkp_surface_transform_hal()`: `HAL_TRANSFORM_ROT_270 = 7`,
+`ROT_90 = 4`, `ROT_180 = 3`, values taken from `graphics-base-v1.0.h`, not guessed.
+
+**Bug 2 - the destination was computed in the wrong space, and the scene in the wrong frame.**
+`caps.currentExtent` is the SURFACE's extent; the destination is in the PARENT's, which differs by
+exactly that rotation. And once the layer rotates, the scene -> parent mapping has to be done in the
+ROTATED frame. `ensure_extent_from_window()` now swaps the extent for 90/270 and `vkp_update_map()`
+swaps the scene it maps. This is checkable by hand and was clearly wrong: a 2404x1080 scene mapped
+into a 1080x2404 parent without the swap yields a **1080x485** destination - a letterbox for the
+wrong aspect. With both fixes the chain resolves to `dst = [0,0 - 1080,2404]`: 1:1 with the rotated
+source, filling the panel.
+
+**The same mistake existed at three more sites** - `layer_geometry` (the `sc_layer_present` and AHB
+paths) and both effects-pass paths all called `vkp_map_rect` with the unswapped scene after
+`vkp_update_map`. They now all use `vkp_mapped_scene_size()`, the size the map was actually built
+for. The swap flag is cleared whenever a swapchain is live, so a session that falls back to the copy
+path does not keep mapping in the rotated frame.
+
+**Method note.** This was found by reading the vendor's own header for the call's contract, and the
+device's own dumpsys for the value, instead of reasoning from a code comment. The comment that was
+wrong ("the DPU scales, never rotates") had been in the tree for months and was never checked against
+either.
+
+Still BUILT, NOT SEEN. The geometry is now self-consistent with the driver's own report; only the
+panel can confirm the result.
