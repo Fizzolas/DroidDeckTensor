@@ -3609,3 +3609,60 @@ rotation  check detects -> g_extent=parent, map invalidated -> remapped next fra
 versionCode 40. **Still BUILT, NOT SEEN.** What remains unverifiable without hardware is now only
 whether the whole approach presents a picture at all - the geometry itself is confirmed against
 AOSP's implementation and against the device's own dumpsys.
+
+## 77. The diagnostic harness: instruments that prove themselves (2026-10-24)
+
+This work existed because the effort kept losing time to four named failures rather than to hard
+problems, and each one has a mechanism here now:
+
+1. **An instrument cited before it was validated.** `vkp_pitch_dump` read a 2404x1080 frame through
+   a 256x256 cursor helper; three findings (§65-68) rested on it and all were retracted. Now every
+   instrument declares a known-answer check in `tools/diagkit/instruments.toml`, and a run's
+   manifest records its verdict. The frame digest's check renders a known pattern **at the session's
+   true resolution** and requires the digest to recover it; a helper sizing itself from the wrong
+   extent fails that check instead of producing a plausible wrong number.
+2. **Measuring a build other than the one shipped (§36).** `diag doctor` inventories every artifact
+   the harness can push and compares it with stock, and a run records each process's mapped inodes.
+   Installed is not loaded.
+3. **A contrast that could not discriminate (§63).** `diag compare` refuses a pair of runs whose
+   arms differ in more than the one declared field, or whose instruments were calibrated
+   differently between arms - the exact shape of §63's "instrumented ICD survives" that was later
+   withdrawn.
+4. **A device left armed by a failed rollback (§63).** `diag doctor` refuses to start a run on a
+   dirty device, and a teardown that does not verify taints the run rather than being mentioned.
+
+It also mechanises §73: `diag prior "<question>"` searches every run and log already on disk and
+prints `file:line` hits, so the check that refuted a written-up hypothesis costs one command.
+
+**Frames are text.** Two producers emit one record - 32 band means, zero-row runs, a run-length
+profile, a 16x16 luminance grid, a hash, and optionally a 48x20 ASCII map - at the frame's true
+extent and the driver's reported row pitch. One runs in the compositor
+(`vkp_frame_digest`, behind `BL_FRAME_DIGEST=1` or `2`), the other decodes `screencap` on the host.
+They are held to byte-identical integer output by `test_diag_frames_parity.py`, because two
+producers that disagree are two instruments that cannot be compared. No image is written, stored or
+read; `screencap` is used only when a run declares it and its bytes are discarded after decoding.
+
+**Commands** (`python3 tools/diag <command>`):
+
+```
+doctor                     inventory and cleanliness; non-zero when the device is dirty
+run --label --hypothesis --arm name=value [--calibrate INSTR] [--snapshot]
+prior "<question>"         search existing evidence before hypothesising
+analyze <run>              findings, each with artifact:line and an UNTRUSTED/TAINTED stamp
+compare <a> <b>            refuse or allow a two-arm comparison
+frame --raw|--panel        one digest record
+export <run> [dest]        a text-only bundle
+```
+
+**Status: built, all tests green.** 51 harness tests pass, including the Python/C parity suite. The
+compositor's digest compiles into the ARM64 library (`vkp_frame_digest` and `fd_should_sample` are
+exported symbols in the built `.so`) and `versionCode` 41 carries `snapshot`/`mark` in
+`classes6.dex`. **Not yet run on the device:** the digest has not been seen producing a record from
+a real PowerVR frame, and the snapshot methods have not been called against a live session. The
+first device run should confirm `doctor` on a clean device, one `run --calibrate frame-digest
+--snapshot`, and that `BL_FRAME_DIGEST=2` yields `fd` lines with a recognisable ASCII map.
+
+Note for the pre-existing test suite: 35 failures and 32 errors remain on a Windows host in
+`test_appimage_run`, `test_game_environment`, `test_steam_*` and friends - they are the guest shell
+scripts being invoked with Windows paths (`/bin/bash: C:Users...`), present before this work and
+unrelated to it. CI runs them on `ubuntu-24.04`.

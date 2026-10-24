@@ -165,5 +165,38 @@ class RunWiringTest(unittest.TestCase):
             self.assertEqual(4, code)
 
 
+class ExportTest(unittest.TestCase):
+    def test_export_writes_text_only(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            run = Path(tmp) / 'run'
+            run.mkdir()
+            (run / 'manifest.json').write_text(json.dumps(
+                {'schema': 1, 'arm': {}, 'instruments': {}, 'taint': {'reasons': []}}))
+            (run / 'wayland.log').write_text('line\n')
+            (run / 'frame.raw').write_bytes(b'\x00' * 64)
+            (run / 'libgbm.so').write_bytes(b'\x7fELF')
+            dest = Path(tmp) / 'out'
+            with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+                self.assertEqual(0, cli.main(['export', str(run), str(dest)]))
+            names = {p.name for p in dest.rglob('*') if p.is_file()}
+            self.assertIn('wayland.log', names)
+            self.assertNotIn('frame.raw', names)
+            self.assertNotIn('libgbm.so', names)
+            self.assertIn('findings.txt', names)
+
+    def test_an_exported_bundle_carries_the_citations(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            run = Path(tmp) / 'run'
+            run.mkdir()
+            (run / 'manifest.json').write_text(json.dumps(
+                {'schema': 1, 'arm': {}, 'instruments': {}, 'taint': {'reasons': []}}))
+            (run / 'wayland.log').write_text(
+                '00:00:01.000  fd   t=1.000 8x8 pitch=32 zero_rows=0 hash=aa\n')
+            dest = Path(tmp) / 'out'
+            with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+                cli.main(['export', str(run), str(dest)])
+            self.assertIn('wayland.log:1', (dest / 'findings.txt').read_text())
+
+
 if __name__ == '__main__':
     unittest.main()
