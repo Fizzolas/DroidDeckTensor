@@ -840,15 +840,6 @@ static void take_dmabuf(struct surface *s, struct dmabuf_buffer *b, struct wl_re
                        vkp_modifier_name(b->modifier),
                        ahb_swapchain_has_ahb(b) ? "gralloc buffers: can go on the display layer without a copy"
                                                 : "dma-buf: copied into the screen swapchain");
-            /* DIAGNOSTIC: fingerprint the client's rows as the GPU samples them, to separate "the client
-             * wrote garbage" from "we read its rows at the wrong offset". The compositor is an Android
-             * process, so a guest variable cannot reach it: the switch is a file in the app's own dir. */
-            static int dump_on = -1;
-            if (dump_on < 0) {
-                dump_on = access("/data/user/0/com.droiddeck.launcher/files/pitch_dump", F_OK) == 0;
-                if (dump_on) droiddeck_log("dmabuf", "pitch dump armed (files/pitch_dump present)");
-            }
-            if (dump_on) vkp_pitch_dump(b->img, "client-frame", 8);
         }
         else if (ahb_swapchain_has_ahb(b))
             droiddeck_log("vulkan", "%s is presenting GPU frames through Wayland: %dx%d on its own display layer only "
@@ -2142,6 +2133,72 @@ static void render_scene(void) {
      *   - screen effects DO when a window is drawn above the game: the chain has to see the whole
      *     scene to look the way it does on the copy path, and here the game is only part of it. */
     const int pass_on = fx_on || framegen;
+    /* DISPLAY LAYER PATH: put the WHOLE scene on the game's SurfaceControl layer instead of
+     * blitting it into the compositor's own swapchain.
+     *
+     * This is the default whenever a display layer is available, because it removes the only
+     * negotiation in this pipeline that does not settle on this panel: a vkSwapchain on the
+     * Android Surface reports currentTransform=ROT_270 together with an already-rotated extent
+     * and answers VK_SUBOPTIMAL_KHR on every present, and no preTransform makes both true
+     * (state doc 69-73). A layer states its buffer's source and destination rectangles outright,
+     * so the display does the placement and nothing can disagree. The compositor still composites
+     * every draw on the GPU (vkp_render_display) - what is dropped is only the swapchain.
+     *
+     * Falls through to the old paths when the layer is unavailable, when frame generation needs
+     * per-vblank presents (a layer latches one buffer per refresh), or when the display switch
+     * Download/droiddeck-env can turn off for an A/B. */
+    static int display_off = -1;
+    if (display_off < 0) {
+        display_off = access("/data/user/0/com.droiddeck.launcher/files/swapchain_copy", F_OK) == 0;
+        droiddeck_log("layer", "display-layer path %s (files/swapchain_copy %s)",
+                      display_off ? "OFF: the scene goes through the screen swapchain"
+                                  : "ON: the scene goes on the game's display layer, no swapchain",
+                      display_off ? "present" : "absent");
+        if (!display_off && !sc_layer_available())
+            droiddeck_log("layer", "display-layer path not usable: this device has no SurfaceControl API "
+                       "(Android 10+, libnativewindow AHardwareBuffer_getNativeHandle)");
+    }
+    /* Screen effects keep their existing routes: the chain runs in vkp_pass_begin and its result
+     * already has a layer route of its own (sc_layer_present_pass / sc_layer_present_hdr_scene).
+     * Running the display path instead would silently drop the effect. */
+    const int display_route = !display_off && !framegen && !fx_on && sc_layer_available();
+    int on_display = 0;
+    if (display_route) {
+        VkImage dimg = VK_NULL_HANDLE;
+        int drw = 0, drh = 0;
+        sc_layer_hide_overlay();
+        int pr = -1;
+        if (vkp_render_display(w, h, dl.d, dl.n, &dimg, &drw, &drh) == 0)
+            pr = sc_layer_present_display(dimg, drw, drh, w, h);
+        if (pr == 0) {
+            on_display = 1;
+            rendered = 1;
+            copy = 0;      /* nothing went through the swapchain */
+            hdr_copy = NULL;
+            /* Deliberately NO vkp_base_black() here: it presents through render_impl, which
+             * acquires a swapchain image and would create exactly the swapchain this path exists
+             * to avoid. Nothing is lost - the game layer is opaque and covers the display, so the
+             * base underneath is never seen, and a SurfaceView never presented is black. */
+        } else if (pr > 0) {
+            /* Deliberately dropped (no free layer buffer): the frame stays on the layer's last
+             * buffer. Not an error, and not a reason to rebuild a swapchain. */
+            on_display = 1;
+            rendered = 1;
+            copy = 0;
+        } else {
+            static int said_display_fail;
+            if (!said_display_fail) {
+                said_display_fail = 1;
+                droiddeck_log("layer", "the display-layer path did not take this frame; using the screen "
+                           "swapchain for it");
+            }
+            /* If that frame DID reach the layer but was refused, the layer may still be showing an
+             * older buffer, which would cover the swapchain frame drawn underneath it. Take it down
+             * before falling back; the old paths raise their own layer when they want one. */
+            sc_layer_hide();
+        }
+    }
+    if (!on_display) {
     int li = (g_zero_copy && !framegen) ? layer_candidate(&dl, w, h) : -1;
     int over = li >= 0 ? dl.n - 1 - li : 0; /* draws above the fullscreen game (0 or 1) */
     const int fx_blocks = (li >= 0 && fx_on && over > 0);
@@ -2238,6 +2295,7 @@ static void render_scene(void) {
                  : !g_zero_copy ? "zero-copy presentation is off"
                  : framegen ? "frame generation needs the compositor pass"
                  : "it is not the one fullscreen window (only that one gets its own display layer)";
+    }
     }
     } /* routes 0 and 3 */
     free(hs.is_hdr);

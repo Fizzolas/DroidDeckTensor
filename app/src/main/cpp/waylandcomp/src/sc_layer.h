@@ -68,6 +68,7 @@
 #include <stddef.h>
 #include <stdint.h>
 #include <android/hardware_buffer.h>
+#include <vulkan/vulkan.h>
 
 struct vkp_image;
 struct vkp_draw;
@@ -101,6 +102,12 @@ void sc_layer_hdr_symbols(char *out, size_t size);
  * The copy into the layer buffer is 8-bit: an HDR frame keeps its tag (its colours stay right), and
  * loses precision. */
 int sc_layer_present(struct vkp_image *src, int scene_w, int scene_h, const struct droiddeck_color *color);
+
+/* GAME layer, DISPLAY PATH: show the scene image the compositor rendered with vkp_render_display.
+ * The scene -> screen rectangle comes from the same mapping the copy path uses, so both paths place
+ * the picture identically. This path creates NO swapchain and asks the presentation engine nothing.
+ * 0 = on the layer, 1 = dropped (no free buffer), -1 = unavailable (caller falls back). */
+int sc_layer_present_display(void *img, int rw, int rh, int scene_w, int scene_h);
 
 /* GAME layer, screen effects on: run the compositor pass (composite `draws` + the effects chain,
  * vkp_pass_begin) and put its result on the layer. Same return values as sc_layer_present. */

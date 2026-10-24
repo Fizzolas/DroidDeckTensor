@@ -900,6 +900,49 @@ int sc_layer_present(struct vkp_image *src, int scene_w, int scene_h, const stru
     return 0;
 }
 
+/* DISPLAY PATH: show the scene image the compositor just rendered on the game's display layer,
+ * placing it with an EXPLICIT source -> destination rectangle.
+ *
+ * This is the swapchain-free route. The compositor composites every draw on the GPU into its own
+ * scene image (vkp_render_display); the only thing this adds is the copy into a gralloc buffer and
+ * an ASurfaceTransaction that says "this buffer, these source pixels, onto these screen pixels".
+ * Nothing here asks the presentation engine what geometry to use, which is the point: a vkSwapchain
+ * on this panel reports currentTransform=ROT_270 with an already-rotated extent and answers
+ * SUBOPTIMAL forever, and no preTransform satisfies both (state doc 69-73). A layer states its
+ * geometry outright, so there is nothing left to disagree about.
+ *
+ * The scene -> screen rectangle comes from the same mapping the copy path uses (vkp_map_rect), so
+ * the two paths place the picture identically - a resolution change or a 16:10-vs-16:9 session
+ * produces the same bars either way.
+ *
+ * scene_w/scene_h are the scene the draws were composed for; the image is `img` at rw x rh.
+ * 0 = on the layer, 1 = nothing visible (deliberately dropped: no free buffer), -1 = the layer
+ * path is unavailable this frame and the caller must fall back.
+ */
+int sc_layer_present_display(void *img_handle, int rw, int rh, int scene_w, int scene_h) {
+    VkImage img = (VkImage)img_handle;
+    struct layer *l = layer_of(SC_LAYER_GAME);
+    int r[8];
+    if (!img || rw <= 0 || rh <= 0 || ensure_sc(l) != 0) return -1;
+    if (vkp_update_map(scene_w, scene_h) != 0) return -1;
+    if (!vkp_map_rect(rw, rh, scene_w, scene_h, r)) { sc_layer_hide(); return 1; }
+    int wait_fd;
+    int idx = take_free_slot(l, rw, rh, AHB_RGBA8, &wait_fd);
+    if (idx < 0) { log_drop(l); return 1; }
+    /* The scene image carries its own layout, so it needs the scene-specific blit, not the generic
+     * client-image one. */
+    if (vkp_blit_scene_to(l->slots[idx].img, wait_fd) != 0) return -1;
+    if (present_slot(l, idx, r, NULL, 0) != 0) return -1;
+    if (!l->first_logged) {
+        l->first_logged = 1;
+        droiddeck_log("layer", "presenting %dx%d frames on their own SurfaceControl layer (%s pool, %d buffers); "
+                   "the compositor hands the scene over directly, no swapchain involved", rw, rh,
+                   l->pool_modifier == MOD_QCOM_COMPRESSED ? "UBWC" : "linear", l->pool_n);
+    }
+    vkp_signal_first_frame();
+    return 0;
+}
+
 int sc_layer_present_pass(const struct vkp_draw *draws, int n, int scene_w, int scene_h) {
     struct layer *l = layer_of(SC_LAYER_GAME);
     int rw = 0, rh = 0, r[8];

@@ -2,6 +2,11 @@
 #define VK_PRESENT_H
 #include <stdint.h>
 #include <android/native_window.h>
+#ifndef VK_USE_PLATFORM_ANDROID_KHR
+#define VK_USE_PLATFORM_ANDROID_KHR
+#endif
+#include <vulkan/vulkan.h>
+#include <vulkan/vulkan_android.h>
 /*
  * Android-surface render backend for the embedded Wayland compositor.
  * Owns a Turnip VkDevice + a swapchain on the SurfaceView's ANativeWindow. Each
@@ -95,6 +100,19 @@ int vkp_device_lost(void);
 // Clear to black, blit the draws in order (first = bottom) and present.
 // Returns 0 on success, -1 if nothing could be presented (no window yet, etc.).
 int vkp_render(int scene_w, int scene_h, const struct vkp_draw *draws, int n);
+/* Render a scene WITHOUT a swapchain: composite on the GPU into the internal scene image and hand
+ * it back (left in TRANSFER_SRC_OPTIMAL) for the caller to put on a display layer. The display does
+ * the scene -> output placement, so no surface geometry is negotiated at all. Use this on the
+ * display-layer path: a swapchain's preTransform/currentExtent/caps dialogue has no value there and
+ * on some panels never settles (state doc 69-72). -1 = not possible; use vkp_render(). */
+/* The window surface's capabilities - the DISPLAY's coordinate space and rotation - creating only a
+ * VkSurface and never a swapchain. 1 = known. Use this to place display layers. */
+int vkp_surface_caps(VkExtent2D *extent, int *transform);
+
+int vkp_render_display(int scene_w, int scene_h, const struct vkp_draw *draws, int n,
+                       void **out, int *rw, int *rh);
+/* Blit the scene image vkp_render_display produced into a layer buffer (correct layout/access). */
+int vkp_blit_scene_to(struct vkp_image *dst, int wait_fd);
 /* A black frame with no compositor pass (no effects, no frame generation), whatever is armed: the
  * base surface under an HDR game that keeps its display layer (compositor.c). */
 int vkp_render_plain(int scene_w, int scene_h);
@@ -150,8 +168,6 @@ int vkp_blit_image(struct vkp_image *src, struct vkp_image *dst, int wait_fd);
 /* A client's GPU cursor (an imported dma-buf, often UBWC) read back as w*h 0xAARRGGBB pixels through a
  * linear host-visible copy; waited for on the CPU. Compositor thread, between frames. 0 = ok. */
 int vkp_image_readback(struct vkp_image *src, uint32_t *out, int max_px);
-/* DIAGNOSTIC: fingerprint rows of an image as the GPU samples it (DROIDDECK_PITCH_DUMP). */
-void vkp_pitch_dump(struct vkp_image *src, const char *tag, int limit);
 /* Refresh the scene -> output mapping for this scene size without presenting (creates the
  * swapchain if needed, since the mapping is in output pixels). 0 = mapping valid. */
 int vkp_update_map(int scene_w, int scene_h);
