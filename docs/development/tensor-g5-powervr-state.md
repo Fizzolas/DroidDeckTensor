@@ -3381,3 +3381,54 @@ and compare the panel. It has NOT been run yet.
 **Known-bad, do not reason from:** `vkp_pitch_dump` / `vkp_image_readback` (cursor helper, 256x256),
 and the scanout dump's read of `g_images[img]` after `vkQueuePresentKHR` re-acquires the image, so
 its "all-zero" reading is not evidence about what was presented.
+
+## 72. Static analysis: the compositor presents through TURNIP on a POWERVR device (2026-10-23)
+
+Done without the device attached, so this section is a code finding with a proposed one-variable test
+rather than a measurement. Treat the hypothesis as unproven until that test runs.
+
+**The finding.** The compositor renders its Android Surface with **Turnip** (Qualcomm's open-source
+Vulkan, via adrenotools), not with the SoC's own driver:
+
+```
+vk_loader.c:23   g_handle = adrenotools_open_libvulkan(RTLD_LOCAL|RTLD_NOW, ADRENOTOOLS_DRIVER_CUSTOM,
+                                   tmpdir, native_lib_dir, driver_path, library_name, NULL, NULL);
+vk_loader.c:31-36  only if THAT fails -> dlopen("libvulkan.so")   // the system driver
+```
+
+`waylandcomp_jni.c:250-260` describes this as intended: "Start with a real output Surface + the
+container's Turnip driver (adrenotools). Frames committed by clients are composited to this Surface
+via Turnip." On an Adreno that is a sensible choice. **On the Pixel 10 (Imagination PowerVR) it is
+Turnip compiling and emitting the command stream that lands in PowerVR scanout buffers.**
+
+Why this is a plausible cause of the symptom, and why it fits the observations that matter:
+- Turnip is tile-based: it emits GMEM-resolve streams with a fixed tile height. A PowerVR scanout
+  allocation handed to that stream is read back per-tile; if the driver will not apply Turnip's
+  binning layout to a foreign allocation, the result is WHOLE horizontal bands of unrelated memory
+  per tile - "each line unique, no vertical structure, no recognisable image".
+- It explains why the bands' ORIENTATION tracked the surface transform (observed directly: the user
+  reported the static "went vertical instead of horizontal" between tests). A per-tile read of a
+  rotated/transformed scanout changes band orientation with the transform; a fixed buffer defect would
+  not.
+- It explains why every upstream stage is clean: `screencap` (SurfaceFlinger's own GPU path) shows a
+  coherent picture, and the client pixels, dma-buf export, our import and the scene blit are all
+  upstream of it (§70).
+
+**The one-variable test.** Make `vk_loader_open` skip adrenotools and fall through to
+`dlopen("libvulkan.so")` - the system PowerVR driver - and look at the panel. The fallback path
+already exists (`vk_loader.c:31`). If the static disappears, the fault is Turnip-presenting-to-PowerVR
+and the fix is to select the vendor's own driver for presentation (as the app already does for the
+guest, where `BwrapSpawner.kt:234-245` picks Turnip/PanVK/PowerVR by vendor and names
+`/dev/dri/renderD128` for Tensor G5).
+
+**Secondary defect found in the same pass (unproven, cheap to check):** the copy path
+(`compositor.c` take_dmabuf -> vkp_render) imports a client dma-buf and blits it in the same frame
+with no wait on the producer's fence. `ahb_swapchain.c` handles `DMA_BUF_IOCTL_IMPORT_SYNC_FILE`
+only for the zero-copy AHB path; the plain dmabuf path has no equivalent. A late-arriving client
+frame would show partial or stale content - a different symptom from bands, but the same "no sync"
+class.
+
+**Correction carried forward:** the `preTransform` decision at `vk_present.c:752` is back to the
+surface-listed value (see §71). For an Android Surface the WSI reports a rotation-corrected
+`currentExtent` together with a non-IDENTITY `currentTransform`; those are contradictory, and
+IDENTITY over an already-rotated extent is the self-consistent choice.
