@@ -3730,3 +3730,39 @@ and is the next thing to run: a Steam session with `BL_FRAME_DIGEST=2`, a panel 
    off" for the whole session, because `CompositorHost` keeps one compositor alive for the app's
    process and the level is read once at its start. Arming the switch therefore needs an
    `am force-stop` (or a fresh app process), not just a new session.
+
+**§78 addendum — the same measurement on the Steam path (2026-10-24).** Run as designed: Steam
+session with `BL_FRAME_DIGEST=2`, 132 compositor grids, one live panel capture.
+
+```
+compositor grids    132
+best r              0.69
+discriminating      FALSE (compositor variance 17.5, panel variance 39.0)
+verdict             "not discriminating: one or both pictures are flat"
+```
+
+**The instrument did the right thing: it refused to call that a match.** Both pictures are nearly
+black (panel band means 4-15 of 255; the compositor's ASCII map is blank for every row), and two
+nearly-flat pictures correlate meaninglessly. This is precisely the trap that a plain hash or a
+naive "they agree" check falls into, and the guard caught it.
+
+**Why the screen is black, from the surrounding evidence, not inference.** The session log shows
+`Found pending update` → `Installing update...` at session start: this is the updater loop recorded
+in §64, still the wall on the Steam path. The Steam window is open at 1650x732 and the compositor
+takes 2470-2500 GPU frames per 10 s through the display-layer path, but what it is being given is
+the update UI's near-black frame at 2-3 fps. So this run measured the updater, not the game.
+
+**What that means for the static.** The Steam-path correlation cannot be evaluated until the client
+gets past the updater, because the picture never reaches anything worth correlating. The command is
+ready and is one step once that wall falls:
+
+```sh
+python3 tools/diag run --label steam-frame --hypothesis "..." --arm digest=2 \
+       --env BL_FRAME_DIGEST=2 --snapshot
+# with Steam compositing a real frame:
+python3 tools/diag frame --panel > panel.json
+python3 tools/diag compare <run> <run> --frame --panel panel.json
+```
+
+If the correlation comes back `not discriminating`, the digest says which side is flat and at what
+extent, which is itself the finding.
