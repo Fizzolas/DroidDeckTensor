@@ -3820,3 +3820,47 @@ No unzip error; the update completes instead of reverting. `steamwebhelper` now 
 immediately shows the **GBM wall of §45-55** (`Failed to get fd for plane`,
 `Failed to export buffer to dma_buf`) rather than never launching at all. That is the next problem,
 and it is the one §50's AHB-backed GBM shim was built for.
+
+## 80. Past the updater: the client reaches the login screen; the wall is now the 1x1 surface (2026-10-24)
+
+With §79's hard-link shim in the session proot, the whole §64 chain is gone. A Steam session
+(2026-10-24-10-steam, versionCode 42, wireless ADB) now runs:
+
+```
+18:54:40  Verifying installation...
+18:54:59  Verification complete          (no unzip error, no revert)
+18:54:42  focused app: 769               (the section 64 fallback taking effect)
+18:55:08  SetLoginState: WaitingForCredentials - OK
+18:55:13  GPU process started: start count: 0
+```
+
+**The client UI is up and waiting for a login.** That is further than any previous run: §64 ended
+with "steamwebhelper never starts", and §63 with the GPU process dying at Big Picture's first
+composite.
+
+**Two consequences for the record.**
+
+1. **The GBM wall of §45-55 is not currently in the way.** `steamwebhelper.log` carries **0**
+   `Buffer handle is null` lines and **0** `gbm_wrapper` errors this session. The `libgbm.so.1` AHB
+   shim is not installed (the harness keeps a clean device), so the shim is not what is getting the
+   client this far - the client simply is not reaching GBM. Its remaining messages are environmental
+   and benign: D-Bus UPower absent, `inotify max_user_watches` unreadable, Floss absent.
+
+2. **The wall is the 1x1 surface, and it is now precisely located.** The compositor log shows two
+   dma-bufs from the client in the same instant:
+
+   ```
+   dmabuf  pitch 1602x720 declared=8192 honoured=8192 (linear)          <- imports fine
+   vulkan  "Steam" presenting GPU frames through Wayland: 1602x720, AR24, linear
+   error   could not import GPU frames from "Steam" (1x1, modifier 0xffffffffffffff)
+   ```
+
+   The 1602x720 buffer is correct and is imported. A second surface commits **1x1 with
+   `MOD_INVALID`**, cannot be imported, and that is the window Steam's UI is drawn into. When it
+   cannot get a usable surface the client closes the window and exits `rc=0` (a clean shutdown, not a
+   crash). This is the §51/§59-60 signature, unchanged - but it is now reachable without an updater
+   loop in front of it, which it never was before.
+
+**Next.** The 1x1 commit is the whole problem: fix that and the login screen is on the panel. The
+harness measures it directly with `BL_FRAME_DIGEST=2` plus a panel capture, and `diag compare
+--frame --panel` will say whether the panel matches the scene once a real frame reaches it.
