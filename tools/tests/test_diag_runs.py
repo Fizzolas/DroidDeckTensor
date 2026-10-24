@@ -23,6 +23,11 @@ class FakeAdb:
         self.files = {}
         self.written = []
         self.provider_calls = []
+        self.calls = []
+
+    def shell(self, cmd, timeout=30):
+        self.calls.append(cmd)
+        return ''
 
     def push_bytes(self, path, data):
         self.written.append((path, data))
@@ -107,6 +112,28 @@ class RunTest(unittest.TestCase):
         self.assertIn(('snapshot', None), self.adb.provider_calls)
         self.assertEqual('clean', manifest.trust(manifest.read_manifest(run.dir)))
 
+    def test_the_host_gathers_the_dumps_an_app_cannot_read(self):
+        """An app holds no DUMP permission; measured on device, every dumpsys probe was a denial."""
+        run = self.make()
+        run.begin()
+        out = run.snapshot()
+        for _command, name in run.HOST_DUMPS:
+            self.assertTrue((Path(out) / name).is_file(), name)
+        self.assertIn('dumpsys SurfaceFlinger', ' '.join(self.adb.calls))
+
+    def test_a_failed_host_dump_is_recorded_not_silently_empty(self):
+        class NoDump(FakeAdb):
+            def shell(self, cmd, timeout=30):
+                self.calls.append(cmd)
+                if cmd.startswith('dumpsys'):
+                    raise RuntimeError('denied')
+                return ''
+        run = runs.Run(self.tmp, 'l', 'h', {'v': '1'}, NoDump(), 'c', 41)
+        run.begin()
+        out = run.snapshot()
+        text = (Path(out) / 'surfaceflinger.txt').read_text()
+        self.assertIn('host dump failed', text)
+
     def test_a_mark_is_recorded(self):
         run = self.make()
         run.begin()
@@ -154,6 +181,30 @@ class RunTest(unittest.TestCase):
         run.calibrate(self.adb, ['frame-digest'])
         stored = manifest.read_manifest(run.dir)
         self.assertEqual('passed', stored['instruments']['frame-digest']['calibration'])
+
+    def test_a_snapshot_in_app_private_data_is_pulled_through_run_as(self):
+        """adb pull gets Permission denied on the app's own files (measured on the device)."""
+        class Private(FakeAdb):
+            APP_DATA = '/data/user/0/com.droiddeck.launcher/'
+            def __init__(self):
+                super().__init__()
+                self.app_pulls = []
+            def provider(self, method, arg=None):
+                self.provider_calls.append((method, arg))
+                return {'ok': True, 'dir': self.APP_DATA + 'files/diag-snapshots/snapshot-1'}
+            def pull_app_private(self, remote, local):
+                self.app_pulls.append(remote)
+                Path(local).mkdir(parents=True, exist_ok=True)
+                (Path(local) / 'procs.txt').write_text('pid=1\n')
+                return Path(local)
+            def pull(self, remote, local):
+                raise AssertionError('must not use a plain pull on app-private data')
+        adb = Private()
+        run = runs.Run(self.tmp, 'l', 'h', {'v': '1'}, adb, 'c', 41)
+        run.begin()
+        out = run.snapshot()
+        self.assertTrue((Path(out) / 'procs.txt').is_file())
+        self.assertTrue(adb.app_pulls)
 
 
 if __name__ == '__main__':

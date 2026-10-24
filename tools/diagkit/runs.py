@@ -94,8 +94,18 @@ class Run:
         self.manifest['maps'] = processes
         manifest.write_manifest(self.dir, self.manifest)
 
+    # What only the shell uid can read. The app has no android.permission.DUMP, so asking it for
+    # these produced "Permission Denial" inside files that looked like evidence (measured on the
+    # device: every dumpsys probe came back 27-133 bytes of denial).
+    HOST_DUMPS = (
+        ('dumpsys SurfaceFlinger', 'surfaceflinger.txt'),
+        ('dumpsys display', 'display.txt'),
+        ('dumpsys input', 'input.txt'),
+        ('dumpsys window displays', 'windows.txt'),
+    )
+
     def snapshot(self, adb=None):
-        """Ask the app for a text snapshot of the device and file it with the run."""
+        """Ask the app for its half, then gather the shell-only half beside it."""
         adb = adb or self.adb
         response = adb.provider('snapshot')
         if not response.get('ok'):
@@ -104,9 +114,24 @@ class Run:
             return None
         dest = self.dir / 'snapshots' / Path(response['dir']).name
         dest.parent.mkdir(parents=True, exist_ok=True)
-        adb.pull(response['dir'], dest)
+        if str(response['dir']).startswith(getattr(adb, 'APP_DATA', '/data/user/0/')):
+            adb.pull_app_private(response['dir'], dest)
+        else:
+            adb.pull(response['dir'], dest)
+        self.gather_host_dumps(adb, dest)
         self.manifest.setdefault('snapshots', []).append(str(dest))
         manifest.write_manifest(self.dir, self.manifest)
+        return dest
+
+    def gather_host_dumps(self, adb, dest):
+        """The dumps an app process cannot read, taken from the host with the shell's DUMP grant."""
+        dest = Path(dest)
+        dest.mkdir(parents=True, exist_ok=True)
+        for command, name in self.HOST_DUMPS:
+            try:
+                (dest / name).write_text(adb.shell(command, timeout=60), encoding='utf-8')
+            except Exception as exc:
+                (dest / name).write_text(f'host dump failed: {exc}\n', encoding='utf-8')
         return dest
 
     def mark(self, adb, label):

@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import json
 import os
+import shutil
 import subprocess
 import sys
 from pathlib import Path
@@ -75,3 +76,43 @@ class Adb:
         if result.returncode != 0:
             raise AdbError(result.stderr.strip() or 'adb pull failed')
         return Path(local)
+
+    APP_DATA = '/data/user/0/com.droiddeck.launcher/'
+
+    def pull_app_private(self, remote, local):
+        """Pull a path inside the app's own data dir, which `adb pull` cannot reach.
+
+        The app's files are mode 600 under its uid, so the shell user gets "Permission denied"
+        (measured on the device). `run-as` runs as that uid, so the directory is tarred in the
+        guest and extracted here. tarfile is stdlib, so nothing new is needed to read it.
+        """
+        import io
+        import tarfile
+
+        remote = str(remote)
+        relative = remote[len(self.APP_DATA):] if remote.startswith(self.APP_DATA) else remote
+        result = self._run('exec-out', f'run-as com.droiddeck.launcher tar -cf - {relative}',
+                           timeout=120, binary=True)
+        if result.returncode != 0:
+            detail = result.stderr.decode(errors='replace').strip() if result.stderr else ''
+            raise AdbError(detail or 'run-as tar failed')
+        local = Path(local)
+        local.mkdir(parents=True, exist_ok=True)
+        with tarfile.open(fileobj=io.BytesIO(result.stdout), mode='r:') as archive:
+            archive.extractall(local, filter='data')
+        # tar keeps the guest's whole path (files/diag-snapshots/<name>/...), so the payload has
+        # to be moved up to the directory the caller asked for; otherwise the snapshot arrives
+        # nested and every later path in it is wrong.
+        wanted = Path(relative).name
+        nested = next((p for p in local.rglob(wanted) if p.is_dir()), None)
+        if nested and nested != local:
+            for child in list(nested.iterdir()):
+                target = local / child.name
+                if target.exists():
+                    continue
+                shutil.move(str(child), str(target))
+            for stray in [nested, *nested.parents]:
+                if stray == local:
+                    break
+                shutil.rmtree(stray, ignore_errors=True)
+        return local

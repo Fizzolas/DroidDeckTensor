@@ -10,22 +10,23 @@ import java.util.Date
 import java.util.Locale
 
 /**
- * One call that gathers, as text, what a device looks like at an instant.
+ * What the app itself can say about the device at an instant, as text.
  *
  * The reason this exists: several sessions were diagnosed from a crash report plus whatever log
- * happened to survive, and the question "what did the display path actually look like at that
- * moment" could not be answered afterwards. Snapshot writes the answer where the session's other
- * artifacts go. It is text only - no image is taken, ever (see the project's no-screenshot rule).
+ * happened to survive, and the question "which binary had each process actually mapped" could not
+ * be answered afterwards. A process's mapped inode is proof of a load; the installed file's hash is
+ * not (state doc §36, §63).
+ *
+ * **Not here: `dumpsys`.** An app process holds no `android.permission.DUMP`, so every dumpsys
+ * probe returns "Permission Denial" and writing that to a file that looks like evidence is worse
+ * than not writing it. The host does hold it (adb shell's own DUMP grant), so DisplayManager,
+ * SurfaceFlinger and input dumps are gathered host-side by `tools/diagkit/runs.py`, into the same
+ * snapshot directory. This class stays within what the app is actually allowed to see.
+ *
+ * Text only - no image is taken, ever (the project's no-screenshot rule).
  */
 object AgentDiagnostics {
     private const val TAG = "AgentDiagnostics"
-
-    private val PROBES = listOf(
-        "dumpsys SurfaceFlinger" to "surfaceflinger.txt",
-        "dumpsys display" to "display.txt",
-        "dumpsys input" to "input.txt",
-        "dumpsys window displays" to "windows.txt",
-    )
 
     /** Writes a snapshot into [dir] (the session folder) and returns the directory it used. */
     @Synchronized
@@ -37,10 +38,7 @@ object AgentDiagnostics {
         val out = File(target, "snapshot-$stamp")
         out.mkdirs()
         File(out, "procs.txt").writeText(processTable())
-        PROBES.forEach { (command, name) ->
-            runCatching { File(out, name).writeText(shell(command)) }
-                .onFailure { Log.w(TAG, "probe failed: $command", it) }
-        }
+        File(out, "app.txt").writeText(appState(context))
         SessionEvents.record("diag.snapshot", mapOf("dir" to out.absolutePath), target)
         return out
     }
@@ -51,15 +49,22 @@ object AgentDiagnostics {
         return true
     }
 
-    private fun shell(command: String): String {
-        val process = ProcessBuilder("/system/bin/sh", "-c", command)
-            .redirectErrorStream(true).start()
-        val text = process.inputStream.bufferedReader().readText()
-        process.waitFor()
-        return text
+    private fun appState(context: Context): String = buildString {
+        append("package=").append(context.packageName).append('\n')
+        runCatching {
+            val info = context.packageManager.getPackageInfo(context.packageName, 0)
+            append("versionName=").append(info.versionName).append('\n')
+            @Suppress("DEPRECATION")
+            append("versionCode=").append(info.versionCode).append('\n')
+        }.onFailure { Log.w(TAG, "package info", it) }
+        append("firstApiLevel=").append(android.os.Build.VERSION.SDK_INT).append('\n')
+        append("fingerprint=").append(android.os.Build.FINGERPRINT).append('\n')
     }
 
-    /** Every process holding a graphics library, with its role and the libraries it has mapped. */
+    /**
+     * Every process holding a graphics library, with its role and the libraries it has mapped.
+     * This is the field an installed-file hash cannot give.
+     */
     private fun processTable(): String {
         val out = StringBuilder()
         val dirs = File("/proc").listFiles()?.filter { it.name.all(Char::isDigit) } ?: return ""
@@ -78,6 +83,7 @@ object AgentDiagnostics {
             val libs = maps.filter { line -> LIBS.any { line.contains(it) } }
                 .map { it.substringAfterLast(' ') }
                 .distinct()
+                .filter { it.isNotBlank() }
             out.append("pid=").append(dir.name).append(" comm=").append(comm)
                 .append(" role=").append(role).append('\n')
             libs.forEach { out.append("  lib ").append(it).append('\n') }

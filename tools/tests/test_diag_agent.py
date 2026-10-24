@@ -14,9 +14,15 @@ class AgentDiagnosticsTest(unittest.TestCase):
         self.assertIn('"snapshot"', self.provider)
         self.assertIn('"mark"', self.provider)
 
-    def test_snapshot_gathers_the_layers_and_the_graphics_processes(self):
-        for probe in ('dumpsys SurfaceFlinger', 'dumpsys display', 'dumpsys input', '/proc'):
-            self.assertIn(probe, self.src)
+    def test_snapshot_gathers_the_graphics_processes_and_the_app_identity(self):
+        self.assertIn('/proc', self.src)
+        self.assertIn('procs.txt', self.src)
+        self.assertIn('app.txt', self.src)
+
+    def test_the_app_does_not_attempt_a_dumpsys_it_is_not_allowed_to_read(self):
+        """Measured on device: every dumpsys from the app is a Permission Denial. The host does it."""
+        self.assertNotIn('dumpsys SurfaceFlinger', self.src)
+        self.assertNotIn('dumpsys display', self.src)
 
     def test_snapshot_is_text_only(self):
         """The project's rule: no image is taken, not even for diagnostics."""
