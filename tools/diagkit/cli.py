@@ -2,9 +2,25 @@
 from __future__ import annotations
 
 import argparse
+import importlib
+import importlib.util
 import json
 import sys
 from pathlib import Path
+
+
+def _module(name):
+    """Import a sibling module whether we are a package or loaded by file path.
+
+    The tests load this file directly (so they can assert on the parser without a package
+    install), and tools/diag imports it as `diagkit.cli`. Both have to work.
+    """
+    if __package__:
+        return importlib.import_module(f'{__package__}.{name}')
+    spec = importlib.util.spec_from_file_location(name, Path(__file__).with_name(f'{name}.py'))
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
 
 
 def _arm(pairs):
@@ -73,13 +89,12 @@ def main(argv=None):
 
 
 def _adb(args):
-    from .device import Adb
-    return Adb(args.adb, args.serial)
+    return _module('device').Adb(args.adb, args.serial)
 
 
 def _dispatch(args):
     if args.command == 'doctor':
-        from . import doctor as doctor_mod
+        doctor_mod = _module('doctor')
         inv = doctor_mod.inventory(_adb(args))
         state, reasons = doctor_mod.verdict(inv)
         print(json.dumps({'ok': state == 'clean', 'state': state,
@@ -87,7 +102,7 @@ def _dispatch(args):
         return 0 if state == 'clean' else 4
 
     if args.command == 'frame':
-        from . import frames
+        frames = _module('frames')
         if args.panel:
             pixels, w, h, _fmt = frames.parse_screencap(_adb(args).screencap_raw())
             out = frames.digest_rgba(pixels, w, h, want_ascii=args.ascii)
@@ -109,7 +124,7 @@ def _dispatch(args):
         return _run(args)
 
     if args.command == 'prior':
-        from . import prior
+        prior = _module('prior')
         roots = [Path(r) for r in (args.roots or ['.', '../audit'])]
         hits = prior.search(roots, args.question)
         print(json.dumps({'ok': True, 'hits': hits}, sort_keys=True))
@@ -117,20 +132,20 @@ def _dispatch(args):
         return 0
 
     if args.command == 'analyze':
-        from . import analyze
+        analyze = _module('analyze')
         found = analyze.findings_from(Path(args.run))
         print(json.dumps({'ok': True, 'findings': found}, sort_keys=True))
         print(analyze.render(found), file=sys.stderr)
         return 0
 
     if args.command == 'compare':
-        from . import compare
+        compare = _module('compare')
         reasons = compare.refusal(Path(args.a), Path(args.b))
         print(json.dumps({'ok': not reasons, 'refusals': reasons}, sort_keys=True))
         return 0 if not reasons else 4
 
     if args.command == 'export':
-        from . import analyze
+        analyze = _module('analyze')
         run_dir = Path(args.run)
         dest = Path(args.dest) if args.dest else run_dir.with_name(run_dir.name + '-export')
         dest.mkdir(parents=True, exist_ok=True)
@@ -161,8 +176,8 @@ def _git_commit():
 
 
 def _run(args):
-    from . import doctor as doctor_mod
-    from . import runs as runs_mod
+    doctor_mod = _module('doctor')
+    runs_mod = _module('runs')
     adb = _adb(args)
     state, reasons = doctor_mod.verdict(doctor_mod.inventory(adb))
     if state != 'clean':
