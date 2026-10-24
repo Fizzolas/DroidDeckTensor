@@ -586,13 +586,25 @@ static void apply_geometry(ASurfaceTransaction *tx, struct layer *l, const int r
     ARect srcR = {r[0], r[1], r[2], r[3]}, dstR = {r[4], r[5], r[6], r[7]};
     if (l == &g_layers[SC_LAYER_GAME]) { g_game_src = srcR; g_game_dst = dstR; g_game_geo_known = 1; }
     if (!l->geo_valid || memcmp(&srcR, &l->geo_src, sizeof(srcR)) || memcmp(&dstR, &l->geo_dst, sizeof(dstR))) {
-        /* The panel's rotation, as the consumer must apply it. MEASURED (dumpsys SurfaceFlinger,
-         * the config that ships): our landscape buffer is composed onto the portrait panel with
-         * sourceCrop=[0 0 2404 1080] and bufferTransform=ROT_270. A display layer is the same kind
-         * of consumer, so it gets the same value; passing 0 makes the DPU read a 2404x1080 buffer
-         * as if it were already portrait - a per-scanline misread, which is exactly the symptom
-         * this whole line of work is about. */
-        api.setGeometry(tx, l->sc, &srcR, &dstR, vkp_surface_transform_hal());
+        /* Transform 0, deliberately.
+         *
+         * The NDK header states the contract for this call: `destination` is "the rect in the
+         * PARENT's space where this surface will be drawn", and `transform` is "applied AFTER the
+         * source rect is applied to the buffer". So `destination` is the FINAL rect and the
+         * transform is a second rotation on top of it.
+         *
+         * The rect this function is handed is ALREADY rotated: vkp_update_map swaps the scene's
+         * axes for a 90/270 surface (g_map_scene_swapped) before building the mapping, so
+         * vkp_map_rect returns a destination in the parent's frame. Passing the panel's transform
+         * as well rotated it twice. MEASURED on the Pixel 10 (dumpsys SurfaceFlinger):
+         *
+         *     opaqueRegion={0,0,1650,732}  toDisplayTransform={ scale x=3.2842 y=0.6467 }
+         *     bounds={0,6,1073,2404}
+         *
+         * which is a ROT_90 applied to a landscape rect that was already placed, and the
+         * non-uniform 3.28/0.65 stretch is the per-scanline misread - the horizontal
+         * random-colour-lines symptom. A ROT_90 of a 1650x732 source must land on 732x1650. */
+        api.setGeometry(tx, l->sc, &srcR, &dstR, 0);
         l->geo_src = srcR; l->geo_dst = dstR; l->geo_valid = 1;
         char cov[96] = "";
         if (l->ds_applied > 0) coverage_text(l, cov, sizeof(cov));
@@ -947,6 +959,10 @@ int sc_layer_present_display(void *img_handle, int rw, int rh, int scene_w, int 
     /* The scene image carries its own layout, so it needs the scene-specific blit, not the generic
      * client-image one. */
     if (vkp_blit_scene_to(l->slots[idx].img, wait_fd) != 0) return -1;
+    /* Evidence about the buffer the display will actually read, not the scene it came from. Off
+     * unless BL_FRAME_DIGEST is set; the same record `diag frame --panel` produces, so the two can
+     * be correlated directly. */
+    if (vkp_fd_level() > 0) vkp_digest_pool_buffer(l->slots[idx].img, rw, rh, vkp_fd_level());
     if (present_slot(l, idx, r, NULL, 0) != 0) return -1;
     if (!l->first_logged) {
         l->first_logged = 1;
