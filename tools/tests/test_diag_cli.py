@@ -90,5 +90,80 @@ class FrameCommandTest(unittest.TestCase):
         self.assertEqual((w, h), (d['w'], d['h']))
 
 
+class RunWiringTest(unittest.TestCase):
+    """The run command must refuse to go on when a calibration fails."""
+
+    def fake(self):
+        class FakeDevice:
+            def sha256(self, path):
+                return None
+            def provider(self, method, arg=None):
+                if method == 'state':
+                    return {'appVersion': '0.3.4'}
+                if method == 'mark':
+                    return {'ok': True}
+                if method == 'snapshot':
+                    return {'ok': True, 'dir': 'files/linuxfs/tmp/snapshot-x'}
+                return {'ok': True}
+            def pull(self, remote, local):
+                Path(local).mkdir(parents=True, exist_ok=True)
+                (Path(local) / 'procs.txt').write_text('pid=1\n')
+                return Path(local)
+        return FakeDevice()
+
+    def invoke(self, argv):
+        original = cli._adb
+        cli._adb = lambda args: self.fake()
+        try:
+            buf = io.StringIO()
+            with contextlib.redirect_stdout(buf), contextlib.redirect_stderr(io.StringIO()):
+                code = cli.main(argv)
+            return code, json.loads(buf.getvalue().splitlines()[-1])
+        finally:
+            cli._adb = original
+
+    def test_a_passing_calibration_lets_the_run_proceed(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            code, out = self.invoke(['run', '--label', 'display', '--hypothesis', 'h',
+                                     '--arm', 'icd=A', '--root', tmp,
+                                     '--calibrate', 'frame-digest'])
+            self.assertEqual(0, code)
+            self.assertEqual(['frame-digest'], out['calibrated'])
+
+    def test_a_failing_calibration_refuses_the_run(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            code, out = self.invoke(['run', '--label', 'display', '--hypothesis', 'h',
+                                     '--arm', 'icd=A', '--root', tmp,
+                                     '--calibrate', 'no-such-instrument'])
+            self.assertEqual(4, code)
+            self.assertFalse(out['ok'])
+            self.assertIn('calibration failed', out['refused'])
+
+    def test_a_snapshot_is_taken_when_asked(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            code, out = self.invoke(['run', '--label', 'display', '--hypothesis', 'h',
+                                     '--arm', 'icd=A', '--root', tmp, '--snapshot'])
+            self.assertEqual(0, code)
+            self.assertIsNotNone(out['snapshot'])
+
+    def test_a_dirty_device_refuses_before_measuring(self):
+        class Dirty(self.fake().__class__):
+            pass
+        with tempfile.TemporaryDirectory() as tmp:
+            original = cli._adb
+            class Dev(Dirty):
+                def sha256(self, path):
+                    return 'sha256:leftover'
+            cli._adb = lambda args: Dev()
+            try:
+                buf = io.StringIO()
+                with contextlib.redirect_stdout(buf), contextlib.redirect_stderr(io.StringIO()):
+                    code = cli.main(['run', '--label', 'l', '--hypothesis', 'h',
+                                     '--arm', 'a=b', '--root', tmp])
+            finally:
+                cli._adb = original
+            self.assertEqual(4, code)
+
+
 if __name__ == '__main__':
     unittest.main()

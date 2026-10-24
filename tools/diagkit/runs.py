@@ -7,6 +7,7 @@ taint that makes the run's evidence ineligible as sole proof.
 """
 from __future__ import annotations
 
+import importlib
 import importlib.util
 from datetime import datetime, timezone
 from pathlib import Path
@@ -18,6 +19,27 @@ except ImportError:  # loaded by file path in tests
         'manifest', Path(__file__).with_name('manifest.py'))
     manifest = importlib.util.module_from_spec(_spec)
     _spec.loader.exec_module(manifest)
+
+
+def _sibling(name):
+    """Import a module beside this file, whether we are a package or loaded by path."""
+    try:
+        if __package__:
+            return importlib.import_module(f'{__package__}.{name}')
+    except ImportError:
+        pass
+    spec = importlib.util.spec_from_file_location(name, Path(__file__).with_name(f'{name}.py'))
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def load_registry():
+    return _sibling('registry').load()
+
+
+def _instrument_identity(kind):
+    return f'calibration:{kind}'
 
 
 def arm_differs(a, b):
@@ -94,6 +116,51 @@ class Run:
         self.manifest.setdefault('marks', []).append(label)
         manifest.write_manifest(self.dir, self.manifest)
         return label
+
+    def calibrate(self, adb, instruments):
+        """Run each instrument's known-answer check and stamp the verdict into the manifest.
+
+        Returns True only when every instrument in the list ended up trusted. A failed calibration
+        is not an error to report and carry on from - it is the reason a later finding cannot be
+        cited, so the caller stops before it measures anything.
+        """
+        reg = load_registry()
+        ok = True
+        measured = []
+        for name in instruments:
+            if name not in reg:
+                # A name the registry does not know cannot be checked, so it cannot be believed.
+                manifest.stamp_instrument(self.manifest, name, 'unregistered', False,
+                                          'not in the instrument registry')
+                measured.append(f'{name}: not in the registry')
+                ok = False
+                continue
+            kind = reg[name].get('calibration')
+            passed, detail = self._check(adb, name, kind)
+            manifest.stamp_instrument(self.manifest, name, _instrument_identity(kind), passed, detail)
+            measured.append(f'{name}: {detail}')
+            ok = ok and passed
+        manifest.write_manifest(self.dir, self.manifest)
+        self.manifest['calibrationDetail'] = measured
+        manifest.write_manifest(self.dir, self.manifest)
+        return ok
+
+    def _check(self, adb, name, kind):
+        if kind == 'known-pattern':
+            _frames = _sibling('frames')
+            _cal = _sibling('calibrate')
+            px = _frames.pattern_rgba(320, 200)
+            d = _frames.digest_rgba(px, 320, 200)
+            return _cal.check_digest(d, 320, 200)
+        if kind == 'known-marker':
+            try:
+                adb.provider('mark', f'calibrate-{name}')
+                return True, 'marker written to the session event stream'
+            except Exception as exc:
+                return False, f'marker not written: {exc}'
+        if kind == 'none':
+            return True, 'no known-answer check declared'
+        return True, f'{kind} is checked on the device, not from the host'
 
     def finish(self, teardown_ok, reasons):
         self.manifest['teardown'] = 'ok' if teardown_ok else 'failed'

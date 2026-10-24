@@ -47,6 +47,10 @@ def build_parser():
     r.add_argument('--arm', action='append', type=str, required=True,
                    help='name=value for the ONE thing this run varies')
     r.add_argument('--root', default='runs')
+    r.add_argument('--calibrate', action='append', default=None, metavar='INSTRUMENT',
+                   help='instrument whose known-answer check must pass before this run measures')
+    r.add_argument('--snapshot', action='store_true',
+                   help='ask the app for a text snapshot once the run has begun')
 
     pr = sub.add_parser('prior', help='search every existing run before forming a hypothesis')
     pr.add_argument('question')
@@ -191,5 +195,21 @@ def _run(args):
     run = runs_mod.Run(Path(args.root), args.label, args.hypothesis,
                        _arm(args.arm), adb, _git_commit(), version_code)
     run.begin()
-    print(json.dumps({'ok': True, 'run': str(run.dir), 'arm': run.arm}))
+    result = {'ok': True, 'run': str(run.dir), 'arm': run.arm}
+
+    if args.calibrate:
+        if not run.calibrate(adb, args.calibrate):
+            # The run exists so the failure is on record; it must not go on to measure.
+            result['ok'] = False
+            result['refused'] = 'a calibration failed; this run measures nothing'
+            print(json.dumps(result))
+            print('diag: calibration failed - see the manifest; not probing', file=sys.stderr)
+            return 4
+        result['calibrated'] = args.calibrate
+
+    if args.snapshot:
+        snapshot = run.snapshot(adb)
+        result['snapshot'] = str(snapshot) if snapshot else None
+
+    print(json.dumps(result))
     return 0

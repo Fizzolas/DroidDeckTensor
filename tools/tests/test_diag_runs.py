@@ -122,6 +122,39 @@ class RunTest(unittest.TestCase):
     def test_arm_differs_is_empty_for_one_variable(self):
         self.assertEqual([], runs.arm_differs({'value': 'A'}, {'value': 'A'}))
 
+    def test_calibration_passes_for_a_known_pattern_instrument(self):
+        run = self.make()
+        run.begin()
+        self.assertTrue(run.calibrate(self.adb, ['frame-digest']))
+        self.assertTrue(manifest.instrument_trusted(run.manifest, 'frame-digest'))
+
+    def test_calibration_marks_a_marker_instrument_through_the_agent(self):
+        run = self.make()
+        run.begin()
+        self.assertTrue(run.calibrate(self.adb, ['snapshot']))
+        self.assertIn(('mark', 'calibrate-snapshot'), self.adb.provider_calls)
+
+    def test_a_marker_instrument_whose_agent_call_fails_is_untrusted(self):
+        class Broken(FakeAdb):
+            def provider(self, method, arg=None):
+                raise RuntimeError('no provider')
+        run = runs.Run(self.tmp, 'l', 'h', {'v': '1'}, Broken(), 'c', 41)
+        run.begin()
+        self.assertFalse(run.calibrate(run.adb, ['snapshot']))
+        self.assertFalse(manifest.instrument_trusted(run.manifest, 'snapshot'))
+
+    def test_an_unknown_instrument_is_not_trusted(self):
+        run = self.make()
+        run.begin()
+        self.assertFalse(run.calibrate(self.adb, ['not-an-instrument']))
+
+    def test_calibration_is_recorded_in_the_manifest_on_disk(self):
+        run = self.make()
+        run.begin()
+        run.calibrate(self.adb, ['frame-digest'])
+        stored = manifest.read_manifest(run.dir)
+        self.assertEqual('passed', stored['instruments']['frame-digest']['calibration'])
+
 
 if __name__ == '__main__':
     unittest.main()
