@@ -39,3 +39,16 @@ Every command writes JSON to stdout and reports its resolved ADB serial to stder
 The `state` response uses schema 1 and includes the build label, runtime version, session ID and phase, mode, requested program, suspend and first-frame state, output size, guest PID, failure details, and artifact paths. Phases are `IDLE`, `PREPARING`, `INSTALLING_RUNTIME`, `STARTING_COMPOSITOR`, `STARTING_GUEST`, `STARTING_STEAM`, `READY`, `SUSPENDED`, `STOPPING`, and `FAILED`. Each session also writes `events.jsonl` alongside its existing artifacts.
 
 `tools/deploy_local.sh` uses the same device resolver. If multiple distinct devices are connected, select one with `ADB_SERIAL` or `ANDROID_SERIAL`.
+
+## Diagnostics
+
+```sh
+adb shell content call --uri content://com.droiddeck.launcher.agent --method snapshot
+adb shell content call --uri content://com.droiddeck.launcher.agent --method mark --arg "pre-restart"
+```
+
+`snapshot` writes `surfaceflinger.txt`, `display.txt`, `input.txt`, `windows.txt` and `procs.txt` (every graphics process, with the Vulkan/hybris/GBM libraries it has actually mapped) into a `snapshot-*` directory inside the current session folder. `procs.txt` is the field that answers "which binary ran", which an installed-file hash cannot: a process's mapped inode is proof of a load.
+
+`mark` writes a `diag.mark` event into `events.jsonl`, so a host action and the guest's own timeline share one correlation point. Neither takes an image — the panel is read only through `screencap`, decoded to numbers, and never stored.
+
+`tools/diag` drives both: `diag doctor` reports whether the device is clean, and a run records every snapshot and mark in its `manifest.json`.

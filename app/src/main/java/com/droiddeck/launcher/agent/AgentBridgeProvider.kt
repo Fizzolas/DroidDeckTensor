@@ -53,6 +53,10 @@ class AgentBridgeProvider : ContentProvider() {
                 "start" -> error("USE_DROIDDECKCTL", "Start sessions with tools/droiddeckctl so Android launches a visible Activity")
                 "stop" -> stop(context)
                 "resume" -> resume(context)
+                "snapshot" -> AgentDiagnostics.snapshot(context, SessionPaths.current())
+                    .let { JSONObject().put("ok", true).put("dir", it.absolutePath) }
+                "mark" -> AgentDiagnostics.mark(context, arg ?: "unnamed")
+                    .let { JSONObject().put("ok", it) }
                 else -> error("UNKNOWN_COMMAND", "Unknown agent command '$method'")
             }
         } catch (e: Exception) {
