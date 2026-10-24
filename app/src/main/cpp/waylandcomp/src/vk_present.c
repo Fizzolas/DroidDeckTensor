@@ -2,6 +2,7 @@
  * (g_vk.*), not the process-default system Adreno driver. */
 #define _POSIX_C_SOURCE 200809L
 #include "vk_present.h"
+#include "frame_digest.h"
 #include "vk_loader.h"
 #include "sc_layer.h"
 #include "effects_chain.h"
@@ -151,6 +152,8 @@ static PFN_vkSetHdrMetadataEXT g_set_hdr_metadata;
 static uint32_t g_swap_md_identity;
 static int g_surface_formats_said;
 static const char *vk_result_name(VkResult r);
+/* Frame-digest gate, read once from BL_FRAME_DIGEST. Defined with the digest itself, below. */
+static int fd_level(void);
 
 /* The Android surface is created/destroyed on the app's UI thread while the compositor thread
  * may be inside a WSI call (acquire and present can block for a refresh or more). The UI thread
@@ -2030,6 +2033,15 @@ static int render_display_impl(int scene_w, int scene_h, const struct vkp_draw *
     if (fr == VK_ERROR_DEVICE_LOST) { device_lost("display render"); return -1; }
     if (fr != VK_SUCCESS) return -1;
 
+    /* Evidence about what was just composed, as text - off unless BL_FRAME_DIGEST says otherwise. */
+    if (fd_level() > 0) {
+        static struct vkp_image scene_view;
+        scene_view.image = scene_img;
+        scene_view.w = scene_w; scene_view.h = scene_h;
+        scene_view.fmt = SCENE_FMT;
+        vkp_frame_digest(&scene_view, fd_level());
+    }
+
     *out = (void *)scene_img;
     *rw = scene_w; *rh = scene_h;
     if (!g_first_frame_done) { g_first_frame_done = 1; droiddeck_on_first_frame(); }
@@ -2452,6 +2464,179 @@ int vkp_image_readback(struct vkp_image *src, uint32_t *out, int max_px) {
     for (int y = 0; y < src->h; y++)
         memcpy(out + (size_t)y * src->w, (const uint8_t *)g_rb->map + g_rb->offset + (size_t)y * g_rb->row_pitch,
                (size_t)src->w * 4);
+    return 0;
+}
+
+/* ---------------------------------------------------------------- frame digest
+ *
+ * Evidence about what is on screen, as text. Gate: BL_FRAME_DIGEST=1 (numeric) or 2 (with the
+ * ASCII map). Cadence is adaptive: dense for the first frames, sparse afterwards, and always on a
+ * frame whose character changed - a transient fault is what a fixed interval misses.
+ *
+ * The staging image is built from the SOURCE's extent and its real subresource layout, and in the
+ * source's own format. That is the whole lesson of state doc §65-68: a helper sized for a 256x256
+ * cursor answered a question it was never built for, and three findings had to be retracted.
+ */
+static struct vkp_image *g_fd;          /* the digest staging image, sized for one shape */
+static long g_fd_frame, g_fd_last_mono, g_fd_last_hash;
+
+static int fd_level(void) {
+    static int level = -1;
+    if (level < 0) {
+        const char *v = getenv("BL_FRAME_DIGEST");
+        level = (v && *v) ? atoi(v) : 0;
+    }
+    return level;
+}
+
+/* Dense for the first 120 frames, then every 30th, plus any frame whose digits moved. */
+int fd_should_sample(long frame, int changed, long mono_ms) {
+    if (frame < 120) return 1;
+    if (changed) return 1;
+    if (mono_ms - g_fd_last_mono > 5000) return 1;
+    return (frame % 30) == 0;
+}
+
+static int fd_ensure_staging(const struct vkp_image *src) {
+    struct vkp_image *img;
+    VkImageCreateInfo ici;
+    VkMemoryRequirements req;
+    VkImageSubresource subr;
+    VkSubresourceLayout lay;
+    VkMemoryAllocateInfo mai;
+    int idx;
+
+    if (g_fd && g_fd->w == src->w && g_fd->h == src->h && g_fd->fmt == src->fmt) return 0;
+    if (g_fd) { vkp_image_destroy(g_fd); g_fd = NULL; }
+    img = calloc(1, sizeof(*img));
+    if (!img) return -1;
+    img->w = src->w; img->h = src->h; img->fmt = src->fmt;
+    ici = (VkImageCreateInfo){
+        .sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO, .imageType = VK_IMAGE_TYPE_2D,
+        .format = src->fmt, .extent = {(uint32_t)src->w, (uint32_t)src->h, 1},
+        .mipLevels = 1, .arrayLayers = 1, .samples = VK_SAMPLE_COUNT_1_BIT,
+        .tiling = VK_IMAGE_TILING_LINEAR, .usage = VK_IMAGE_USAGE_TRANSFER_DST_BIT,
+        .sharingMode = VK_SHARING_MODE_EXCLUSIVE, .initialLayout = VK_IMAGE_LAYOUT_UNDEFINED};
+    if (g_vk.CreateImage(g_dev, &ici, NULL, &img->image) != VK_SUCCESS) { free(img); return -1; }
+    g_vk.GetImageMemoryRequirements(g_dev, img->image, &req);
+    idx = memory_type(req.memoryTypeBits,
+                      VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
+    if (idx < 0) { g_vk.DestroyImage(g_dev, img->image, NULL); free(img); return -1; }
+    mai = (VkMemoryAllocateInfo){.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO,
+                                 .allocationSize = req.size, .memoryTypeIndex = (uint32_t)idx};
+    if (g_vk.AllocateMemory(g_dev, &mai, NULL, &img->mem) != VK_SUCCESS) {
+        g_vk.DestroyImage(g_dev, img->image, NULL); free(img); return -1;
+    }
+    g_vk.BindImageMemory(g_dev, img->image, img->mem, 0);
+    subr = (VkImageSubresource){VK_IMAGE_ASPECT_COLOR_BIT, 0, 0};
+    g_vk.GetImageSubresourceLayout(g_dev, img->image, &subr, &lay);
+    img->offset = lay.offset;
+    img->row_pitch = lay.rowPitch;
+    if (g_vk.MapMemory(g_dev, img->mem, 0, req.size, 0, &img->map) != VK_SUCCESS) {
+        vkp_image_destroy(img); return -1;
+    }
+    g_fd = img;
+    return 0;
+}
+
+/* Digest the composed scene and log one record. `level` 1 = numbers, 2 = numbers + ASCII map.
+ * Returns 0 when it ran (or chose not to sample), -1 on a real failure. */
+int vkp_frame_digest(struct vkp_image *src, int level) {
+    struct fd_digest d;
+    VkImageSubresourceRange range = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+    VkCommandBuffer cmd;
+    VkCommandBufferBeginInfo bi;
+    VkImageMemoryBarrier pre[2], post[2];
+    VkImageBlit blit;
+    VkSubmitInfo si;
+    VkResult qr, fr;
+    struct timespec ts;
+    long mono, hash;
+    int begin_layout;
+    char map[4096];
+
+    if (level <= 0 || !src || !src->image || src->w <= 0 || src->h <= 0) return 0;
+    if (g_dev_state == -2 || dev_init() != 0) return -1;
+    if (fd_ensure_staging(src) != 0) return -1;
+
+    /* The scene is left in TRANSFER_SRC_OPTIMAL by the display path; a swapchain image is not.
+     * Treat the source as it actually is rather than assuming one caller. */
+    begin_layout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
+    cmd = g_cmds[0];
+    g_vk.ResetCommandBuffer(cmd, 0);
+    bi = (VkCommandBufferBeginInfo){.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO,
+                                    .flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT};
+    if (g_vk.BeginCommandBuffer(cmd, &bi) != VK_SUCCESS) return -1;
+    pre[0] = (VkImageMemoryBarrier){
+        .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
+        .oldLayout = begin_layout, .newLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+        .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED, .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+        .image = src->image, .subresourceRange = range, .dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT};
+    pre[1] = (VkImageMemoryBarrier){
+        .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
+        .oldLayout = VK_IMAGE_LAYOUT_UNDEFINED, .newLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+        .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED, .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+        .image = g_fd->image, .subresourceRange = range, .dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT};
+    g_vk.CmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT,
+                            0, 0, NULL, 0, NULL, 2, pre);
+    blit = (VkImageBlit){.srcSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1},
+                         .srcOffsets = {{0, 0, 0}, {src->w, src->h, 1}},
+                         .dstSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1},
+                         .dstOffsets = {{0, 0, 0}, {src->w, src->h, 1}}};
+    g_vk.CmdBlitImage(cmd, src->image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+                      g_fd->image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &blit, VK_FILTER_NEAREST);
+    post[0] = (VkImageMemoryBarrier){
+        .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
+        .oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, .newLayout = VK_IMAGE_LAYOUT_GENERAL,
+        .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED, .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+        .image = g_fd->image, .subresourceRange = range,
+        .srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT, .dstAccessMask = VK_ACCESS_HOST_READ_BIT};
+    post[1] = (VkImageMemoryBarrier){
+        .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
+        .oldLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, .newLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+        .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED, .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+        .image = src->image, .subresourceRange = range,
+        .srcAccessMask = VK_ACCESS_TRANSFER_READ_BIT, .dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT};
+    g_vk.CmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TRANSFER_BIT,
+                            VK_PIPELINE_STAGE_HOST_BIT | VK_PIPELINE_STAGE_TRANSFER_BIT,
+                            0, 0, NULL, 0, NULL, 2, post);
+    if (g_vk.EndCommandBuffer(cmd) != VK_SUCCESS) return -1;
+    si = (VkSubmitInfo){.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO, .commandBufferCount = 1,
+                        .pCommandBuffers = &cmd};
+    g_vk.ResetFences(g_dev, 1, &g_fence);
+    qr = g_vk.QueueSubmit(g_queue, 1, &si, g_fence);
+    if (qr == VK_ERROR_DEVICE_LOST) { device_lost("frame digest"); return -1; }
+    if (qr != VK_SUCCESS) return -1;
+    fr = timed_wait(g_fence, 1000000000ULL);
+    if (fr == VK_ERROR_DEVICE_LOST) { device_lost("frame digest"); return -1; }
+    if (fr != VK_SUCCESS) return -1;
+
+    /* The digest reads the layout the driver reported, not width*4. */
+    if (fd_digest_rgba((const unsigned char *)g_fd->map + g_fd->offset,
+                       src->w, src->h, (int)g_fd->row_pitch, &d) != 0) return -1;
+
+    hash = (long)strtoul(d.hash_hex, NULL, 16);
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    mono = ts.tv_sec * 1000L + ts.tv_nsec / 1000000L;
+    if (g_fd_frame > 0 && fd_should_sample(g_fd_frame, hash != g_fd_last_hash, mono)) {
+        g_fd_last_mono = mono;
+        droiddeck_log("fd", "t=%ld.%03ld %dx%d pitch=%llu zero_rows=%d hash=%s",
+                      (long)ts.tv_sec, ts.tv_nsec / 1000000L, d.w, d.h,
+                      (unsigned long long)g_fd->row_pitch, d.zero_rows, d.hash_hex);
+        if (level >= 2 &&
+            fd_ascii((const unsigned char *)g_fd->map + g_fd->offset, src->w, src->h,
+                     (int)g_fd->row_pitch, 48, 20, map, (int)sizeof map) > 0) {
+            const char *p = map;
+            while (*p) {
+                const char *nl = strchr(p, '\n');
+                int n = nl ? (int)(nl - p) : (int)strlen(p);
+                droiddeck_log("fd", "map|%.*s|", n, p);
+                p = nl ? nl + 1 : p + n;
+            }
+        }
+    }
+    g_fd_last_hash = hash;
+    g_fd_frame++;
     return 0;
 }
 

@@ -168,6 +168,12 @@ int vkp_blit_image(struct vkp_image *src, struct vkp_image *dst, int wait_fd);
 /* A client's GPU cursor (an imported dma-buf, often UBWC) read back as w*h 0xAARRGGBB pixels through a
  * linear host-visible copy; waited for on the CPU. Compositor thread, between frames. 0 = ok. */
 int vkp_image_readback(struct vkp_image *src, uint32_t *out, int max_px);
+/* Evidence about a composed frame, as text: one record through droiddeck_log("fd", ...). The
+ * staging image is sized and formatted from src, and the bytes are read at the layout the driver
+ * reported. level 0 = off, 1 = numbers, 2 = numbers + a 48x20 ASCII luminance map. Sampling is
+ * adaptive (dense at first, sparse after, plus any frame whose digest changed). 0 = ok. */
+int vkp_frame_digest(struct vkp_image *src, int level);
+int fd_should_sample(long frame, int changed, long mono_ms);
 /* Refresh the scene -> output mapping for this scene size without presenting (creates the
  * swapchain if needed, since the mapping is in output pixels). 0 = mapping valid. */
 int vkp_update_map(int scene_w, int scene_h);
