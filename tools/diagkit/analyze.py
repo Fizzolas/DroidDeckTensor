@@ -35,6 +35,12 @@ def _lines(path):
         return []
 
 
+# The compositor emits `[fd] t=<sec>.<ms> <w>x<h> pitch=<n> zero_rows=<n> hash=<hex>` through
+# the session log, and logcat renders the same line with a `[fd]` tag or a ` fd ` area column.
+# This matches the record itself rather than one renderer's wrapper, so both are recognised.
+DIGEST_RECORD = re.compile(r'(?:\[fd\]|\bfd\b)[^\n]*?\d+x\d+[^\n]*?zero_rows=\d+')
+
+
 def _digest_records(run_dir):
     """Every `fd` digest line the run produced, with where it came from."""
     records = []
@@ -42,7 +48,7 @@ def _digest_records(run_dir):
         if not log.is_file() or log.suffix.lower() not in {'.log', '.txt', '.jsonl'}:
             continue
         for number, line in enumerate(_lines(log), 1):
-            if ' fd ' in line or re.match(r'^\S+ +fd +', line) or line.startswith('fd '):
+            if DIGEST_RECORD.search(line):
                 records.append((log.relative_to(run_dir).as_posix(), number, line))
     return records
 

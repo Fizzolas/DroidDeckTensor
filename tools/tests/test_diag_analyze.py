@@ -65,6 +65,19 @@ class AnalyzeTest(unittest.TestCase):
         row = next(f for f in found if '492' in f['claim'])
         self.assertEqual(('wayland.log', 3), (row['artifact'], row['line']))
 
+    def test_the_real_compositor_line_format_is_recognised(self):
+        """Recorded from the device: the compositor writes '[fd] t=... 1650x732 pitch=6600 ...'."""
+        run = self.tmp / 'run'
+        run.mkdir()
+        (run / 'manifest.json').write_text(json.dumps(
+            manifest.new_manifest('l', 'h', {'v': '1'}, 'c', 41)))
+        (run / 'wayland.log').write_text(
+            '[fd] t=45404.329 1650x732 pitch=6600 zero_rows=0 hash=10692e00\n'
+            '[fd] map|....|\n')
+        found = analyze.findings_from(run)
+        self.assertNotIn('no digest', found[0]['claim'])
+        self.assertEqual(('wayland.log', 1), (found[0]['artifact'], found[0]['line']))
+
     def test_a_calibrated_instrument_keeps_the_finding_clean(self):
         run = self.tmp / 'run'
         run.mkdir()
