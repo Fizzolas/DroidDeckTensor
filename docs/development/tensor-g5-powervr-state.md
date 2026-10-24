@@ -3464,3 +3464,51 @@ client dma-buf and blits it with no wait on the producer's fence (`ahb_swapchain
 presents with the real PowerVR driver (this section), and the user sees bands that changed orientation
 with the transform. The remaining unexplained step is the handoff from the compositor's swapchain
 image to the panel through SurfaceFlinger/DPU - i.e. what the DPU reads, not what the GPU wrote.
+
+## 74. The swapchain is gone from the display path (2026-10-23, commit `be073f84`, versionCode 37)
+
+§69-73 kept circling one thing: the swapchain's `preTransform`/`currentExtent` dialogue with this
+panel never settles. Measured both ways:
+
+| preTransform | driver says | SurfaceFlinger does |
+|---|---|---|
+| IDENTITY | `VK_SUBOPTIMAL_KHR` every frame | rotates our buffer (`bufferTransform=ROT_270`) |
+| `currentTransform` | no SUBOPTIMAL | stops rotating and NON-UNIFORMLY STRETCHES it (`scale 2.2259 / 0.4493`) |
+
+Both cannot be right, and the code cannot fix that - it is a disagreement between what the
+presentation engine reports and what it expects. So the path no longer asks.
+
+**What changed.** A display layer states its buffer outright - `ASurfaceTransaction_setBuffer` plus
+`setGeometry(src, dst)` - so there is nothing to negotiate. New entry points:
+
+- `vkp_render_display()` - composites every draw on the GPU into the internal scene image with no
+  swapchain, no `vkAcquireNextImageKHR` and no `vkQueuePresentKHR`, and hands the image back.
+- `vkp_blit_scene_to()` - copies it into a layer pool buffer using the scene image's actual layout
+  and access masks (`vkp_blit_image` would have assumed a host-written GENERAL image and set the
+  wrong source access mask - a synchronisation bug, not a cosmetic one).
+- `sc_layer_present_display()` - places it on the game layer through the same scene -> screen
+  mapping the copy path uses, so the two paths put the picture in the same place.
+- `vkp_surface_caps()` - reads the surface's capabilities by creating a `VkSurface` only. The
+  display's coordinate space and rotation still matter (they are what `setGeometry` is phrased in),
+  but learning them now costs zero scanout buffers.
+
+Verified by inspection that no function on this path reaches `swap_init`/`acquire_image`: the only
+swapchain references are `if (!g_swapchain)` guards.
+
+**Live by default, with a way back.** The old copy path is still there and is still the fallback;
+`files/swapchain_copy` in the app's data dir forces it, so the A/B is one file and one restart.
+Screen effects and frame generation keep their own routes - the effects chain runs in
+`vkp_pass_begin` and has had a layer route all along, and frame generation needs one present per
+vblank which a layer cannot pace - so neither is silently dropped by the new path.
+
+**Removed in the same pass**, both known-bad instruments (§68): `vkp_pitch_dump` (routed a full
+frame through the 256x256 cursor readback and produced three falsified findings) and the scanout
+dump (read `g_images[img]` after present had re-acquired it - an illegal read - and put a 2 s fence
+wait in the present path).
+
+**Status: BUILT, NOT SEEN.** The build is clean and the APK carries the new code
+(`versionCode 37`), but no device run has confirmed it presents. The first evidence to look for is
+`display-layer path ON` followed by a `layer ... geometry: buffer ... -> screen ...` line, and then
+the panel itself. If the picture is correct this closes the whole §65-73 thread; if it is not, the
+one number that matters is in that geometry line - whether the destination rectangle is in the
+display's space or the window's.
