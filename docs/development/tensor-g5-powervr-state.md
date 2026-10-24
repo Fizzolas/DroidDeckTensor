@@ -3846,21 +3846,52 @@ composite.
    client this far - the client simply is not reaching GBM. Its remaining messages are environmental
    and benign: D-Bus UPower absent, `inotify max_user_watches` unreadable, Floss absent.
 
-2. **The wall is the 1x1 surface, and it is now precisely located.** The compositor log shows two
-   dma-bufs from the client in the same instant:
+2. **CORRECTION to the first reading of this session: the 1x1 is NOT the wall.** The first draft of
+   this section called the 1x1 surface the blocker. Reading the compositor's own annotation at
+   `compositor.c:858` shows that is wrong: *"A program's small surfaces - gamescope's 1x1 cursor,
+   Qt's menus and tooltips - came after the game's and drew too rarely to count."* The
+   1x1 `MOD_INVALID` import error is **gamescope's cursor**, it is expected, and it appears in every
+   session including the ones that worked.
+
+   The UI window itself behaves correctly in this run:
 
    ```
-   dmabuf  pitch 1602x720 declared=8192 honoured=8192 (linear)          <- imports fine
-   vulkan  "Steam" presenting GPU frames through Wayland: 1602x720, AR24, linear
-   error   could not import GPU frames from "Steam" (1x1, modifier 0xffffffffffffff)
+   window    opened "Steam" (gamescope) 1650x732 at 0,0
+   vulkan    "Steam" presenting GPU frames through Wayland: 1602x720, AR24, linear
+   dmabuf    pitch 1602x720 declared=8192 honoured=8192 (linear)
+   screen    fit, center: 1650x732 scene shown 2404x1067 at 0,6 on the 2404x1080 output
+   layer     presenting 1650x732 frames on their own SurfaceControl layer
    ```
 
-   The 1602x720 buffer is correct and is imported. A second surface commits **1x1 with
-   `MOD_INVALID`**, cannot be imported, and that is the window Steam's UI is drawn into. When it
-   cannot get a usable surface the client closes the window and exits `rc=0` (a clean shutdown, not a
-   crash). This is the §51/§59-60 signature, unchanged - but it is now reachable without an updater
-   loop in front of it, which it never was before.
+   A correct frame reaches the compositor and is placed on the display layer. That is a real
+   improvement on every earlier account, which never got this far.
 
-**Next.** The 1x1 commit is the whole problem: fix that and the login screen is on the panel. The
-harness measures it directly with `BL_FRAME_DIGEST=2` plus a panel capture, and `diag compare
---frame --panel` will say whether the panel matches the scene once a real frame reaches it.
+**What actually stops it: a display the client will accept.** `console_log.txt` ends at
+`GetWin32Stats: display was not open yet, good` with nothing after it, and the window closes ~17 s
+later with `steam exited rc=0` - a clean shutdown, not a crash. The client is waiting for a display
+it recognises and never gets one. Note it is **not** the X11 size problem of §51: the window is
+1650x732, not 1x1.
+
+**What it is waiting for, established from the connection log.** Not a display fault at all:
+
+```
+18:55:03  Connectivity test: Starting test, fetching 'http://steamconnecttest.com/204'
+18:55:03  [Logged Off, 0, 0] [U:1:0] CCMInterface::SetSteamID( [U:1:0] )
+18:55:04  Connectivity test: result=Connected                    <- the network is fine
+18:55:14  [Logged Off, 0, 0] [U:1:0] Log session ended
+```
+
+Steam is **logged off with no user** (`[U:1:0]`) the whole time, and ends the log session 11 s after
+connecting. The client is sitting at its login screen with nobody able to log in. IPv6 tests time out,
+which is expected on this network and not the cause - the IPv4 test says `OK`.
+
+So the client is not blocked by the compositor, the ICD, GBM or D-Bus. It is blocked by an absent
+login, and the display path is now complete enough that the login screen *is* being drawn
+(1602x720 frame -> 1650x732 scene -> display layer). The two X11 property complaints
+(`GAMESCOPE_VIEWPORT_SUPPORTED`, the atom-type warning) remain unexplained but are not what ends the
+session.
+
+**Next, and it is now a login question, not a graphics one.** Either sign in (which needs the login
+screen to be reachable - it should be, on the panel), or run the client in a mode that does not need
+one. The frame measurement the harness is built for becomes possible the moment a real UI frame is on
+screen: `BL_FRAME_DIGEST=2` plus `diag frame --panel`, then `diag compare --frame --panel`.
