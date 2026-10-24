@@ -3559,3 +3559,53 @@ either.
 
 Still BUILT, NOT SEEN. The geometry is now self-consistent with the driver's own report; only the
 panel can confirm the result.
+
+## 76. The display path's lifecycle: three defects, and the geometry confirmed against AOSP (2026-10-24, commit `0ceb8b08`)
+
+Verifying §75's geometry against AOSP's own implementation settled the open question, and tracing the
+path's lifecycle found three more defects. No device was involved.
+
+**The geometry is now confirmed, not inferred.** `SurfaceComposerClient::Transaction::setGeometry`
+(`frameworks/native/libs/gui/SurfaceComposerClient.cpp`) is the code that turns the call into a
+matrix, and its ROT_270 case is:
+
+```cpp
+case NATIVE_WINDOW_TRANSFORM_ROT_270:
+    matrix[0] = 0; matrix[1] = yScale;
+    matrix[2] = -xScale; matrix[3] = 0;
+    y += source.getWidth();
+```
+
+with `xScale = dst.width / source.width` and `yScale = dst.height / source.height`. So the
+DESTINATION'S HEIGHT carries the SOURCE'S WIDTH. A 2404x1080 source therefore needs a destination
+taller than it is wide - which, on a 1080x2404 panel, is `dst = [0,0 - 1080,2404]`. That is exactly
+what §75's fix computes, so §75's remaining uncertainty ("does SurfaceFlinger honour the layer's
+transform the same way as a swapchain's?") is answered by the implementation: it builds the matrix
+itself.
+
+**Three lifecycle defects fixed:**
+
+1. **A rotation change was never detected.** `check_surface_changed()` started with
+   `if (!g_swapchain ...) return;` - always true on the display path, which has no swapchain. A
+   fold, a rotation lock, or another display would have left the mapping on the old orientation
+   forever. It now reads the surface's caps and rebuilds the MAPPING when size or rotation moves.
+2. **The mapping survived a window change.** `update_map()` short-circuits on an unchanged
+   (scene, output, mode, align) tuple, and nothing invalidated it when the window was replaced, so a
+   new window reporting the same size kept the previous one's rectangle. Invalidated in
+   `vkp_apply_window_request()` now, with the rotation flag.
+3. **`vkp_surface_caps` wrote `g_caps_extent`**, which belongs to the swapchain comparison while on
+   the display path `g_extent` holds the ROTATED parent extent. Left to the swapchain path; the
+   display branch establishes its own baseline instead of reporting a change from (0,0).
+
+**Lifecycle trace, real device numbers** (panel 1080x2404, surface extent 2404x1080, ROT_270):
+
+```
+frame 1   caps -> parent 1080x2404, swapped=1; map sees scene 1080x2404 on output 1080x2404
+          dst = [0,0 - 1080,2404]; setGeometry(src 0,0-2404,1080, dst ^, transform 7)
+frame 2   nothing changed -> check returns, update_map short-circuits, same dst
+rotation  check detects -> g_extent=parent, map invalidated -> remapped next frame
+```
+
+versionCode 40. **Still BUILT, NOT SEEN.** What remains unverifiable without hardware is now only
+whether the whole approach presents a picture at all - the geometry itself is confirmed against
+AOSP's implementation and against the device's own dumpsys.
