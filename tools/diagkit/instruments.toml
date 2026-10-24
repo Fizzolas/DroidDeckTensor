@@ -1,0 +1,94 @@
+# Every instrument the harness knows how to deploy or read, what proves it is the thing that ran,
+# and the known answer it must reproduce before its output may be cited in a finding.
+# `cost` is bytes per minute in the run's evidence directory at default settings.
+
+[crashcatch]
+kind = "guest-so"
+build = "WSL: bash docs/development/pvr-re/rig/build.sh -> rig/dist/crashcatch.so"
+identity = "sha256 of the pushed file, compared with /proc/<pid>/maps inode"
+calibration = "known-fault-address"
+cost = 4096
+
+[mmwatch]
+kind = "guest-so"
+build = "WSL: bash docs/development/pvr-re/rig/build.sh -> rig/dist/mmwatch.so"
+identity = "sha256 of the pushed file, compared with /proc/<pid>/maps inode"
+calibration = "known-mmap"
+cost = 65536
+
+[symwatch]
+kind = "guest-so"
+build = "WSL: bash docs/development/pvr-re/rig/build.sh -> rig/dist/symwatch.so"
+identity = "sha256 of the pushed file, compared with /proc/<pid>/maps inode"
+calibration = "known-dlopen"
+cost = 32768
+
+[icd-wsi-log]
+kind = "icd-log"
+build = "WSL: bash docs/development/pvr-re/hybshim/build_all.sh -> hybshim/icd/libvulkan_powervr.so"
+identity = "dist/build_id.json sha256 against /proc/<pid>/maps inode"
+calibration = "build-signature"
+cost = 16384
+
+[icd-diag-log]
+kind = "icd-log"
+build = "WSL: bash docs/development/pvr-re/hybshim/build_all.sh (PVR_ICD_DEBUG=1 at runtime)"
+identity = "build signature line in the captured stderr"
+calibration = "build-signature"
+cost = 16384
+
+[compositor-log]
+kind = "compositor-log"
+build = "gradle: ./gradlew assembleDebug"
+identity = "BuildConfig.VERSION_CODE from the agent state call"
+calibration = "build-signature"
+cost = 8192
+
+[frame-digest]
+kind = "frame-digest"
+build = "gradle: ./gradlew assembleDebug (src/frame_digest.c + src/vk_present.c)"
+identity = "build label printed in the first digest line"
+calibration = "known-pattern"
+cost = 10240
+
+[panel-digest]
+kind = "panel-digest"
+build = "host: tools/diagkit/frames.py (no build)"
+identity = "screencap header width/height must equal the session output size"
+calibration = "known-pattern"
+cost = 0
+
+[proc-watch]
+kind = "host-tool"
+build = "none: pushed shell script"
+identity = "sha256 of the pushed file"
+calibration = "known-marker"
+cost = 2048
+
+[x-inspect]
+kind = "host-tool"
+build = "guest build: docs/development/pvr-re/rig (x11build)"
+identity = "sha256 of the pushed file"
+calibration = "known-marker"
+cost = 4096
+
+[cdp-observer]
+kind = "host-tool"
+build = "none: python script pushed into the guest"
+identity = "sha256 of the pushed file"
+calibration = "known-marker"
+cost = 8192
+
+[device-report]
+kind = "snapshot"
+build = "gradle: ./gradlew assembleDebug"
+identity = "BuildConfig.VERSION_CODE"
+calibration = "none"
+cost = 2048
+
+[snapshot]
+kind = "snapshot"
+build = "gradle: ./gradlew assembleDebug"
+identity = "BuildConfig.VERSION_CODE"
+calibration = "known-marker"
+cost = 65536
