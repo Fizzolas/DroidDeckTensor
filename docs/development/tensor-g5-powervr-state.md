@@ -3895,3 +3895,61 @@ session.
 screen to be reachable - it should be, on the panel), or run the client in a mode that does not need
 one. The frame measurement the harness is built for becomes possible the moment a real UI frame is on
 screen: `BL_FRAME_DIGEST=2` plus `diag frame --panel`, then `diag compare --frame --panel`.
+
+## 81. The 5-8 second black, and the GPU process death, both located (2026-10-24)
+
+The reported cycle, from the user: *"after like 5-8 seconds the screen behind the controls goes
+black; lines still there too."* The overlay renders correctly throughout, which was the decisive
+clue - it is drawn by the Android app through the normal view path, so the display stack is sound
+and only the Steam path is broken.
+
+**The cycle, measured (three consecutive, each ~70 s apart and identical):**
+
+```
+19:49:19  SP BPM_uid0: Created window: size: 1280,800 pos: 0,0 mode: OpenGL
+19:49:17  BrowserReady: handle:65536
+19:49:20  BrowserReady: handle:131073          <- the UI page; this is what draws the lines
+19:49:25  Restart webhelper process, counter 2
+19:49:21  gpu_process_host.cc(1002) GPU process exited unexpectedly: exit_code=11
+19:49:21  The GPU process has crashed 1 time(s)
+19:49:26  Reinitialized the GPU process after a crash (1005 ms)
+```
+
+`exit_code=11` is **SIGSEGV**. So the sequence is: the CEF GPU process segfaults ~4 s in, CEF
+reinitialises it, Steam's helper gives up and restarts the whole webhelper, and each restart tears
+the window down - which is the black. The lines are whatever the dying GPU process managed to draw
+first.
+
+**Two corrections to earlier readings in this same session:**
+
+1. **The `0x0` in `CreateBrowser ... 0x0` is not the bug.** It is CEF's initial creation size before
+   the viewport is set. Big Picture's actual window is **1280x800** (`SP BPM_uid0: Created window`).
+   The `1x1` import error in the compositor log is gamescope's cursor, as `compositor.c:858`
+   documents. Neither is the fault, and both were guessed at before being read properly.
+
+2. **`--link2symlink` (section 79) is still correct and still needed** - the updater now completes -
+   but it did not change this cycle, which is a GPU-process crash, not an extraction failure.
+
+**The labelled crash capture, run at last.** `crashcatch.so` hash `5cb533e9` (the `e15bead` build
+that re-fronts on a zygote's SIG_DFL reset), BL_FRAME_DIGEST off, one Steam session. Two reports
+were produced, both the **secondary** fault, none from the GPU process:
+
+```
+comm=vulkandriverque   si_addr=0x308 (NULL+0x308)
+pc -> bionic libc.so +0x80944   (the __errno region)
+lr -> bionic libc.so +0x91c54   (__open_2 return site)
+```
+
+This confirms section 63's reading of `vulkandriverquery` exactly - Steam's GPU driver query
+dereferences a bad pointer on an open/errno path inside the bionic HAL, through our hybris bridge.
+It is a real fault and it is **not** the GPU-process crash.
+
+**Honest negative result:** the GPU process still produces no report even with the zygote fix. It is
+forked from the Chromium zygote and its fatal-signal dispositions are reset in the child; re-fronting
+on `sigaction()` evidently is not enough. Capturing it needs a different mechanism - most cheaply,
+`logcat -b crash` plus the kernel's own tombstone, or attaching to the pid before it dies.
+
+**Where this leaves the work.** The user's two visible symptoms are now both explained: garbled
+content is the doomed GPU process's partial frame, and the black is its restart taking the window
+down. The next question is why the GPU process segfaults - and that is section 63's question, still
+open, now with a reproducible ~4 s window to attach to instead of a race.
