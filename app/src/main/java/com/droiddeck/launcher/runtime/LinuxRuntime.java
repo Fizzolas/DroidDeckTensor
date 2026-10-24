@@ -217,6 +217,14 @@ public final class LinuxRuntime {
         List<String> cmd = new ArrayList<>();
         cmd.add(prootBinary(context).getPath());
         cmd.add("--kill-on-exit");
+        // Android denies an app link()/linkat() outright (EACCES, measured at the exact path the
+        // Steam runtime extracts into). The Steam client's runtime archive extracts with hard
+        // links as its dedup mechanism, so the extraction fails partway - "Failed to unzip item
+        // 3732 (.../share/i18n/locales/anp_IN_)" - and the client loops on "Installing update..."
+        // forever, which is the wall in state doc sections 64 and 78. proot's own answer is this
+        // flag: it answers the guest's link() with a symlink and keeps the stand-in it points at
+        // in PROOT_L2S_DIR.
+        cmd.add("--link2symlink");
         // Preserve the host kernel identity while giving the guest the app's branded host name.
         cmd.add("--kernel-release=" + guestUtsname(SessionPrefs.guestHostname(context)));
         // Android's app seccomp policy traps the whole set*id family. Xwayland's Popen() calls

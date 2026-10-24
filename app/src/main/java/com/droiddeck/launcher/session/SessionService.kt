@@ -472,6 +472,11 @@ class SessionService : Service() {
         val hostEnv = HostEnvironment()
         hostEnv["PROOT_LOADER"] = LinuxRuntime.prootLoader(this).path
         hostEnv["PROOT_TMP_DIR"] = cacheDir.path
+        // --link2symlink writes each hard link's stand-in here. Unnamed it uses a directory inside
+        // the guest rootfs, where the entries outlive the session and fill it; ours lives in the
+        // app's own files dir and is cleared when the session starts.
+        val linkDir = File(filesDir, ".l2s").apply { deleteRecursively(); mkdirs() }
+        hostEnv["PROOT_L2S_DIR"] = linkDir.path
         // proot links against a libtalloc beside it, and Android's linker does not search an
         // executable's own directory: unnamed, the process dies before it starts and says so only
         // in `logcat -b crash`.
