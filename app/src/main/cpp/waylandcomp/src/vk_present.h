@@ -182,6 +182,12 @@ int vkp_map_rect(int img_w, int img_h, int scene_w, int scene_h, int out[8]);
  * it does - never a device allowlist. The layer path uses it to decide whether a SECOND display
  * layer is affordable on this display (sc_layer_present_overlay). */
 int vkp_surface_rotation_degrees(void);
+/* The same rotation as the NATIVE_WINDOW_TRANSFORM_* bitmask that
+ * ASurfaceTransaction_setGeometry's transform parameter takes (0 = none). Use this for layers. */
+int vkp_surface_transform_hal(void);
+/* The scene size the current mapping was built for - pass THIS to vkp_map_rect after
+ * vkp_update_map, or the rectangle is derived from the unrotated frame. 0 = nothing mapped. */
+int vkp_mapped_scene_size(int *w, int *h);
 
 ANativeWindow *vkp_window(void);
 /* Fire the one-shot first-frame notification (layer mode presents outside vkp_render). */

@@ -568,7 +568,12 @@ static int ensure_sc(struct layer *l) {
  * app's touch mapping use. 1 = r filled, 0 = nothing of it is on screen, -1 = no mapping. */
 static int layer_geometry(int w, int h, int scene_w, int scene_h, int r[8]) {
     if (vkp_update_map(scene_w, scene_h) != 0) return -1;
-    return vkp_map_rect(w, h, scene_w, scene_h, r) ? 1 : 0;
+    /* Derive the rectangle from the size the map was actually built for: on a rotated panel
+     * vkp_update_map maps the ROTATED scene, and using the unrotated one gives a rectangle for the
+     * wrong aspect. */
+    int mw = scene_w, mh = scene_h;
+    vkp_mapped_scene_size(&mw, &mh);
+    return vkp_map_rect(w, h, mw, mh, r) ? 1 : 0;
 }
 
 /* The GAME layer's last placement, kept across SurfaceControl retires and swaps (l->geo_valid is
@@ -581,7 +586,13 @@ static void apply_geometry(ASurfaceTransaction *tx, struct layer *l, const int r
     ARect srcR = {r[0], r[1], r[2], r[3]}, dstR = {r[4], r[5], r[6], r[7]};
     if (l == &g_layers[SC_LAYER_GAME]) { g_game_src = srcR; g_game_dst = dstR; g_game_geo_known = 1; }
     if (!l->geo_valid || memcmp(&srcR, &l->geo_src, sizeof(srcR)) || memcmp(&dstR, &l->geo_dst, sizeof(dstR))) {
-        api.setGeometry(tx, l->sc, &srcR, &dstR, 0 /* no transform: the DPU scales, never rotates */);
+        /* The panel's rotation, as the consumer must apply it. MEASURED (dumpsys SurfaceFlinger,
+         * the config that ships): our landscape buffer is composed onto the portrait panel with
+         * sourceCrop=[0 0 2404 1080] and bufferTransform=ROT_270. A display layer is the same kind
+         * of consumer, so it gets the same value; passing 0 makes the DPU read a 2404x1080 buffer
+         * as if it were already portrait - a per-scanline misread, which is exactly the symptom
+         * this whole line of work is about. */
+        api.setGeometry(tx, l->sc, &srcR, &dstR, vkp_surface_transform_hal());
         l->geo_src = srcR; l->geo_dst = dstR; l->geo_valid = 1;
         char cov[96] = "";
         if (l->ds_applied > 0) coverage_text(l, cov, sizeof(cov));
@@ -925,7 +936,11 @@ int sc_layer_present_display(void *img_handle, int rw, int rh, int scene_w, int 
     int r[8];
     if (!img || rw <= 0 || rh <= 0 || ensure_sc(l) != 0) return -1;
     if (vkp_update_map(scene_w, scene_h) != 0) return -1;
-    if (!vkp_map_rect(rw, rh, scene_w, scene_h, r)) { sc_layer_hide(); return 1; }
+    /* Use the scene size the mapping was built for, not the one handed in: on a rotated panel
+     * vkp_update_map maps the ROTATED frame and the rectangle must be derived from that. */
+    int mw = scene_w, mh = scene_h;
+    vkp_mapped_scene_size(&mw, &mh);
+    if (!vkp_map_rect(rw, rh, mw, mh, r)) { sc_layer_hide(); return 1; }
     int wait_fd;
     int idx = take_free_slot(l, rw, rh, AHB_RGBA8, &wait_fd);
     if (idx < 0) { log_drop(l); return 1; }
@@ -951,7 +966,8 @@ int sc_layer_present_pass(const struct vkp_draw *draws, int n, int scene_w, int 
     /* Compose + run the effects chain first: the chain's result size (a scaling mode resizes to
      * the scene's mapped output size) decides how big the layer buffer has to be. */
     if (vkp_pass_begin(scene_w, scene_h, draws, n, &rw, &rh) != 0) return -1;
-    if (!vkp_map_rect(rw, rh, scene_w, scene_h, r)) { vkp_pass_abort(); sc_layer_hide(); return 0; }
+    { int mw = scene_w, mh = scene_h; vkp_mapped_scene_size(&mw, &mh);
+      if (!vkp_map_rect(rw, rh, mw, mh, r)) { vkp_pass_abort(); sc_layer_hide(); return 0; } }
     int wait_fd;
     int idx = take_free_slot(l, rw, rh, AHB_RGBA8, &wait_fd);
     if (idx < 0) { vkp_pass_abort(); log_drop(l); return 0; }
@@ -984,7 +1000,8 @@ int sc_layer_present_hdr_scene(const struct vkp_draw *draws, int n, const struct
     if (!draws || n <= 0 || !hf || ensure_sc(l) != 0) return -1;
     if (vkp_update_map(scene_w, scene_h) != 0) return -1;
     if (vkp_pass_begin_hdr(scene_w, scene_h, draws, n, hf, &rw, &rh) != 0) return -1;
-    if (!vkp_map_rect(rw, rh, scene_w, scene_h, r)) { vkp_pass_abort(); sc_layer_hide(); return 0; }
+    { int mw = scene_w, mh = scene_h; vkp_mapped_scene_size(&mw, &mh);
+      if (!vkp_map_rect(rw, rh, mw, mh, r)) { vkp_pass_abort(); sc_layer_hide(); return 0; } }
     const int tm = hf->tonemap;
     const uint32_t fmt = tm ? AHB_RGBA8 : g_hdr_pool_fmt;
     g_alloc_failed = 0;

@@ -166,6 +166,7 @@ static volatile int g_mode = VKP_MODE_STRETCH, g_align = VKP_ALIGN_CENTER;
 
 /* The scene -> output mapping of the last frame (compositor thread): scene pixel (x,y) lands at
  * output (off_x + x * kx, off_y + y * ky), clipped to the region rectangle. */
+static int g_map_scene_swapped; /* the layer carries a 90/270 rotation: the map sees the swapped scene */
 static struct {
     int scene_w, scene_h, out_w, out_h, mode, align;
     float kx, ky, off_x, off_y;
@@ -2075,6 +2076,29 @@ int vkp_render_hdr(int scene_w, int scene_h, const struct vkp_draw *draws, int n
 /* Degrees the display rotates our layers by: 0, 90, 180 or 270; -1 before the swapchain exists.
  * Read from the surface, so it follows the panel's install orientation and the session's own
  * orientation together, on any device. */
+/* The surface rotation as the value ASurfaceTransaction_setGeometry's `transform` parameter wants
+ * (a NATIVE_WINDOW_TRANSFORM_* / HAL_TRANSFORM_* bitmask), or 0 for none.
+ *
+ * This matters and is measured, not assumed. SurfaceFlinger composes our landscape buffer onto the
+ * portrait panel with sourceCrop=[0 0 2404 1080] and bufferTransform=ROT_270 (dumpsys
+ * SurfaceFlinger, the config that ships). A display layer is the same kind of consumer, so it must
+ * be given the same rotation - passing 0 makes the DPU read a 2404x1080 buffer as if it were
+ * already portrait, which is a per-scanline misread. HAL_TRANSFORM_ROT_270 is 7 (FLIP_H|FLIP_V|
+ * ROT_90); ROT_90 is 4, ROT_180 is 3.
+ *
+ * The Vulkan bit and the HAL constant are the same rotation expressed for the same consumer, so no
+ * inversion is applied here - and the dumpsys above is the evidence for that, since SurfaceFlinger
+ * reports VK's ROT_270 and HAL's ROT_270 for the same buffer. */
+int vkp_surface_transform_hal(void) {
+    if (!g_surface_transform_known) return 0;
+    switch (g_surface_transform) {
+        case VK_SURFACE_TRANSFORM_ROTATE_90_BIT_KHR:  return 4; /* HAL_TRANSFORM_ROT_90  */
+        case VK_SURFACE_TRANSFORM_ROTATE_180_BIT_KHR: return 3; /* HAL_TRANSFORM_ROT_180 */
+        case VK_SURFACE_TRANSFORM_ROTATE_270_BIT_KHR: return 7; /* HAL_TRANSFORM_ROT_270 */
+        default: return 0;
+    }
+}
+
 int vkp_surface_rotation_degrees(void) {
     if (!g_surface_transform_known) return -1;
     switch (g_surface_transform) {
@@ -2113,11 +2137,30 @@ static void ensure_extent_from_window(void) {
     VkExtent2D caps_extent = {0, 0};
     int transform = 0;
     if (vkp_surface_caps(&caps_extent, &transform) && caps_extent.width > 0) {
-        if (caps_extent.width != g_extent.width || caps_extent.height != g_extent.height) {
-            g_extent = caps_extent;
-            droiddeck_log("screen", "output %ux%u, rotation 0x%x (from the surface; no swapchain)",
-                          g_extent.width, g_extent.height, (unsigned)transform);
+        /* caps.currentExtent is the SURFACE's (the SurfaceView's) extent - the size of a buffer you
+         * would present into. A display layer's destination rectangle lives in the PARENT's space
+         * instead (surface_control.h: "the rect in the parent's space where this surface will be
+         * drawn"), and the layer carries the rotation that turns our landscape buffer portrait.
+         *
+         * So the parent and the surface differ by exactly that rotation, and the scene -> parent
+         * mapping has to be computed in the ROTATED frame. The map maps a scene of scene_w x
+         * scene_h onto an output of g_extent; after the layer rotates the scene by 90/270, the
+         * scene's own aspect is swapped as seen by the parent. Feeding the unswapped scene size
+         * through the FIT maths sizes the destination as if the picture were still landscape and
+         * leaves it small and off-centre (measured by hand: a 2404x1080 scene mapped that way into
+         * a 1080x2404 parent gives a 1080x485 destination - a letterbox for the wrong aspect).
+         *
+         * Only reached with no swapchain, so the swapchain path's own extent is untouched. */
+        VkExtent2D parent = caps_extent;
+        int rot = (transform == 0x4 /* ROT_90 */ || transform == 0x8 /* ROT_270 */);
+        if (rot) { uint32_t t = parent.width; parent.width = parent.height; parent.height = t; }
+        if (parent.width != g_extent.width || parent.height != g_extent.height) {
+            g_extent = parent;
+            droiddeck_log("screen", "layer space %ux%u (surface %ux%u, rotation 0x%x)",
+                          g_extent.width, g_extent.height, caps_extent.width, caps_extent.height,
+                          (unsigned)transform);
         }
+        g_map_scene_swapped = rot;
         return;
     }
     int w = ANativeWindow_getWidth(g_window), h = ANativeWindow_getHeight(g_window);
@@ -2164,9 +2207,30 @@ int vkp_surface_caps(VkExtent2D *extent, int *transform) {
 int vkp_update_map(int scene_w, int scene_h) {
     if (g_dev_state == -2 || dev_init() != 0 || !g_window || scene_w <= 0 || scene_h <= 0) return -1;
     check_surface_changed(); /* layer mode may present nothing on the base surface for a long time */
-    if (!g_swapchain) ensure_extent_from_window(); /* layer/display path: no swapchain to ask */
+    if (!g_swapchain) {
+        ensure_extent_from_window(); /* layer/display path: no swapchain to ask */
+    } else {
+        /* A live swapchain means the copy path, which owns the extent and applies no rotation.
+         * Clear the flag so a session that fell back from the layer path does not keep mapping in
+         * the rotated frame. */
+        g_map_scene_swapped = 0;
+    }
+    /* The layer carries the panel's rotation, so the mapping must see the scene in the frame the
+     * PARENT displays (a 90/270 rotation swaps the scene's axes). Only set on the display path. */
+    if (g_map_scene_swapped) { int t = scene_w; scene_w = scene_h; scene_h = t; }
     update_map(scene_w, scene_h);
     return g_map.valid ? 0 : -1;
+}
+
+/* The scene size the current mapping was built for. After vkp_update_map this is the size a caller
+ * must pass to vkp_map_rect, or it would re-derive a mapping from the unrotated frame and get a
+ * different (wrong) rectangle - on the display path with a rotated panel that is a letterbox for
+ * the wrong aspect. 0 = nothing mapped yet. */
+int vkp_mapped_scene_size(int *w, int *h) {
+    if (!g_map.valid) return 0;
+    if (w) *w = g_map.scene_w;
+    if (h) *h = g_map.scene_h;
+    return 1;
 }
 
 int vkp_map_rect(int img_w, int img_h, int scene_w, int scene_h, int out[8]) {
