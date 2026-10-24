@@ -2480,8 +2480,14 @@ int vkp_image_readback(struct vkp_image *src, uint32_t *out, int max_px) {
 static struct vkp_image *g_fd;          /* the digest staging image, sized for one shape */
 static long g_fd_frame, g_fd_last_mono, g_fd_last_hash;
 
+/* Set from Java before the compositor starts (WaylandCompositor.nativeSetFrameDigest), because the
+ * compositor runs in the app's process: a variable exported to the guest never reaches it. The
+ * environment variable is still honoured as a fallback for a host-side or guest-side test. */
+volatile int g_fd_level_setting;
+
 static int fd_level(void) {
     static int level = -1;
+    if (g_fd_level_setting > 0) return g_fd_level_setting;
     if (level < 0) {
         const char *v = getenv("BL_FRAME_DIGEST");
         level = (v && *v) ? atoi(v) : 0;

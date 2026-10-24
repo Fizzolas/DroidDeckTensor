@@ -998,6 +998,10 @@ class SessionActivity : ComponentActivity(), SurfaceHolder.Callback {
             // (the default). This switch forces the old path back for an A/B; set before the
             // compositor starts, like the other compositor switches below.
             WaylandCompositor.nativeSetSwapchainCopy(SessionPrefs.swapchainCopy(this))
+            // Frame digest: the compositor lives in THIS process, so the guest's environment never
+            // reaches it - the switch has to be read here. The same Downloads/droiddeck-env file
+            // that carries the experiment's variables carries this one.
+            WaylandCompositor.nativeSetFrameDigest(frameDigestLevel())
             val probe = HdrSupport.probe(this)
             WaylandCompositor.nativeSetHdrDisplay(
                 probe.displayId, probe.name, probe.formats, probe.hdr10,
@@ -2149,4 +2153,19 @@ class SessionActivity : ComponentActivity(), SurfaceHolder.Callback {
             LoadingState.Topic.STEAM, checkingReadable = false,
         )
     }
+
+    /**
+     * BL_FRAME_DIGEST from Downloads/droiddeck-env, clamped to 0..2. The compositor runs in this
+     * process, so the guest's environment never reaches it; this is how the switch crosses over.
+     * Absent or unreadable means off, which is the right default: the digest reads every sampled
+     * frame back to the CPU, and nothing should be doing that while nobody is looking.
+     */
+    private fun frameDigestLevel(): Int =
+        runCatching {
+            File(Environment.getExternalStorageDirectory(), "Download/droiddeck-env")
+                .takeIf { it.isFile }?.readLines().orEmpty()
+                .map { it.trim() }
+                .firstOrNull { it.startsWith("BL_FRAME_DIGEST=") }
+                ?.substringAfter('=')?.trim()?.toIntOrNull()
+        }.getOrNull()?.coerceIn(0, 2) ?: 0
 }

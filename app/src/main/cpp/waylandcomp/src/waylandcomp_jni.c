@@ -373,6 +373,18 @@ Java_com_droiddeck_launcher_wayland_WaylandCompositor_nativeSetSwapchainCopy(JNI
                         on ? "OFF (swapchain copy forced)" : "on");
 }
 
+/* Frame digest level (0 off, 1 numbers, 2 numbers + ASCII map). Set before the compositor starts;
+ * BL_FRAME_DIGEST in Downloads/droiddeck-env chooses it. Off unless asked: it reads the frame back
+ * to the CPU, which is not something to do while nobody is looking. */
+extern volatile int g_fd_level_setting;
+JNIEXPORT void JNICALL
+Java_com_droiddeck_launcher_wayland_WaylandCompositor_nativeSetFrameDigest(JNIEnv *env, jclass clazz, jint level) {
+    g_fd_level_setting = level > 2 ? 2 : (level < 0 ? 0 : level);
+    __android_log_print(ANDROID_LOG_INFO, TAG, "frame digest %s",
+                        g_fd_level_setting == 0 ? "off"
+                        : (g_fd_level_setting == 1 ? "on (numeric)" : "on (numeric + ascii map)"));
+}
+
 /* Debug: name no DRM device in the dma-buf feedback (DROIDDECK_WAYLAND_NO_RENDER_NODE=1), the way a
  * phone that exposes no /dev/dri node to apps does. Set before the compositor starts. */
 JNIEXPORT void JNICALL

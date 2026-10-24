@@ -74,6 +74,20 @@ class CompositorDigestTest(unittest.TestCase):
     def test_the_header_declares_the_digest(self):
         self.assertIn('int vkp_frame_digest', self.hdr)
 
+    def test_the_switch_crosses_from_java_because_the_compositor_is_in_the_app_process(self):
+        """A variable exported to the guest never reaches the compositor; it runs in our process."""
+        jni = (COMPOSITOR / 'src/waylandcomp_jni.c').read_text(encoding='utf-8')
+        java = (ROOT / 'app/src/main/java/com/droiddeck/launcher/wayland/WaylandCompositor.java').read_text(encoding='utf-8')
+        activity = (ROOT / 'app/src/main/java/com/droiddeck/launcher/SessionActivity.kt').read_text(encoding='utf-8')
+        self.assertIn('nativeSetFrameDigest', jni)
+        self.assertIn('nativeSetFrameDigest', java)
+        self.assertIn('nativeSetFrameDigest', activity)
+
+    def test_the_jni_setter_clamps_the_level(self):
+        jni = (COMPOSITOR / 'src/waylandcomp_jni.c').read_text(encoding='utf-8')
+        body = jni.split('nativeSetFrameDigest', 1)[1].split('}', 1)[0]
+        self.assertIn('level > 2', body)
+
 
 if __name__ == '__main__':
     unittest.main()

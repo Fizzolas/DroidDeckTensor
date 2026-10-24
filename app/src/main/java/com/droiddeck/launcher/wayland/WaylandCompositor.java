@@ -277,6 +277,12 @@ public final class WaylandCompositor {
      *  display path). Set before the session starts; read once, on the first scene. */
     public static native void nativeSetSwapchainCopy(boolean on);
 
+    /** Frame digest: 0 off (default), 1 numeric evidence about each composed frame, 2 that plus a
+     *  48x20 ASCII luminance map. Text only - it never reads back an image. Adaptive cadence: every
+     *  frame for the first 120, then sparse, plus any frame whose digest changed. Set before the
+     *  compositor starts; BL_FRAME_DIGEST in Downloads/droiddeck-env selects it. */
+    public static native void nativeSetFrameDigest(int level);
+
     /** Debug: advertise no DRM device (main device 0:0) in the dma-buf feedback, as a phone that
      *  exposes no /dev/dri node to apps does. DROIDDECK_WAYLAND_NO_RENDER_NODE=1 in the container's or
      *  shortcut's environment variables. Set before the compositor starts. */
