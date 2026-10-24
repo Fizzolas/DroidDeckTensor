@@ -97,6 +97,9 @@ class RunWiringTest(unittest.TestCase):
         class FakeDevice:
             def sha256(self, path):
                 return None
+            def shell(self, cmd, timeout=30):
+                # teardown runs after every run now; the fake reports nothing left behind
+                return ''
             def provider(self, method, arg=None):
                 if method == 'state':
                     return {'appVersion': '0.3.4'}

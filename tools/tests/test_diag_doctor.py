@@ -54,6 +54,27 @@ class DoctorTest(unittest.TestCase):
                     'sha256': 'sha256:stock', 'stock': tracked['stock']}]
         self.assertEqual('clean', doctor.verdict(entries)[0])
 
+    def test_an_env_file_the_run_declares_is_not_debris(self):
+        """The env switch IS how an experiment is armed; without this, one armed run refuses the next."""
+        entries = [{'name': 'droiddeck-env', 'path': '/sdcard/Download/droiddeck-env',
+                    'present': True, 'sha256': 'sha256:x', 'stock': None,
+                    'lines': ['BL_FRAME_DIGEST=2']}]
+        self.assertEqual('clean', doctor.verdict(entries, expected_env=['BL_FRAME_DIGEST=2'])[0])
+
+    def test_an_env_file_the_run_does_not_declare_is_still_dirty(self):
+        entries = [{'name': 'droiddeck-env', 'path': '/sdcard/Download/droiddeck-env',
+                    'present': True, 'sha256': 'sha256:x', 'stock': None,
+                    'lines': ['SOMETHING_ELSE=1']}]
+        state, reasons = doctor.verdict(entries, expected_env=['BL_FRAME_DIGEST=2'])
+        self.assertEqual('dirty', state)
+        self.assertIn('declared', reasons[0])
+
+    def test_without_a_declaration_the_env_file_is_dirty_as_before(self):
+        entries = [{'name': 'droiddeck-env', 'path': '/sdcard/Download/droiddeck-env',
+                    'present': True, 'sha256': 'sha256:x', 'stock': None,
+                    'lines': ['A=1']}]
+        self.assertEqual('dirty', doctor.verdict(entries)[0])
+
     def test_a_tracked_file_with_another_hash_is_dirty(self):
         tracked = dict(doctor.ARTIFACTS[0], stock='sha256:stock')
         entries = [{'name': tracked['name'], 'path': tracked['app_path'], 'present': True,

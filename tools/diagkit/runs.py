@@ -34,6 +34,9 @@ def _sibling(name):
     return module
 
 
+ENV_PATH = '/sdcard/Download/droiddeck-env'
+
+
 def load_registry():
     return _sibling('registry').load()
 
@@ -186,6 +189,77 @@ class Run:
         if kind == 'none':
             return True, 'no known-answer check declared'
         return True, f'{kind} is checked on the device, not from the host'
+
+    # Instruments the run leaves on the device and must take away again. The env switch is not one
+    # of them: it is how the experiment is armed, and it is restored rather than deleted.
+    TEARDOWN_PATHS = (
+        'files/linuxfs/tmp/crashcatch.so',
+        'files/linuxfs/tmp/mmwatch.so',
+        'files/linuxfs/tmp/symwatch.so',
+        'files/linuxfs/tmp/calibrate',
+        'files/linuxfs/tmp/cdp_probe.py',
+        'files/linuxfs/tmp/xinspect',
+        'files/linuxfs/tmp/proc_watch.sh',
+    )
+
+    def arm_env(self, adb, lines):
+        """Write the experiment's environment switch, and record it so teardown can restore it."""
+        adb = adb or self.adb
+        previous = None
+        try:
+            previous = adb.shell(f'cat {ENV_PATH} 2>/dev/null; true')
+        except Exception:
+            previous = None
+        body = ''.join(f'{line}\n' for line in lines)
+        adb.shell("run-as com.droiddeck.launcher true 2>/dev/null; "
+                  f"printf '%s' \"{body}\" > {ENV_PATH}")
+        self.manifest['env'] = {'armed': list(lines), 'previous': previous or None}
+        manifest.write_manifest(self.dir, self.manifest)
+        return lines
+
+    def teardown(self, adb=None):
+        """Take back what this run put on the device, then verify it, and taint the run if not.
+
+        This is the half of §63 the harness exists for: a rollback that failed mid-USB-flap left
+        two sessions running against a configuration the notes did not describe. A teardown that
+        cannot verify is not reported as done - it taints the run.
+        """
+        adb = adb or self.adb
+        reasons = []
+        for path in self.TEARDOWN_PATHS:
+            try:
+                adb.shell(f'run-as com.droiddeck.launcher rm -f {path} 2>/dev/null')
+            except Exception as exc:
+                reasons.append(f'{path}: {exc}')
+        env = self.manifest.get('env') or {}
+        try:
+            previous = env.get('previous')
+            if previous:
+                adb.shell(f"printf '%s' \"{previous}\" > {ENV_PATH}")
+            else:
+                adb.shell(f'rm -f {ENV_PATH}')
+        except Exception as exc:
+            reasons.append(f'droiddeck-env: {exc}')
+
+        # Verify rather than assume: anything still present is a failure to restore. The env file
+        # is checked too - it was armed by this run, and "the run left a variable set" is exactly
+        # the §63 shape. Checking only the copied libraries would have reported this run clean.
+        for path in self.TEARDOWN_PATHS:
+            try:
+                if adb.sha256(path) is not None:
+                    reasons.append(f'{path} is still present')
+            except Exception as exc:
+                reasons.append(f'{path}: could not be checked ({exc})')
+        try:
+            now = adb.shell(f'cat {ENV_PATH} 2>/dev/null; true')
+            previous = (self.manifest.get('env') or {}).get('previous')
+            if previous is None and now.strip():
+                reasons.append(f'{ENV_PATH} is still present')
+            elif previous is not None and now != previous:
+                reasons.append(f'{ENV_PATH} was not restored to what it held before')
+        except Exception as exc:
+            reasons.append(f'{ENV_PATH}: could not be checked ({exc})')
+        return self.finish(teardown_ok=not reasons, reasons=reasons)
 
     def finish(self, teardown_ok, reasons):
         self.manifest['teardown'] = 'ok' if teardown_ok else 'failed'

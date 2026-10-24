@@ -51,6 +51,10 @@ def build_parser():
                    help='instrument whose known-answer check must pass before this run measures')
     r.add_argument('--snapshot', action='store_true',
                    help='ask the app for a text snapshot once the run has begun')
+    r.add_argument('--env', action='append', default=None, metavar='KEY=VALUE',
+                   help='arm the experiment through Downloads/droiddeck-env (restored on teardown)')
+    r.add_argument('--keep', action='store_true',
+                   help='leave the instrumentation on the device instead of tearing it down')
 
     pr = sub.add_parser('prior', help='search every existing run before forming a hypothesis')
     pr.add_argument('question')
@@ -183,7 +187,9 @@ def _run(args):
     doctor_mod = _module('doctor')
     runs_mod = _module('runs')
     adb = _adb(args)
-    state, reasons = doctor_mod.verdict(doctor_mod.inventory(adb))
+    # A run that declares its environment makes that file expected rather than leftover, so one
+    # armed run does not refuse the next (the env switch IS how an experiment is armed).
+    state, reasons = doctor_mod.verdict(doctor_mod.inventory(adb), expected_env=args.env)
     if state != 'clean':
         print(json.dumps({'ok': False, 'state': state, 'reasons': reasons}))
         print('diag: the device is not clean; run `diag doctor` for the list', file=sys.stderr)
@@ -207,9 +213,23 @@ def _run(args):
             return 4
         result['calibrated'] = args.calibrate
 
+    if args.env:
+        result['armed'] = run.arm_env(adb, args.env)
+
     if args.snapshot:
         snapshot = run.snapshot(adb)
         result['snapshot'] = str(snapshot) if snapshot else None
+
+    if not args.keep:
+        final = run.teardown(adb)
+        result['teardown'] = final['teardown']
+        result['trust'] = 'tainted' if final['taint']['reasons'] else 'clean'
+        if final['taint']['reasons']:
+            result['ok'] = False
+            result['taint'] = final['taint']['reasons']
+            print(json.dumps(result))
+            print('diag: the device was not restored; this run is tainted', file=sys.stderr)
+            return 4
 
     print(json.dumps(result))
     return 0

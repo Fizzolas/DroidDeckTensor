@@ -206,6 +206,73 @@ class RunTest(unittest.TestCase):
         self.assertTrue((Path(out) / 'procs.txt').is_file())
         self.assertTrue(adb.app_pulls)
 
+    def test_teardown_restores_the_previous_env_and_verifies_the_device(self):
+        """§63's failure: a rollback that did not verify left the device armed."""
+        class EnvAdb(FakeAdb):
+            def __init__(self):
+                super().__init__()
+                self.env = 'OLD=1\n'
+                self.removed = []
+            def shell(self, cmd, timeout=30):
+                self.calls.append(cmd)
+                if cmd.startswith('cat /sdcard/Download/droiddeck-env'):
+                    return self.env
+                if 'printf' in cmd and '/sdcard/Download/droiddeck-env' in cmd:
+                    self.env = cmd.split('"')[1] if '"' in cmd else ''
+                if ' rm -f ' in cmd:
+                    self.removed.append(cmd.split(' rm -f ')[1].split()[0])
+                return ''
+            def sha256(self, path):
+                if path.startswith('files/linuxfs/tmp/'):
+                    return None          # removed, as teardown intends
+                return self.files.get(path)
+        adb = EnvAdb()
+        run = runs.Run(self.tmp, 'l', 'h', {'v': '1'}, adb, 'c', 41)
+        run.begin()
+        run.arm_env(adb, ['BL_FRAME_DIGEST=2'])
+        self.assertIn('BL_FRAME_DIGEST=2', adb.env)
+        m = run.teardown(adb)
+        self.assertEqual('ok', m['teardown'])
+        self.assertEqual('clean', manifest.trust(m))
+        self.assertIn('OLD=1', adb.env)
+
+    def test_teardown_that_finds_something_left_taints_the_run(self):
+        class Sticky(FakeAdb):
+            def shell(self, cmd, timeout=30):
+                self.calls.append(cmd)
+                return ''
+            def sha256(self, path):
+                if path == 'files/linuxfs/tmp/crashcatch.so':
+                    return 'sha256:still-here'   # the rm silently failed
+                return self.files.get(path)
+        run = runs.Run(self.tmp, 'l', 'h', {'v': '1'}, Sticky(), 'c', 41)
+        run.begin()
+        m = run.teardown(run.adb)
+        self.assertEqual('failed', m['teardown'])
+        self.assertEqual('tainted', manifest.trust(m))
+        self.assertTrue(any('still present' in r for r in m['taint']['reasons']))
+
+    def test_an_armed_run_records_what_it_replaced(self):
+        adb = FakeAdb()
+        run = runs.Run(self.tmp, 'l', 'h', {'v': '1'}, adb, 'c', 41)
+        run.begin()
+        run.arm_env(adb, ['BL_FRAME_DIGEST=1'])
+        self.assertEqual(['BL_FRAME_DIGEST=1'], run.manifest['env']['armed'])
+
+    def test_teardown_notices_an_env_file_it_could_not_remove(self):
+        """The verification must cover the env file, not only the copied libraries."""
+        class StuckEnv(FakeAdb):
+            def shell(self, cmd, timeout=30):
+                self.calls.append(cmd)
+                if cmd.startswith('cat /sdcard/Download/droiddeck-env'):
+                    return 'BL_FRAME_DIGEST=2\n'   # still there after the rm
+                return ''
+        run = runs.Run(self.tmp, 'l', 'h', {'v': '1'}, StuckEnv(), 'c', 41)
+        run.begin()
+        m = run.teardown(run.adb)
+        self.assertEqual('failed', m['teardown'])
+        self.assertTrue(any('droiddeck-env' in r for r in m['taint']['reasons']))
+
 
 if __name__ == '__main__':
     unittest.main()
