@@ -3432,3 +3432,35 @@ class.
 surface-listed value (see §71). For an Android Surface the WSI reports a rotation-corrected
 `currentExtent` together with a non-IDENTITY `currentTransform`; those are contradictory, and
 IDENTITY over an already-rotated extent is the self-consistent choice.
+
+## 73. §72's Turnip hypothesis is REFUTED by the existing logs (2026-10-23)
+
+Before acting on §72, check the line the compositor has printed in every session:
+
+```
+compositor renders on PowerVR D-Series DXT-48-1536 MC1 with the system Vulkan driver
+```
+(`vk_present.c:447`, logged once per session; verified in ten separate `wayland.log` files from
+2026-10-22 and 2026-10-23.)
+
+"with the system Vulkan driver" is printed when `g_library_name` is NULL, i.e. **adrenotools' Turnip
+never loaded** and `vk_loader_open` took its fallback (`vk_loader.c:31`). So the compositor has been
+presenting through the device's own PowerVR Vulkan all along. §72's central claim - that Turnip is
+compiling the command stream for PowerVR scanout buffers - is FALSE on this device.
+
+That also removes the clean story §72 told: it was attractive because per-tile banding would explain
+both the bands and their orientation tracking the transform, but the premise does not hold.
+
+**Lesson, same as §68 and §71:** state the instrument that would falsify the hypothesis BEFORE
+writing the hypothesis up. Here the falsifying instrument was a log line already on disk, in a file
+this investigation had already pulled. One grep would have saved the section.
+
+**What survives from §72:** only the secondary, unproven observation - the copy path imports a
+client dma-buf and blits it with no wait on the producer's fence (`ahb_swapchain.c` handles
+`DMA_BUF_IOCTL_IMPORT_SYNC_FILE` only on the zero-copy path). That remains a plausible defect of the
+"missing synchronisation" class and is cheap to test, but it is not established as the cause either.
+
+**Where the corruption boundary stands after §70-73:** `screencap` is coherent (§70), the compositor
+presents with the real PowerVR driver (this section), and the user sees bands that changed orientation
+with the transform. The remaining unexplained step is the handoff from the compositor's swapchain
+image to the panel through SurfaceFlinger/DPU - i.e. what the DPU reads, not what the GPU wrote.
