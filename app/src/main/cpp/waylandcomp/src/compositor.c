@@ -319,6 +319,10 @@ static int g_zero_copy_fx_skip_said;
  * from the app before the compositor starts; read at every zwp_linux_dmabuf_v1 bind. */
 volatile int g_ubwc = 1;
 
+/* Force the old swapchain copy path instead of the display-layer path (the A/B for the display
+ * path). Set from the app before the session starts; read once, on the first scene. */
+volatile int g_swapchain_copy;
+
 /* Debug (DROIDDECK_WAYLAND_NO_RENDER_NODE=1): name no DRM device in the dma-buf feedback, as a phone
  * that exposes no /dev/dri node to apps does, to reproduce its OpenGL path here. Set from the app
  * before the compositor starts. */
@@ -2149,11 +2153,14 @@ static void render_scene(void) {
      * Download/droiddeck-env can turn off for an A/B. */
     static int display_off = -1;
     if (display_off < 0) {
-        display_off = access("/data/user/0/com.droiddeck.launcher/files/swapchain_copy", F_OK) == 0;
-        droiddeck_log("layer", "display-layer path %s (files/swapchain_copy %s)",
+        /* The compositor runs in the APP process, so a shell or guest variable cannot reach it -
+         * the switch is set from Kotlin through nativeSetSwapchainCopy, like every other compositor
+         * switch here (g_ubwc, g_zero_copy, HDR). */
+        display_off = g_swapchain_copy;
+        droiddeck_log("layer", "display-layer path %s (%s)",
                       display_off ? "OFF: the scene goes through the screen swapchain"
                                   : "ON: the scene goes on the game's display layer, no swapchain",
-                      display_off ? "present" : "absent");
+                      display_off ? "forced off by the app" : "default");
         if (!display_off && !sc_layer_available())
             droiddeck_log("layer", "display-layer path not usable: this device has no SurfaceControl API "
                        "(Android 10+, libnativewindow AHardwareBuffer_getNativeHandle)");
@@ -2164,7 +2171,7 @@ static void render_scene(void) {
     const int display_route = !display_off && !framegen && !fx_on && sc_layer_available();
     int on_display = 0;
     if (display_route) {
-        VkImage dimg = VK_NULL_HANDLE;
+        void *dimg = NULL;
         int drw = 0, drh = 0;
         sc_layer_hide_overlay();
         int pr = -1;

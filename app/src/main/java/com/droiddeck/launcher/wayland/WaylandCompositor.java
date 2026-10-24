@@ -273,6 +273,10 @@ public final class WaylandCompositor {
      *  Set before the compositor starts. */
     public static native void nativeSetUbwc(boolean on);
 
+    /** Force the old swapchain copy path instead of the display-layer path (an A/B for the
+     *  display path). Set before the session starts; read once, on the first scene. */
+    public static native void nativeSetSwapchainCopy(boolean on);
+
     /** Debug: advertise no DRM device (main device 0:0) in the dma-buf feedback, as a phone that
      *  exposes no /dev/dri node to apps does. DROIDDECK_WAYLAND_NO_RENDER_NODE=1 in the container's or
      *  shortcut's environment variables. Set before the compositor starts. */

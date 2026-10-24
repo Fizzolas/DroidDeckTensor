@@ -2131,6 +2131,10 @@ static void ensure_extent_from_window(void) {
  * window; destroyed with the window. Returns 1 when known. */
 int vkp_surface_caps(VkExtent2D *extent, int *transform) {
     if (!g_window || dev_init() != 0) return 0;
+    /* Refuse while a swapchain owns the surface: the caller must not be able to create/destroy a
+     * surface underneath a live swapchain. vkp_update_map only reaches this with no swapchain, and
+     * this check keeps a future caller honest. */
+    if (g_swapchain) return 0;
     if (!g_surface) {
         VkAndroidSurfaceCreateInfoKHR aci = {
             .sType = VK_STRUCTURE_TYPE_ANDROID_SURFACE_CREATE_INFO_KHR, .window = g_window};

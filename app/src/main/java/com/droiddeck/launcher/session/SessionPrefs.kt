@@ -33,6 +33,13 @@ object SessionPrefs {
 
     private fun prefs(context: Context) = context.getSharedPreferences("session", Context.MODE_PRIVATE)
 
+    /**
+     * Force the old swapchain copy path instead of the display-layer path, for an A/B of the
+     * compositor's presentation. Off by default: the display layer is the normal path.
+     */
+    fun swapchainCopy(context: Context): Boolean =
+        prefs(context).getBoolean("swapchainCopy", false)
+
     /** Whether the launcher hides Android's status and navigation bars. */
     fun launcherFullscreen(context: Context): Boolean = prefs(context).getBoolean("launcherFullscreen", true)
 

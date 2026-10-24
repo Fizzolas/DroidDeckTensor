@@ -1,18 +1,20 @@
 /* pvr_linear_layout_test.c - is a VK_IMAGE_TILING_LINEAR export really linear, and complete?
  *
- * The compositor declares modifier 0 (DRM_FORMAT_MOD_LINEAR) to every client and reads the swapped
- * buffer as rows of `pitch` bytes. Measured on the Pixel 10 (2026-10-23, vkcube): 492 of 1080 rows
- * of the pushed dma-buf are ENTIRELY zero, stay zero after settling, and the zero runs repeat with
- * a period of exactly 64 rows. At the HAL's reported rowPitch of 16384, 64 rows is exactly 1 MiB,
- * and the allocation is exactly 32 MiB.
+ * STATUS: the reading this was written to explain is WITHDRAWN (state doc 68). The "492 of 1080
+ * rows entirely zero, 64-row period" numbers came from vkp_pitch_dump, which routed a full frame
+ * through the 256x256 CURSOR readback helper; screencap later showed the client's frame was complete
+ * all along (24 black rows of 1080, at the frame edges). Do not treat that claim as established.
  *
- * The HAL's dma-buf is not CPU-mappable (mmap is refused even to the app uid), so this probe reads
- * the image back THROUGH THE GPU into a host-visible linear image and inspects that. That is the
- * same pixel data the compositor samples, which is the question that matters.
+ * What it still does, and why it is kept: it creates a LINEAR **exportable** image exactly like the
+ * ICD's swapchain image, fills it, copies it on the GPU into a host-visible LINEAR image and counts
+ * all-zero rows. That answers "can a LINEAR exportable image be written and read back completely?"
+ * from inside the same ICD the app uses - still an open question, and there is no cheaper check
+ * because the HAL's dma-buf cannot be mmap'd (refused even to the app uid).
  *
- * If a fully cleared image comes back with zero holes, the export layout is self-consistent and the
- * holes seen in a real frame are the producer's; if the cleared image also has holes, the layout
- * contract is broken at export.
+ * Two runs of the same build, differing only in HOW the image is filled, gave different answers
+ * (0 zero rows via vkCmdClearColorImage, 128 via a render-pass clear). That difference is real
+ * whatever its cause; the mechanism is unknown and state doc 66/67's conclusions about it were
+ * retracted. Re-run it rather than quoting either number.
  *
  * Build (WSL):
  *   zig cc -target aarch64-linux-gnu.2.38 -O1 -o pvr_linear_layout_test pvr_linear_layout_test.c \

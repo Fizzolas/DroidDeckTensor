@@ -994,6 +994,10 @@ class SessionActivity : ComponentActivity(), SurfaceHolder.Callback {
         // what puts an HDR frame on a display layer tagged BT2020_PQ, so it is turned on with it.
         if (!CompositorHost.isStarted) {
             val mode = SessionPrefs.prefMode(intent.getStringExtra(SessionService.EXTRA_MODE) ?: SessionService.MODE_STEAM)
+            // Compose the scene on a display layer instead of the compositor's own swapchain
+            // (the default). This switch forces the old path back for an A/B; set before the
+            // compositor starts, like the other compositor switches below.
+            WaylandCompositor.nativeSetSwapchainCopy(SessionPrefs.swapchainCopy(this))
             val probe = HdrSupport.probe(this)
             WaylandCompositor.nativeSetHdrDisplay(
                 probe.displayId, probe.name, probe.formats, probe.hdr10,

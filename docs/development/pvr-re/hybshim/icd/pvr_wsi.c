@@ -473,10 +473,12 @@ static VkResult wsi_create_swapchain(VkDevice device, const VkSwapchainCreateInf
         VkSubresourceLayout layout; memset(&layout, 0, sizeof(layout));
         if (sc->GetImageSubresourceLayout) sc->GetImageSubresourceLayout(device, sc->images[i].image, &sl, &layout);
         sc->stride = (uint32_t)(layout.rowPitch > 0 ? layout.rowPitch : (uint32_t)(sc->width * 4));
-        /* Is the allocation big enough for the rows we are about to describe? A dma-buf whose
-         * memory is smaller than pitch*height leaves the tail unpopulated (reads as zeros), which
-         * shows up on screen as scanlines of garbage that never settle. Measured on the Pixel 10:
-         * 2404x1080 at pitch 16384 needs 17694720 bytes. */
+        /* Is the allocation big enough for the rows we are about to describe? If it is not, the
+         * tail of every described row lies outside the memory the buffer can reach, and a reader
+         * gets zeros there. Logged once per image so a session states the geometry it is relying
+         * on. Measured on the Pixel 10: 2404x1080 at pitch 16384 needs 17694720 bytes and the HAL
+         * allocates 33554432 - ample, so this is not the current fault; it is a guard against a
+         * future size/format combination where it would be. */
         {
             VkMemoryRequirements mr2; memset(&mr2, 0, sizeof(mr2));
             sc->GetImageMemoryRequirements(device, sc->images[i].image, &mr2);

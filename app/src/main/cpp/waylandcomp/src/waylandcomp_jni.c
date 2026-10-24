@@ -363,6 +363,16 @@ Java_com_droiddeck_launcher_wayland_WaylandCompositor_nativeSetUbwc(JNIEnv *env,
     __android_log_print(ANDROID_LOG_INFO, TAG, "compressed (UBWC) game buffers %s", on ? "on" : "off");
 }
 
+extern volatile int g_swapchain_copy;
+/* Force the old swapchain copy path instead of the display-layer path, for an A/B. Set before the
+ * session starts, like the switches above: read once, on the first scene. */
+JNIEXPORT void JNICALL
+Java_com_droiddeck_launcher_wayland_WaylandCompositor_nativeSetSwapchainCopy(JNIEnv *env, jclass clazz, jboolean on) {
+    g_swapchain_copy = on ? 1 : 0;
+    __android_log_print(ANDROID_LOG_INFO, TAG, "display-layer path %s",
+                        on ? "OFF (swapchain copy forced)" : "on");
+}
+
 /* Debug: name no DRM device in the dma-buf feedback (DROIDDECK_WAYLAND_NO_RENDER_NODE=1), the way a
  * phone that exposes no /dev/dri node to apps does. Set before the compositor starts. */
 JNIEXPORT void JNICALL
