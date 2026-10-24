@@ -3688,3 +3688,45 @@ Note for the pre-existing test suite: 35 failures and 32 errors remain on a Wind
 `test_appimage_run`, `test_game_environment`, `test_steam_*` and friends - they are the guest shell
 scripts being invoked with Windows paths (`/bin/bash: C:Users...`), present before this work and
 unrelated to it. CI runs them on `ubuntu-24.04`.
+
+## 78. The §70 boundary, measured with two calibrated instruments (2026-10-24)
+
+§70 established that `screencap` was coherent while the panel was not, and left one question open:
+*is the panel showing what the compositor composed?* With both producers of the harness in place,
+that is now a measurement rather than an argument.
+
+**Method.** vkcube running with `BL_FRAME_DIGEST=2` (71 complete compositor grids emitted), and one
+`diag frame --panel` capture during the same run. The two records carry the same 16x16 luminance
+grid, so `frames.correlate` aligns them over the four quarter turns and reports Pearson r. It also
+requires **both pictures to have structure** - two uniform frames correlate at 1.0 and prove
+nothing, which is exactly how a blank capture can masquerade as a match.
+
+```
+frames compared        71 (every compositor frame in the run)
+r                      0.978 - 0.989   (median 0.984)
+quarter turns          3  (the panel is the scene rotated 270 degrees, as §75-76 established)
+discriminating         true for all 71  (variances 511 / 486, not flat)
+verdict                "same picture" for all 71
+```
+
+**Reading.** What the compositor composed is what the panel is showing, to within the 16x16
+sampling of both. For vkcube's path the handoff to the display is therefore **not** where the
+horizontal-scanline static comes from - consistent with §70's conclusion that the fault is
+downstream of the client's pixels, but now on the *compositor-to-panel* leg rather than just the
+SurfaceFlinger leg.
+
+**What this does not say.** vkcube is a pure Vulkan client on the display-layer path. The reported
+static has only ever been seen in the Steam/CEF path. The same one-command measurement applies there
+and is the next thing to run: a Steam session with `BL_FRAME_DIGEST=2`, a panel capture, and
+`diag compare --frame --panel <digest>`. If that correlation drops - or comes back
+`not discriminating` because a side is flat - the digest says which side and at which extent.
+
+**Two defects this measurement found**, both in the instrument rather than the pipeline:
+
+1. The grid record was emitted as one 1024-character line, but `droiddeck_log`'s message buffer is
+   512 bytes: it arrived truncated to 506 characters and could not be decoded. Emitted as eight
+   `gridN=<64 hex>` halves now.
+2. A run whose compositor had been started *before* the digest was armed reported "frame digest
+   off" for the whole session, because `CompositorHost` keeps one compositor alive for the app's
+   process and the level is read once at its start. Arming the switch therefore needs an
+   `am force-stop` (or a fresh app process), not just a new session.

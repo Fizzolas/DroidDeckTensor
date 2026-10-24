@@ -5,6 +5,7 @@ import argparse
 import importlib
 import importlib.util
 import json
+import re
 import sys
 from pathlib import Path
 
@@ -67,6 +68,10 @@ def build_parser():
     c = sub.add_parser('compare', help='diff two runs, refusing arms that vary more than one thing')
     c.add_argument('a')
     c.add_argument('b')
+    c.add_argument('--frame', action='store_true',
+                   help='also correlate the compositor digest in A with a panel digest (or a file)')
+    c.add_argument('--panel', metavar='DIGEST',
+                   help='a JSON digest (e.g. from `diag frame --panel`) to compare against A')
 
     f = sub.add_parser('frame', help='digest a frame file (raw RGBA) or the live panel')
     f.add_argument('--raw', help='path to a raw RGBA frame')
@@ -149,7 +154,31 @@ def _dispatch(args):
     if args.command == 'compare':
         compare = _module('compare')
         reasons = compare.refusal(Path(args.a), Path(args.b))
-        print(json.dumps({'ok': not reasons, 'refusals': reasons}, sort_keys=True))
+        out = {'ok': not reasons, 'refusals': reasons}
+        if args.frame or args.panel:
+            # The §70 question, as a measurement: is the panel showing what the compositor composed?
+            frames = _module('frames')
+            scene = None
+            for log in sorted(Path(args.a).rglob('*')):
+                if not log.is_file() or log.suffix.lower() not in {'.log', '.txt'}:
+                    continue
+                text = log.read_text(errors='replace').splitlines()
+                grid = frames.parse_grid_lines(text)
+                if grid is None:
+                    continue
+                m = next((re.search(r'(\d+)x(\d+)', l) for l in text if re.search(r'\[fd\].*\d+x\d+', l)), None)
+                scene = {'w': int(m.group(1)), 'h': int(m.group(2))} if m else {'w': None, 'h': None}
+                scene['grid'] = grid
+                break
+            panel = json.loads(Path(args.panel).read_text()) if args.panel else None
+            if panel is None:
+                out['frame'] = {'ok': False, 'reason': 'no --panel digest supplied'}
+            elif scene is None:
+                out['frame'] = {'ok': False,
+                                'reason': 'no compositor grid in run A (needs BL_FRAME_DIGEST=2)'}
+            else:
+                out['frame'] = frames.correlate(scene, panel)
+        print(json.dumps(out, sort_keys=True))
         return 0 if not reasons else 4
 
     if args.command == 'export':

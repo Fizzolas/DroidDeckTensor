@@ -2629,6 +2629,30 @@ int vkp_frame_digest(struct vkp_image *src, int level) {
         droiddeck_log("fd", "t=%ld.%03ld %dx%d pitch=%llu zero_rows=%d hash=%s",
                       (long)ts.tv_sec, ts.tv_nsec / 1000000L, d.w, d.h,
                       (unsigned long long)g_fd->row_pitch, d.zero_rows, d.hash_hex);
+        if (level >= 2) {
+            /* The 16x16 luminance grid, two hex digits a cell: this is the record the host
+             * correlates a panel digest against, so without it the two producers cannot be
+             * compared - only hashed, which says nothing about the same picture being on screen.
+             *
+             * Emitted as eight half-grids rather than one line because droiddeck_log's message
+             * buffer is 512 bytes and the full record is 1024 hex digits; a single line was
+             * silently truncated to 506 and could not be decoded. */
+            for (int half = 0; half < 8; half++) {
+                char chunk[2 * FD_GRID * 2 + 1];
+                char text[16];
+                int n = 0;
+                for (int r = half * 2; r < half * 2 + 2; r++)
+                    for (int c = 0; c < FD_GRID; c++) {
+                        static const char *hx = "0123456789abcdef";
+                        int v = d.grid[r][c] & 0xff;
+                        chunk[n++] = hx[(v >> 4) & 0xf];
+                        chunk[n++] = hx[v & 0xf];
+                    }
+                chunk[n] = 0;
+                snprintf(text, sizeof text, "grid%d=", half);
+                droiddeck_log("fd", "%s%s", text, chunk);
+            }
+        }
         if (level >= 2 &&
             fd_ascii((const unsigned char *)g_fd->map + g_fd->offset, src->w, src->h,
                      (int)g_fd->row_pitch, 48, 20, map, (int)sizeof map) > 0) {
