@@ -78,3 +78,30 @@ report alone could not answer.
   reverts it silently (a 49976-byte file becomes 49279 again).
 * **The APK's asset merge is cached.** Deleting the apk and re-running is not enough; the change has
   to originate in `overlay/` (and can need `--rerun-tasks`) before it reaches the apk.
+
+## The frame digest (a different instrument, same idea)
+
+The three layers above answer "what happened in this process". None of them answers "what does the
+frame look like", which is the question §65-68 got wrong three times through a 256x256 helper.
+
+`vkp_frame_digest` (in `app/src/main/cpp/waylandcomp/src/frame_digest.c` and `vk_present.c`) reads
+each composed frame back **at its true extent, in its own format, at the row pitch the driver
+reports**, and emits one text record: 32 band means, the runs of wholly-empty rows, a run-length
+profile, a 16x16 luminance grid, and a hash - optionally a 48x20 ASCII map. The host's
+`python3 tools/diag frame --panel` decodes a `screencap` into the same record. The two are held to
+byte-identical integer output by `tools/tests/test_diag_frames_parity.py`.
+
+**Turning it on.** The compositor runs in the *app's* process, so a variable exported to the guest
+never reaches it. Put the line in `Download/droiddeck-env`, which `SessionActivity` reads before the
+compositor starts and marshals across with `nativeSetFrameDigest`:
+
+```
+BL_FRAME_DIGEST=2      # 0 off (default), 1 numeric, 2 numeric + ASCII map
+```
+
+Lines appear in the session log and logcat as `[fd] t=... WxH pitch=... zero_rows=... hash=...`.
+Cadence is adaptive: every frame for the first 120, then every 30th, plus any frame whose digest
+changed or after 5 s of no sample.
+
+**Measured on the Pixel 10** (vkcube, 2026-10-24): 124 records over 76 distinct frames at
+1650x732, pitch 6600, `zero_rows=0` in every one.

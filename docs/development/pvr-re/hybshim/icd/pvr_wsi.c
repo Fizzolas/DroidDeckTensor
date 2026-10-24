@@ -81,6 +81,91 @@ static struct wsi_device_entries *wsi_entries(VkDevice dev) {
     return NULL;
 }
 
+/* Fill a freshly created swapchain image through the TRANSFER path, once, before any app work.
+ *
+ * Why: measured on the Pixel 10 (2026-10-23, probes/pvr_linear_layout_test.c) - an image created
+ * LINEAR and exportable, cleared with vkCmdClearColorImage, comes back complete (0 zero rows of
+ * 1080); the SAME image cleared by a render pass (loadOp = CLEAR), which is what a game does, comes
+ * back with 128 all-zero rows at the top. Real frames showed whole-row zero runs at a 64-row period
+ * - 128 = 2 x 64, the same granularity. So the HAL's render-pass clear does not reach the whole
+ * image, while its transfer path does.
+ *
+ * Touching the image here with a transfer clear means the app's first render pass is not the first
+ * writer, and every row of the exported dma-buf has been written at least once by a path that is
+ * known to cover the image. Best-effort: if any entrypoint is missing the image is simply left
+ * as it was, which is the behaviour that existed before this.
+ */
+static void wsi_clear_image_once(VkDevice device, VkQueue queue, VkImage img, VkFormat fmt,
+                                 uint32_t w, uint32_t h) {
+    PFN_vkCreateCommandPool CreateCommandPool = (PFN_vkCreateCommandPool)dev_proc(device, "vkCreateCommandPool");
+    PFN_vkAllocateCommandBuffers AllocCB = (PFN_vkAllocateCommandBuffers)dev_proc(device, "vkAllocateCommandBuffers");
+    PFN_vkBeginCommandBuffer Begin = (PFN_vkBeginCommandBuffer)dev_proc(device, "vkBeginCommandBuffer");
+    PFN_vkEndCommandBuffer End = (PFN_vkEndCommandBuffer)dev_proc(device, "vkEndCommandBuffer");
+    PFN_vkCmdPipelineBarrier Barrier = (PFN_vkCmdPipelineBarrier)dev_proc(device, "vkCmdPipelineBarrier");
+    PFN_vkCmdClearColorImage Clear = (PFN_vkCmdClearColorImage)dev_proc(device, "vkCmdClearColorImage");
+    PFN_vkFreeCommandBuffers FreeCB = (PFN_vkFreeCommandBuffers)dev_proc(device, "vkFreeCommandBuffers");
+    PFN_vkDestroyCommandPool DestroyPool = (PFN_vkDestroyCommandPool)dev_proc(device, "vkDestroyCommandPool");
+    PFN_vkQueueWaitIdle WaitIdle = (PFN_vkQueueWaitIdle)dev_proc(device, "vkQueueWaitIdle");
+    PFN_vkQueueSubmit Submit = (PFN_vkQueueSubmit)dev_proc(device, "vkQueueSubmit");
+    struct wsi_device_entries *e = wsi_entries(device);
+    WSI_LOG("clear: enter dev=%p pool=%d cb=%d begin=%d end=%d bar=%d clear=%d submit=%d entries=%d qf=%u",
+            (void *)device, !!CreateCommandPool, !!AllocCB, !!Begin, !!End, !!Barrier, !!Clear, !!Submit,
+            !!e, e ? e->queue_family : 0u);
+    /* queue family 0 is a VALID family on this device (there is exactly one), so its value
+     * cannot be used to mean "missing" - only the entry itself can. */
+    if (!CreateCommandPool || !AllocCB || !Begin || !End || !Barrier || !Clear || !Submit || !e)
+        return;
+
+    VkCommandPoolCreateInfo pci = { VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO };
+    pci.queueFamilyIndex = e->queue_family;
+    pci.flags = VK_COMMAND_POOL_CREATE_TRANSIENT_BIT;
+    VkCommandPool pool = VK_NULL_HANDLE;
+    if (CreateCommandPool(device, &pci, NULL, &pool) != VK_SUCCESS) return;
+
+    VkCommandBufferAllocateInfo cbai = { VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO };
+    cbai.commandPool = pool; cbai.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY; cbai.commandBufferCount = 1;
+    VkCommandBuffer cb = VK_NULL_HANDLE;
+    if (AllocCB(device, &cbai, &cb) != VK_SUCCESS) { if (DestroyPool) DestroyPool(device, pool, NULL); return; }
+
+    VkCommandBufferBeginInfo bi = { VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO };
+    bi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+    int ok = Begin(cb, &bi) == VK_SUCCESS;
+    if (ok) {
+        VkImageSubresourceRange rr = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1 };
+        VkImageMemoryBarrier to_dst = { VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER };
+        to_dst.oldLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+        to_dst.newLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+        to_dst.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        to_dst.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        to_dst.image = img; to_dst.subresourceRange = rr;
+        to_dst.dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+        Barrier(cb, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT,
+                0, 0, NULL, 0, NULL, 1, &to_dst);
+        VkClearColorValue black; memset(&black, 0, sizeof(black));
+        Clear(cb, img, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, &black, 1, &rr);
+        /* Hand it back as GENERAL: that is the layout the present path transitions from, so the
+         * app's own first use is not surprised by TRANSFER_DST. */
+        VkImageMemoryBarrier to_gen = to_dst;
+        to_gen.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+        to_gen.newLayout = VK_IMAGE_LAYOUT_GENERAL;
+        to_gen.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+        to_gen.dstAccessMask = 0;
+        Barrier(cb, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT,
+                0, 0, NULL, 0, NULL, 1, &to_gen);
+        ok = End(cb) == VK_SUCCESS;
+    }
+    if (ok) {
+        VkSubmitInfo si = { VK_STRUCTURE_TYPE_SUBMIT_INFO };
+        si.commandBufferCount = 1; si.pCommandBuffers = &cb;
+        ok = Submit(queue, 1, &si, VK_NULL_HANDLE) == VK_SUCCESS;
+        if (ok && WaitIdle) WaitIdle(queue);
+    }
+    if (FreeCB) FreeCB(device, pool, 1, &cb);
+    if (DestroyPool) DestroyPool(device, pool, NULL);
+    WSI_LOG("create_swapchain: transfer-cleared %ux%u image once (%s)", w, h, ok ? "ok" : "failed");
+}
+
+
 /* The HAL's vkQueueSubmit: signal [sem] and/or complete [fence] on [queue] with an empty submit. */
 static int wsi_signal_on_queue(VkDevice dev, VkQueue queue, VkFence fence, VkSemaphore sem) {
     if (!fence && !sem) return 1;
@@ -442,7 +527,10 @@ static VkResult wsi_create_swapchain(VkDevice device, const VkSwapchainCreateInf
     VkExternalMemoryImageCreateInfo emi = { VK_STRUCTURE_TYPE_EXTERNAL_MEMORY_IMAGE_CREATE_INFO };
     emi.handleTypes = VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT;
     VkImageCreateInfo ici = { VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO };
-    ici.pNext = &emi; ici.imageType = VK_IMAGE_TYPE_2D; ici.format = ci->imageFormat;
+    ici.pNext = &emi; ici.imageType = VK_IMAGE_TYPE_2D;
+    /* TRANSFER_DST is needed for the creation-time clear below, and it must be in the create info
+     * rather than added afterwards: usage is fixed when the image is created. */
+    ici.format = ci->imageFormat;
     ici.extent = (VkExtent3D){ (uint32_t)sc->width, (uint32_t)sc->height, 1 };
     ici.mipLevels = 1; ici.arrayLayers = 1; ici.samples = VK_SAMPLE_COUNT_1_BIT;
     ici.tiling = VK_IMAGE_TILING_LINEAR; ici.usage = ci->imageUsage | VK_IMAGE_USAGE_TRANSFER_DST_BIT;
@@ -492,6 +580,10 @@ static VkResult wsi_create_swapchain(VkDevice device, const VkSwapchainCreateInf
         gfi.memory = sc->images[i].mem; gfi.handleType = VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT;
         sc->images[i].fd = -1;
         if (sc->GetMemoryFdKHR) sc->GetMemoryFdKHR(device, &gfi, &sc->images[i].fd);
+        /* Write every row once, through the transfer path that is measured to cover the whole image
+         * (see wsi_clear_image_once). The app's first render pass must not be the first writer. */
+        wsi_clear_image_once(device, sc->queue, sc->images[i].image, ci->imageFormat,
+                             (uint32_t)sc->width, (uint32_t)sc->height);
         made = i + 1;
     }
     WSI_LOG("swapchain: %u images %dx%d stride %u fmt %d (fd0=%d)", sc->count, sc->width, sc->height,

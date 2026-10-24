@@ -3654,13 +3654,35 @@ frame --raw|--panel        one digest record
 export <run> [dest]        a text-only bundle
 ```
 
-**Status: built, all tests green.** 51 harness tests pass, including the Python/C parity suite. The
-compositor's digest compiles into the ARM64 library (`vkp_frame_digest` and `fd_should_sample` are
-exported symbols in the built `.so`) and `versionCode` 41 carries `snapshot`/`mark` in
-`classes6.dex`. **Not yet run on the device:** the digest has not been seen producing a record from
-a real PowerVR frame, and the snapshot methods have not been called against a live session. The
-first device run should confirm `doctor` on a clean device, one `run --calibrate frame-digest
---snapshot`, and that `BL_FRAME_DIGEST=2` yields `fd` lines with a recognisable ASCII map.
+**Status: seen on the device (2026-10-24, Pixel 10 Pro XL, versionCode 41).** 117 harness tests
+pass, including the Python/C parity suite.
+
+- **`diag doctor`** found the device *dirty* on first contact - a `droiddeck-env` left from an
+  earlier session, the §63 failure caught before any measurement. It refused the run.
+- **`diag run --calibrate frame-digest --calibrate snapshot --snapshot`** completed clean: both
+  calibrations passed, the manifest is `trust: clean`, and the snapshot holds 169 KB of
+  `dumpsys SurfaceFlinger`, 130 KB of `dumpsys display`, plus the app's own process table.
+- **The frame digest produced real records.** vkcube: 124 records over 76 distinct frames at the
+  true **1650x732**, pitch **6600**, `zero_rows=0` in every single one.
+- **The panel producer works**: `diag frame --panel` decoded a `screencap` to 1080x2404, zero empty
+  rows, and the bytes were discarded.
+
+**Two defects the device found that the tests could not**, both fixed:
+
+1. An app process holds no `android.permission.DUMP`, so every `dumpsys` the app ran wrote
+   "Permission Denial" into a file that looked like evidence (27-133 bytes, not the 169 KB the
+   host gets). The app now gathers only what it may read; the host gathers the dumps.
+2. `adb pull` is refused the app's own files (mode 600, its uid), so a snapshot in app-private
+   storage could not be retrieved. It now comes across as a `run-as tar`.
+
+A third defect was in the analysis, found only against real output: `analyze` did not recognise
+the line format the compositor actually writes (`[fd] t=... WxH ...`), and reported a run full of
+evidence as having none. It now matches the record by its shape.
+
+**Also measured, and it closes the §65-68 question for this path:** with the display-layer path
+live, the composed frame has no wholly-empty rows at all. Every earlier "492 of 1080 rows" finding
+came from the cursor helper; with an instrument that sizes itself from the real extent, the number
+is zero.
 
 Note for the pre-existing test suite: 35 failures and 32 errors remain on a Windows host in
 `test_appimage_run`, `test_game_environment`, `test_steam_*` and friends - they are the guest shell
