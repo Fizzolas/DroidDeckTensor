@@ -174,6 +174,11 @@ int vkp_image_readback(struct vkp_image *src, uint32_t *out, int max_px);
  * adaptive (dense at first, sparse after, plus any frame whose digest changed). 0 = ok. */
 int vkp_frame_digest(struct vkp_image *src, int level);
 int fd_should_sample(long frame, int changed, long mono_ms);
+/* The same record for a layer pool buffer, after the scene was blitted into it. This is what says
+ * whether the copy filled the buffer the display will read - the scene digest cannot see that. */
+int vkp_digest_pool_buffer(struct vkp_image *dst, int src_w, int src_h, int level);
+/* The frame-digest gate; 0 when off. Defined in vk_present.c. */
+int vkp_fd_level(void);
 /* Refresh the scene -> output mapping for this scene size without presenting (creates the
  * swapchain if needed, since the mapping is in output pixels). 0 = mapping valid. */
 int vkp_update_map(int scene_w, int scene_h);

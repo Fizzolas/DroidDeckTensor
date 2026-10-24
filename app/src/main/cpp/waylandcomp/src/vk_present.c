@@ -2485,6 +2485,8 @@ static long g_fd_frame, g_fd_last_mono, g_fd_last_hash;
  * environment variable is still honoured as a fallback for a host-side or guest-side test. */
 volatile int g_fd_level_setting;
 
+int vkp_fd_level(void) { return fd_level(); }
+
 static int fd_level(void) {
     static int level = -1;
     if (g_fd_level_setting > 0) return g_fd_level_setting;
@@ -2669,6 +2671,99 @@ int vkp_frame_digest(struct vkp_image *src, int level) {
     g_fd_frame++;
     return 0;
 }
+
+/* Digest a layer POOL BUFFER after the blit that fills it.
+ *
+ * This is the measurement the scene digest cannot make. The chain is
+ *     client frame -> scene image -> (CmdBlitImage) -> gralloc pool buffer -> SurfaceControl layer
+ * and the scene digest only sees the middle of it. SurfaceFlinger's GPU then reads the pool buffer
+ * back at the stride gralloc reported. If the copy wrote fewer rows than the buffer holds, or at a
+ * different pitch, every scanline past that point is whatever the buffer held before - lines of
+ * unrelated colour, which is the reported symptom.
+ *
+ * `dst` is one of the blit's destinations. `src_w/src_h` are the scene's own dimensions, so the
+ * record says at once whether the whole scene landed. Same schema as every other digest, so a
+ * pool-buffer record and a panel record are directly comparable with frames.correlate. */
+int vkp_digest_pool_buffer(struct vkp_image *dst, int src_w, int src_h, int level) {
+    struct timespec ts;
+    long mono;
+
+    if (level <= 0 || !dst || !dst->image || !dst->blit_dst || dst->w <= 0 || dst->h <= 0) return 0;
+    if (g_dev_state == -2 || dev_init() != 0) return -1;
+
+    /* Reuse the scene-digest staging machinery, sized for the DESTINATION. */
+    if (fd_ensure_staging(dst) != 0) return -1;
+
+    VkImageSubresourceRange range = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+    VkCommandBuffer cmd = g_cmds[0];
+    VkCommandBufferBeginInfo bi = {.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO,
+                                   .flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT};
+    struct fd_digest d;
+
+    g_vk.ResetCommandBuffer(cmd, 0);
+    if (g_vk.BeginCommandBuffer(cmd, &bi) != VK_SUCCESS) return -1;
+    VkImageMemoryBarrier pre[2] = {
+        {.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
+         .oldLayout = VK_IMAGE_LAYOUT_GENERAL, .newLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+         .srcQueueFamilyIndex = g_qfam, .dstQueueFamilyIndex = g_qfam,
+         .image = dst->image, .subresourceRange = range,
+         .srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT, .dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT},
+        {.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
+         .oldLayout = VK_IMAGE_LAYOUT_UNDEFINED, .newLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+         .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED, .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+         .image = g_fd->image, .subresourceRange = range, .dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT}};
+    g_vk.CmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT,
+                            0, 0, NULL, 0, NULL, 2, pre);
+    VkImageBlit blit = {.srcSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1},
+                        .srcOffsets = {{0, 0, 0}, {dst->w, dst->h, 1}},
+                        .dstSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1},
+                        .dstOffsets = {{0, 0, 0}, {dst->w, dst->h, 1}}};
+    g_vk.CmdBlitImage(cmd, dst->image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+                      g_fd->image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &blit, VK_FILTER_NEAREST);
+    VkImageMemoryBarrier post = {
+        .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
+        .oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, .newLayout = VK_IMAGE_LAYOUT_GENERAL,
+        .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED, .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+        .image = g_fd->image, .subresourceRange = range,
+        .srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT, .dstAccessMask = VK_ACCESS_HOST_READ_BIT};
+    g_vk.CmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_HOST_BIT,
+                            0, 0, NULL, 0, NULL, 1, &post);
+    if (g_vk.EndCommandBuffer(cmd) != VK_SUCCESS) return -1;
+    VkSubmitInfo si = {.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO, .commandBufferCount = 1,
+                       .pCommandBuffers = &cmd};
+    g_vk.ResetFences(g_dev, 1, &g_fence);
+    if (g_vk.QueueSubmit(g_queue, 1, &si, g_fence) != VK_SUCCESS) return -1;
+    if (timed_wait(g_fence, 1000000000ULL) != VK_SUCCESS) return -1;
+
+    if (fd_digest_rgba((const unsigned char *)g_fd->map + g_fd->offset,
+                       dst->w, dst->h, (int)g_fd->row_pitch, &d) != 0) return -1;
+
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    mono = ts.tv_sec * 1000L + ts.tv_nsec / 1000000L;
+    if (!fd_should_sample(g_fd_frame, 1, mono)) return 0;
+    droiddeck_log("fd", "pool t=%ld.%03ld %dx%d pitch=%llu zero_rows=%d scene=%dx%d hash=%s",
+                  (long)ts.tv_sec, ts.tv_nsec / 1000000L, d.w, d.h,
+                  (unsigned long long)g_fd->row_pitch, d.zero_rows, src_w, src_h, d.hash_hex);
+    if (level >= 2) {
+        for (int half = 0; half < 8; half++) {
+            char chunk[2 * FD_GRID * 2 + 1];
+            char text[16];
+            int n = 0;
+            for (int r = half * 2; r < half * 2 + 2; r++)
+                for (int c = 0; c < FD_GRID; c++) {
+                    static const char *hx = "0123456789abcdef";
+                    int v = d.grid[r][c] & 0xff;
+                    chunk[n++] = hx[(v >> 4) & 0xf];
+                    chunk[n++] = hx[v & 0xf];
+                }
+            chunk[n] = 0;
+            snprintf(text, sizeof text, "pgrid%d=", half);
+            droiddeck_log("fd", "%s%s", text, chunk);
+        }
+    }
+    return 0;
+}
+
 
 /* ---------------------------------------------------------------- the compositor pass, off-screen
  *
