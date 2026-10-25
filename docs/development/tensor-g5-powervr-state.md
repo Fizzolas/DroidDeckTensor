@@ -3992,3 +3992,51 @@ cause (GBM, shim, AHB, focus, geometry - §45-§55, §62, §63). This is the fir
 only one variable moved and the outcome was unambiguous. The next step has a target: make the HAL's
 failing open path visible - `HYBRIS_LINKER_DIR` plus a `strace`-equivalent on the GPU process, or the
 `__open_2`/`__errno` site the two independent crashes agree on.
+
+## 83. The crash needs the client to get past login; openwatch captures the guest (2026-10-24)
+
+Following §82's isolation, two new instruments were built and one negative result recorded.
+
+**`openwatch`** (`docs/development/pvr-re/rig/openwatch.c`) interposes `open`/`open64`/`openat` and
+records every attempt with its result and errno, changing no return value. Built into the rig and
+gated into the session script's preload loop beside `crashcatch`/`mmwatch`/`symwatch`.
+
+Captured **6,870 open records** in one session. The failed ones are, in order of frequency:
+
+```
+74  /root/.Xdefaults-DroidDeck            ENOENT
+74  /root/.Xdefaults                      ENOENT
+45  /sys/class/drm/card0/device/boot_vga  ENOENT
+35  /etc/drirc                            ENOENT
+13  /system/lib64/libsrv_um.so             ENOENT   <- HAL's own dependency
+13  /system/lib64/libusc.so                ENOENT   <- HAL's compiler
+13  /system/lib64/libcustomer_gralloc_ddk_api.so ENOENT
+12  /system/etc/ld.config.txt              ENOENT
+```
+
+Two things to be careful about, both of which would mislead if taken at face value:
+
+* The `/system/lib64/libsrv_um.so` probes are **normal**. A glibc process resolving a bionic
+  dependency walks the bionic search path first; libhybris then supplies the library from the
+  vendor directory. An ENOENT there is the resolver doing its job, not a missing library. §31-33
+  spent a long time on a related confusion and the rig README's note 5 applies.
+* `/sys/class/drm/card0/device/boot_vga` failing 45 times is worth noting only because §63's crash
+  reports fault in `__open_2`. This device has no `card0`; a HAL probing it and mishandling the
+  failure is consistent with that trace, but **nothing here proves it is the faulting open**.
+
+**The negative result, stated plainly.** That session produced **zero** `GPU process exited
+unexpectedly` lines:
+
+```
+cef_log.txt: 116 lines, 0 crashes, ending at "Pref observer ... found at shutdown"
+```
+
+So the GPU-process crash is **not** universal in every session. It needs the client to get far
+enough to start compositing; when Steam ends at the login screen instead (§80), the GPU process
+never reaches the state that faults. Every earlier crash observation (§63, §81, §82 arm A) came from
+sessions where the client stayed up longer.
+
+**Consequence for the next attempt.** A capture run must first confirm the client got past login,
+or it will record an ordinary shutdown and look like evidence. The GPU-process crash is reproducible
+(§82 arm A, every session that reached it) but its precondition is not yet pinned - which is itself
+the thing to establish next, before trying to catch the fault again.
