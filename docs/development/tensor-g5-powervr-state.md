@@ -3953,3 +3953,42 @@ on `sigaction()` evidently is not enough. Capturing it needs a different mechani
 content is the doomed GPU process's partial frame, and the black is its restart taking the window
 down. The next question is why the GPU process segfaults - and that is section 63's question, still
 open, now with a reproducible ~4 s window to attach to instead of a race.
+
+## 82. Isolated: the CEF GPU-process crash is in the PowerVR HAL path (2026-10-24)
+
+§63 recorded the GPU-process death as universal and never got a contrast that held. This is that
+contrast, and it holds.
+
+**Method.** One variable: `BL_CEF_VULKAN_ICD`, the switch the session script already carries for
+exactly this experiment (`droiddeck-session:897`). It points the Steam client's Vulkan at a chosen
+ICD while gamescope and Xwayland keep the real one. Two arms, same session build (versionCode 44),
+same env otherwise:
+
+| Arm | ICD | `GPU process exited unexpectedly` |
+|---|---|---|
+| A | PowerVR shim (default) | `exit_code=11` **every session**, reproducibly |
+| B | Steam's bundled `vk_swiftshader_icd.json` | **0**, across a full session |
+
+```
+Arm A: [19:59:42] GPU process exited unexpectedly: exit_code=11
+       [19:59:43] Reinitialized the GPU process after a crash (1418 ms)
+Arm B: [20:18:00] GPU process started: start count: 0     <- still the first one
+       (no "exited unexpectedly" line at all)
+```
+
+**What this establishes.** The crash is not in CEF, not in the compositor, not in the display path.
+It is in the **PowerVR path that the shim ICD exposes** - the HAL, our WSI, or the libhybris bridge
+between them. SwiftShader never touches any of it, and never crashes.
+
+**What it does not establish.** Which of those three. §63's second fault - `vulkandriverquery`
+faulting at `si_addr=0x308` in bionic libc (reproduced again in §81, `pc` in the `__errno` region,
+`lr` at `__open_2`) - is in the **same** layer, and §63's symbolized backtrace already carried it
+through our ICD/WSI region into the HAL's `vulkan.powervr.so` entries and then into bionic's
+`__open_2`. That is the strongest single lead: a HAL call that opens something (likely a sysfs or
+DRM path) through the hybris bridge and dereferences a null on failure.
+
+**Why this matters more than another guess.** Every earlier attempt at this crash guessed at the
+cause (GBM, shim, AHB, focus, geometry - §45-§55, §62, §63). This is the first comparison in which
+only one variable moved and the outcome was unambiguous. The next step has a target: make the HAL's
+failing open path visible - `HYBRIS_LINKER_DIR` plus a `strace`-equivalent on the GPU process, or the
+`__open_2`/`__errno` site the two independent crashes agree on.
