@@ -1309,7 +1309,7 @@ static void record_draw(VkCommandBuffer cmd, const struct vkp_draw *d, const VkI
     int use_blend = 0;
     int tw = (im->tex_w > 0) ? im->tex_w : im->w;
     if (im->sampled) {
-        int br = blendp_draw(cmd, im->image, im->fmt, im->w, im->h, tw, !im->dmabuf, target, target_fmt, target_w, target_h, blit);
+        int br = blendp_draw(cmd, im->image, im->fmt, im->w, im->h, tw, !im->dmabuf, target, target_fmt, target_w, target_h, blit, d->blend);
         if (draw_count < 10) {
             droiddeck_log("gpu", "record_draw #%d: blendp_draw returned %d (im->sampled=1, %dx%d [tex %d] -> %dx%d)",
                           draw_count, br, im->w, im->h, tw, target_w, target_h);
@@ -2227,7 +2227,7 @@ int vkp_blit_scene_to(struct vkp_image *dst, int wait_fd) {
     int use_blend = 0;
     if (dst->can_render) {
         int br = blendp_draw(cmd, g_scene.img, SCENE_FMT, g_scene.w, g_scene.h, g_scene.w, 0,
-                             dst->image, dst->fmt, dst->w, dst->h, &blit);
+                             dst->image, dst->fmt, dst->w, dst->h, &blit, 0);
         if (blit_scene_count < 10) {
             droiddeck_log("layer", "vkp_blit_scene_to #%d: blendp_draw returned %d (dst->can_render=1, scene %dx%d -> dst %dx%d)",
                           blit_scene_count, br, g_scene.w, g_scene.h, dst->w, dst->h);
@@ -3098,7 +3098,7 @@ int vkp_pass_copy_to(struct vkp_image *dst, int wait_fd) {
                         .dstOffsets = {{0, 0, 0}, {bw, bh, 1}}};
     if (dst->can_render &&
         blendp_draw(cmd, g_pass.result, SCENE_FMT, g_pass.rw, g_pass.rh, g_pass.rw, 0,
-                    dst->image, dst->fmt, dst->w, dst->h, &blit) == 0) {
+                    dst->image, dst->fmt, dst->w, dst->h, &blit, 0) == 0) {
         /* Rendered directly via 3D pass */
     } else {
         g_vk.CmdBlitImage(cmd, g_pass.result, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, dst->image,

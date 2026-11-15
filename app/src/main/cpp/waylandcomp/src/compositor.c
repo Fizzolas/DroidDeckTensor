@@ -1885,14 +1885,16 @@ static void add_surface(struct draw_list *dl, struct surface *s, int ox, int oy)
                 (float)s->gs_nom_w, (float)s->gs_nom_h, ox, oy, s->gs_nom_w, s->gs_nom_h, 0});
         }
         int dx = ox, dy = oy;
-        if (s->buf_w <= s->gs_nom_w / 2 && s->buf_h <= s->gs_nom_h / 2) {
-            dx = ox + s->gs_nom_w - s->buf_w - 16;
-            dy = oy + s->gs_nom_h - s->buf_h - 16;
+        if (s->buf_w < s->gs_nom_w && s->buf_h <= s->gs_nom_h / 2) {
             dw = s->buf_w;
             dh = s->buf_h;
+            dx = ox + s->gs_nom_w - dw - 16;
+            dy = oy + s->gs_nom_h - dh - 16;
         } else {
             dw = s->buf_w > s->gs_nom_w ? s->gs_nom_w : s->buf_w;
             dh = s->buf_h > s->gs_nom_h ? s->gs_nom_h : s->buf_h;
+            dx = ox + (s->gs_nom_w - dw) / 2;
+            dy = oy + (s->gs_nom_h - dh) / 2;
         }
         emit_draw(dl, (struct vkp_draw){img, 0, 0, (float)dw, (float)dh, dx, dy, dw, dh, 1});
         s->drawn = 1;

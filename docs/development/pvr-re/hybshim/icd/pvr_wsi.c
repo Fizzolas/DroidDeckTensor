@@ -659,7 +659,7 @@ static VkResult wsi_surface_caps(VkPhysicalDevice pd, VkSurfaceKHR surface, VkSu
               pthread_mutex_unlock(&g_memprops_mu);
           }
       } }
-    caps->minImageCount = (s->kind == WSI_WAYLAND) ? 3 : 2;
+    caps->minImageCount = 3;
     caps->maxImageCount = 4;
     /* The size of the window this presents into, re-read every time. Reporting a hardcoded extent is
      * worse than reporting none: a real non-UINT32_MAX currentExtent tells the app that exact size is
@@ -764,11 +764,16 @@ static VkResult wsi_surface_formats2(VkPhysicalDevice pd, const VkPhysicalDevice
 
 static VkResult wsi_surface_present_modes(VkPhysicalDevice pd, VkSurfaceKHR surface, uint32_t *count, VkPresentModeKHR *modes) {
     (void)pd; (void)surface;
-    if (!modes) { *count = 1; return VK_SUCCESS; }
-    if (*count < 1) { *count = 0; return VK_INCOMPLETE; }
-    modes[0] = VK_PRESENT_MODE_FIFO_KHR;
-    *count = 1;
-    return VK_SUCCESS;
+    static const VkPresentModeKHR m[] = {
+        VK_PRESENT_MODE_FIFO_KHR,
+        VK_PRESENT_MODE_MAILBOX_KHR,
+        VK_PRESENT_MODE_IMMEDIATE_KHR,
+    };
+    if (!modes) { *count = 3; return VK_SUCCESS; }
+    uint32_t n = *count < 3 ? *count : 3;
+    memcpy(modes, m, n * sizeof(*m));
+    *count = n;
+    return (*count < 3) ? VK_INCOMPLETE : VK_SUCCESS;
 }
 
 /* ---- swapchain ------------------------------------------------------------------ */
@@ -964,7 +969,18 @@ static VkResult wsi_create_swapchain(VkDevice device, const VkSwapchainCreateInf
             rded.image = sc->images[i].render;
             VkMemoryAllocateInfo rmai = { VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO };
             rmai.pNext = &rded; rmai.allocationSize = rmr.size; rmai.memoryTypeIndex = 0;
-            for (uint32_t t = 0; t < 32; t++) if (rmr.memoryTypeBits & (1u << t)) { rmai.memoryTypeIndex = t; break; }
+            int found_dev_local = 0;
+            for (uint32_t t = 0; t < sc->memProps.memoryTypeCount && t < 32; t++) {
+                if ((rmr.memoryTypeBits & (1u << t)) &&
+                    (sc->memProps.memoryTypes[t].propertyFlags & VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT)) {
+                    rmai.memoryTypeIndex = t;
+                    found_dev_local = 1;
+                    break;
+                }
+            }
+            if (!found_dev_local) {
+                for (uint32_t t = 0; t < 32; t++) if (rmr.memoryTypeBits & (1u << t)) { rmai.memoryTypeIndex = t; break; }
+            }
             r = sc->AllocateMemory(device, &rmai, alloc, &sc->images[i].render_mem);
             if (r != VK_SUCCESS) { WSI_LOG("render image alloc failed %d", r); goto fail; }
             r = sc->BindImageMemory(device, sc->images[i].render, sc->images[i].render_mem, 0);

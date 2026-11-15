@@ -990,13 +990,16 @@ typedef struct {
     uint32_t flags; uint32_t pad2; void *memory;
 } IcdMemUnmapInfoKHR;
 
+static int g_placed_ext_enabled = 0;
+
 static VkResult icd_allocate_memory(void *device, const void *pAllocateInfo, const void *pAllocator, void **pMemory) {
     VkResult (*hal)(void *, const void *, const void *, void **) =
         (VkResult (*)(void *, const void *, const void *, void **))icd_hal_dev_proc(device, "vkAllocateMemory");
     if (!hal) return VK_ERROR_INITIALIZATION_FAILED;
     const IcdMemAllocInfo *ai = (const IcdMemAllocInfo *)pAllocateInfo;
     VkResult r = VK_ERROR_UNKNOWN;
-    if (ai && ((1u << ai->memoryTypeIndex) & icd_host_visible_mask())) {
+    if (ai && __atomic_load_n(&g_placed_ext_enabled, __ATOMIC_RELAXED) &&
+        ai->memoryTypeIndex < 32u && ((1u << ai->memoryTypeIndex) & icd_host_visible_mask())) {
         int has_exp = 0;
         for (const uint8_t *p = (const uint8_t *)ai->pNext; p; p = *(const uint8_t *const *)(p + 8)) {
             if (*(const uint32_t *)p == 1000072002u) { has_exp = 1; break; }
@@ -1258,9 +1261,12 @@ static VkResult icd_create_device(void *pd, const void *ci, const void *alloc, v
     const char **kept = (const char **)malloc(sizeof(char *) * (n + 2));
     uint32_t kn = 0;
     for (uint32_t i = 0; i < n; i++) {
+        if (!strcmp(names[i], "VK_EXT_map_memory_placed")) {
+            __atomic_store_n(&g_placed_ext_enabled, 1, __ATOMIC_RELAXED);
+            continue;
+        }
         if (!strcmp(names[i], "VK_KHR_swapchain") ||
-            !strcmp(names[i], "VK_KHR_map_memory2") ||
-            !strcmp(names[i], "VK_EXT_map_memory_placed")) continue;
+            !strcmp(names[i], "VK_KHR_map_memory2")) continue;
         kept[kn++] = names[i];
     }
     for (int k = 0; k < 2; k++) if (!have[k]) kept[kn++] = need[k];
@@ -1874,17 +1880,8 @@ typedef struct { uint32_t sType; void *pNext; uint32_t flags; uint32_t imageType
                  uint32_t tiling; uint32_t usage; uint32_t sharingMode; uint32_t queueFamilyIndexCount;
                  const uint32_t *pQueueFamilyIndices; uint32_t initialLayout; } ImgCI;
 static VkResult icd_create_image(void *device, const void *ci, const void *alloc, void **out) {
-    if (!g_gipa && icd_load() != 0) return VK_ERROR_INITIALIZATION_FAILED;
-    /* Fetch the HAL's own vkCreateImage through the device's gdpa, or the pointer would be this
-     * function again (gipa returns the ICD's entries). */
-    void *(*dgdpa)(void *, const char *) =
-        (void *(*)(void *, const char *))g_gipa(device, "vkGetDeviceProcAddr");
     VkResult (*hal)(void *, const void *, const void *, void **) =
-        dgdpa ? (VkResult (*)(void *, const void *, const void *, void **))dgdpa(device, "vkCreateImage") : NULL;
-    if (!hal || hal == icd_create_image) {
-        void *(*igdpa)(void *, const char *) = (void *(*)(void *, const char *))g_gipa(g_instance, "vkGetDeviceProcAddr");
-        if (igdpa) hal = (VkResult (*)(void *, const void *, const void *, void **))igdpa(device, "vkCreateImage");
-    }
+        (VkResult (*)(void *, const void *, const void *, void **))icd_hal_dev_proc(device, "vkCreateImage");
     if (!hal || hal == icd_create_image) return VK_ERROR_INITIALIZATION_FAILED;
     const ImgCI *in = (const ImgCI *)ci;
     int external = 0;
@@ -1984,15 +1981,8 @@ typedef struct {
 } ShaderModuleCI;
 
 static VkResult icd_create_shader_module(void *device, const void *ci, const void *alloc, void **out) {
-    if (!g_gipa && icd_load() != 0) return VK_ERROR_INITIALIZATION_FAILED;
-    void *(*dgdpa)(void *, const char *) =
-        (void *(*)(void *, const char *))g_gipa(device, "vkGetDeviceProcAddr");
     VkResult (*hal)(void *, const void *, const void *, void **) =
-        dgdpa ? (VkResult (*)(void *, const void *, const void *, void **))dgdpa(device, "vkCreateShaderModule") : NULL;
-    if (!hal || hal == icd_create_shader_module) {
-        void *(*igdpa)(void *, const char *) = (void *(*)(void *, const char *))g_gipa(g_instance, "vkGetDeviceProcAddr");
-        if (igdpa) hal = (VkResult (*)(void *, const void *, const void *, void **))igdpa(device, "vkCreateShaderModule");
-    }
+        (VkResult (*)(void *, const void *, const void *, void **))icd_hal_dev_proc(device, "vkCreateShaderModule");
     if (!hal || hal == icd_create_shader_module) return VK_ERROR_INITIALIZATION_FAILED;
 
     const ShaderModuleCI *in = (const ShaderModuleCI *)ci;
@@ -2028,15 +2018,8 @@ typedef struct {
 
 static VkResult icd_create_compute_pipelines(void *device, void *pipelineCache, uint32_t count,
                                              const void *pCreateInfos, const void *alloc, void **pPipelines) {
-    if (!g_gipa && icd_load() != 0) return VK_ERROR_INITIALIZATION_FAILED;
-    void *(*dgdpa)(void *, const char *) =
-        (void *(*)(void *, const char *))g_gipa(device, "vkGetDeviceProcAddr");
     VkResult (*hal)(void *, void *, uint32_t, const void *, const void *, void **) =
-        dgdpa ? (VkResult (*)(void *, void *, uint32_t, const void *, const void *, void **))dgdpa(device, "vkCreateComputePipelines") : NULL;
-    if (!hal || hal == icd_create_compute_pipelines) {
-        void *(*igdpa)(void *, const char *) = (void *(*)(void *, const char *))g_gipa(g_instance, "vkGetDeviceProcAddr");
-        if (igdpa) hal = (VkResult (*)(void *, void *, uint32_t, const void *, const void *, void **))igdpa(device, "vkCreateComputePipelines");
-    }
+        (VkResult (*)(void *, void *, uint32_t, const void *, const void *, void **))icd_hal_dev_proc(device, "vkCreateComputePipelines");
     if (!hal || hal == icd_create_compute_pipelines) return VK_ERROR_INITIALIZATION_FAILED;
 
     const CompPipeCI *cis = (const CompPipeCI *)pCreateInfos;
@@ -2119,15 +2102,8 @@ typedef struct {
 
 static VkResult icd_create_graphics_pipelines(void *device, void *pipelineCache, uint32_t count,
                                               const void *pCreateInfos, const void *alloc, void **pPipelines) {
-    if (!g_gipa && icd_load() != 0) return VK_ERROR_INITIALIZATION_FAILED;
-    void *(*dgdpa)(void *, const char *) =
-        (void *(*)(void *, const char *))g_gipa(device, "vkGetDeviceProcAddr");
     VkResult (*hal)(void *, void *, uint32_t, const void *, const void *, void **) =
-        dgdpa ? (VkResult (*)(void *, void *, uint32_t, const void *, const void *, void **))dgdpa(device, "vkCreateGraphicsPipelines") : NULL;
-    if (!hal || hal == icd_create_graphics_pipelines) {
-        void *(*igdpa)(void *, const char *) = (void *(*)(void *, const char *))g_gipa(g_instance, "vkGetDeviceProcAddr");
-        if (igdpa) hal = (VkResult (*)(void *, void *, uint32_t, const void *, const void *, void **))igdpa(device, "vkCreateGraphicsPipelines");
-    }
+        (VkResult (*)(void *, void *, uint32_t, const void *, const void *, void **))icd_hal_dev_proc(device, "vkCreateGraphicsPipelines");
     if (!hal || hal == icd_create_graphics_pipelines) return VK_ERROR_INITIALIZATION_FAILED;
 
     VkResult r = hal(device, pipelineCache, count, pCreateInfos, alloc, pPipelines);

@@ -985,7 +985,11 @@ SESSIONCONF
         export LD_LIBRARY_PATH="$BL_CEF_LIBDIR${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
         echo "== steam: LD_LIBRARY_PATH prefixed with $BL_CEF_LIBDIR (client only)"
       fi
-      export GAMESCOPE_WSI_FORCE_BYPASS=1
+      if [[ "${BL_VK_DRIVER:-}" != *powervr* ]]; then
+        export GAMESCOPE_WSI_FORCE_BYPASS=1
+      else
+        unset GAMESCOPE_WSI_FORCE_BYPASS
+      fi
       export STEAM_GLCOMPOSER_USE_MAKECURRENT_LEGACY=1
       export vk_x11_ignore_suboptimal=true
       "$steam_root/steamrtarm64/steam" "${_bl_ui[@]}" "${_bl_cdp[@]}" "${_bl_lang[@]}" -clientbeta "$steam_channel" \
