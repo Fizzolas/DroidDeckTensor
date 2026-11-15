@@ -63,7 +63,7 @@ static struct bind binds[MAX_BINDS];
 static int nbinds;
 static char root[PATH_MAX];
 static size_t rootlen;
-static long long ttl_ns = 2000000000LL;
+static long long ttl_ns = 10000000000LL;
 static unsigned long hits, misses;
 
 static long sc(long nr, long a, long b, long c, long d, long e) { return fp_sys(nr, a, b, c, d, e, 0); }
@@ -216,7 +216,7 @@ static const struct bind *canon(struct bind *bd) {
 
 /* ---------------------------------------------------------------- verified parents */
 
-#define SLOTS 256
+#define SLOTS 2048
 #define SLOT_PATH 240 /* longer directories are verified every time */
 struct slot { long long stamp; unsigned hash; char path[SLOT_PATH]; };
 static struct slot cache[SLOTS];

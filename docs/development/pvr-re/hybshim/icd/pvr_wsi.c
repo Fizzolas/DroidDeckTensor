@@ -948,7 +948,18 @@ static VkResult wsi_create_swapchain(VkDevice device, const VkSwapchainCreateInf
          * exportable LINEAR colour image, and this is the selection the dma-buf probes proved
          * exportable on the device. (A host-visible preference needs the physical device, which is
          * not reachable from a VkDevice swapchain create; the vulkaninfo/format dump has the detail.) */
-        for (uint32_t t = 0; t < 32; t++) if (mr.memoryTypeBits & (1u << t)) { mai.memoryTypeIndex = t; break; }
+        int found_exp_dev_local = 0;
+        for (uint32_t t = 0; t < sc->memProps.memoryTypeCount && t < 32; t++) {
+            if ((mr.memoryTypeBits & (1u << t)) &&
+                (sc->memProps.memoryTypes[t].propertyFlags & VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT)) {
+                mai.memoryTypeIndex = t;
+                found_exp_dev_local = 1;
+                break;
+            }
+        }
+        if (!found_exp_dev_local) {
+            for (uint32_t t = 0; t < 32; t++) if (mr.memoryTypeBits & (1u << t)) { mai.memoryTypeIndex = t; break; }
+        }
         r = sc->AllocateMemory(device, &mai, alloc, &sc->images[i].mem);
         if (r != VK_SUCCESS) { WSI_LOG("vkAllocateMemory failed %d", r); goto fail; }
         r = sc->BindImageMemory(device, sc->images[i].image, sc->images[i].mem, 0);
@@ -1430,9 +1441,16 @@ static void probe_any_image(struct wsi_swapchain *sc, VkImage img, int iw, int i
     if (pCreateBuffer(dev, &bci, NULL, &buf) != VK_SUCCESS) return;
     VkMemoryRequirements req; pGetBufReq(dev, buf, &req);
     int type = -1;
-    for (uint32_t t = 0; t < sc->memProps.memoryTypeCount; t++)
+    for (uint32_t t = 0; t < sc->memProps.memoryTypeCount && t < 32; t++) {
         if ((req.memoryTypeBits & (1u << t)) &&
-            (sc->memProps.memoryTypes[t].propertyFlags & VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT)) { type = (int)t; break; }
+            (sc->memProps.memoryTypes[t].propertyFlags & (VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_CACHED_BIT)) ==
+            (VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_CACHED_BIT)) { type = (int)t; break; }
+    }
+    if (type < 0) {
+        for (uint32_t t = 0; t < sc->memProps.memoryTypeCount && t < 32; t++)
+            if ((req.memoryTypeBits & (1u << t)) &&
+                (sc->memProps.memoryTypes[t].propertyFlags & VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT)) { type = (int)t; break; }
+    }
     if (type < 0) { pDestroyBuffer(dev, buf, NULL); return; }
     VkMemoryAllocateInfo mai = { VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO };
     mai.allocationSize = req.size; mai.memoryTypeIndex = (uint32_t)type;
@@ -1563,7 +1581,8 @@ static int wsi_blit_to_export(struct wsi_swapchain *sc, uint32_t idx, VkQueue q,
     bars[1].dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
     bars[1].newLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
     bars[1].image = sc->images[idx].image;
-    pBarrier(sc->blit_cb, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0,
+    pBarrier(sc->blit_cb, VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT | VK_PIPELINE_STAGE_TRANSFER_BIT,
+             VK_PIPELINE_STAGE_TRANSFER_BIT, 0,
              0, NULL, 0, NULL, 2, bars);
     VkImageCopy region;
     memset(&region, 0, sizeof(region));
@@ -1588,7 +1607,8 @@ static int wsi_blit_to_export(struct wsi_swapchain *sc, uint32_t idx, VkQueue q,
     back[1].dstAccessMask = VK_ACCESS_MEMORY_READ_BIT;
     back[1].oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
     back[1].newLayout = VK_IMAGE_LAYOUT_GENERAL;
-    pBarrier(sc->blit_cb, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0,
+    pBarrier(sc->blit_cb, VK_PIPELINE_STAGE_TRANSFER_BIT,
+             VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT | VK_PIPELINE_STAGE_TRANSFER_BIT, 0,
              0, NULL, 0, NULL, 2, back);
     if (pEnd(sc->blit_cb) != VK_SUCCESS) return 0;
     if (pResetFences) pResetFences(dev, 1, &sc->blit_fence);
@@ -1600,7 +1620,7 @@ static int wsi_blit_to_export(struct wsi_swapchain *sc, uint32_t idx, VkQueue q,
         for (uint32_t k = 0; k < cap; k++) {
             if (wait_sems[k] != VK_NULL_HANDLE) {
                 local_sems[valid_waits] = wait_sems[k];
-                local_stages[valid_waits] = VK_PIPELINE_STAGE_ALL_COMMANDS_BIT;
+                local_stages[valid_waits] = VK_PIPELINE_STAGE_TRANSFER_BIT;
                 valid_waits++;
             }
         }
@@ -1671,9 +1691,16 @@ static int wsi_x11_put_image_present(struct wsi_swapchain *sc, uint32_t idx) {
     }
     VkMemoryRequirements req; pGetBufReq(dev, buf, &req);
     int type = -1;
-    for (uint32_t t = 0; t < sc->memProps.memoryTypeCount; t++)
+    for (uint32_t t = 0; t < sc->memProps.memoryTypeCount && t < 32; t++) {
         if ((req.memoryTypeBits & (1u << t)) &&
-            (sc->memProps.memoryTypes[t].propertyFlags & VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT)) { type = (int)t; break; }
+            (sc->memProps.memoryTypes[t].propertyFlags & (VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_CACHED_BIT)) ==
+            (VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_CACHED_BIT)) { type = (int)t; break; }
+    }
+    if (type < 0) {
+        for (uint32_t t = 0; t < sc->memProps.memoryTypeCount && t < 32; t++)
+            if ((req.memoryTypeBits & (1u << t)) &&
+                (sc->memProps.memoryTypes[t].propertyFlags & VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT)) { type = (int)t; break; }
+    }
     if (type < 0) {
         WSI_LOG("wsi_x11_put_image_present: no host-visible memory type (bits=0x%x types=%u)",
                 req.memoryTypeBits, sc->memProps.memoryTypeCount);

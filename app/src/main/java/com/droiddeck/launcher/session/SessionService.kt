@@ -656,7 +656,10 @@ class SessionService : Service() {
             // threads on big.LITTLE, and bound D3D9 frame latency to 1 for PowerVR TBDR.
             guest.add("DXVK_STATE_CACHE=1")
             guest.add("DXVK_STATE_CACHE_PATH=/root/.cache/dxvk")
-            guest.add("DXVK_CONFIG=dxvk.numCompilerThreads = 4; d3d9.invariantPosition = True; d3d11.invariantPosition = True; d3d9.forceSingleSample = True")
+            guest.add("DXVK_LOG_LEVEL=none")
+            guest.add("VKD3D_DEBUG=none")
+            guest.add("WINEDEBUG=-all")
+            guest.add("DXVK_CONFIG=dxvk.numCompilerThreads = 4; dxvk.allowMemoryOvercommit = True; d3d11.cachedDynamicResources = vi; d3d9.invariantPosition = True; d3d11.invariantPosition = True; d3d9.forceSingleSample = True")
             guest.add("MESA_SHADER_CACHE_MAX_SIZE=2G")
             guest.add("MESA_SHADER_CACHE_DIR=/root/.cache/mesa")
             if (SessionPrefs.fexPreset(this) == "PERFORMANCE_TSO") {
@@ -680,7 +683,10 @@ class SessionService : Service() {
         // glibc's per-thread rseq registration is refused by Android's app seccomp policy, so
         // every thread start paid a SIGSYS that proot answers; the malloc top pad grows the heap
         // 16 MB at a time instead of 128 KB, and every brk(2) is a proot stop too.
-        guest.add("GLIBC_TUNABLES=glibc.pthread.rseq=0:glibc.malloc.top_pad=16777216")
+        guest.add(
+            if (isPowerVr) "GLIBC_TUNABLES=glibc.pthread.rseq=0:glibc.malloc.top_pad=16777216:glibc.malloc.arena_max=4"
+            else "GLIBC_TUNABLES=glibc.pthread.rseq=0:glibc.malloc.top_pad=16777216"
+        )
         if (SessionState.mode == MODE_STEAM) guest.add("BL_STEAMDECK=" + (if (SessionPrefs.steamDeckMode(this)) "1" else "0"))
         if (SessionState.mode == MODE_STEAM) guest.add("BL_MANGOAPP=" + (if (SessionPrefs.mangoapp(this)) "1" else "0"))
         if (steamHere) guest.add("BL_STEAM_CHANNEL=" + SessionPrefs.steamChannel(this))
