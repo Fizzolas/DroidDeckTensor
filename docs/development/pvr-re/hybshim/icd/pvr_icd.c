@@ -781,9 +781,22 @@ int pvr_icd_mem_props(void *pd, void *out) {
 
 static void *icd_hal_dev_proc(void *device, const char *name) {
     if (!g_gipa && icd_load() != 0) return NULL;
-    void *(*hal_gdpa)(void *, const char *) =
-        (void *(*)(void *, const char *))g_gipa(g_instance, "vkGetDeviceProcAddr");
-    if (!hal_gdpa) hal_gdpa = (void *(*)(void *, const char *))g_gipa(device, "vkGetDeviceProcAddr");
+    static pthread_mutex_t gdpa_mu = PTHREAD_MUTEX_INITIALIZER;
+    static void *(*cached_hal_gdpa)(void *, const char *) = NULL;
+    static void *cached_inst = NULL;
+    void *(*hal_gdpa)(void *, const char *) = NULL;
+    pthread_mutex_lock(&gdpa_mu);
+    if (cached_inst == g_instance && cached_hal_gdpa) {
+        hal_gdpa = cached_hal_gdpa;
+    } else {
+        hal_gdpa = (void *(*)(void *, const char *))g_gipa(g_instance, "vkGetDeviceProcAddr");
+        if (!hal_gdpa && device) hal_gdpa = (void *(*)(void *, const char *))g_gipa(device, "vkGetDeviceProcAddr");
+        if (hal_gdpa && g_instance) {
+            cached_inst = g_instance;
+            cached_hal_gdpa = hal_gdpa;
+        }
+    }
+    pthread_mutex_unlock(&gdpa_mu);
     return hal_gdpa ? hal_gdpa(device, name) : NULL;
 }
 
@@ -794,40 +807,87 @@ typedef struct {
     uint64_t placed_size;
 } IcdMemRec;
 
+#define ICD_MEM_TOMBSTONE ((void *)(uintptr_t)1)
 static pthread_mutex_t g_mem_mu = PTHREAD_MUTEX_INITIALIZER;
 static IcdMemRec *g_mem_recs = NULL;
-static size_t g_mem_count = 0, g_mem_cap = 0;
+static size_t g_mem_count = 0, g_mem_used = 0, g_mem_cap = 0;
+
+static inline size_t icd_mem_hash(const void *mem) {
+    uint64_t x = (uint64_t)(uintptr_t)mem;
+    x = (x >> 4) ^ (x >> 16);
+    x *= 11400714819323198485ULL;
+    return (size_t)(x >> 32);
+}
+
+static void icd_mem_rehash(size_t new_cap) {
+    IcdMemRec *nt = (IcdMemRec *)calloc(new_cap, sizeof(IcdMemRec));
+    if (!nt) return;
+    size_t mask = new_cap - 1;
+    size_t nc = 0;
+    for (size_t i = 0; i < g_mem_cap; i++) {
+        void *m = g_mem_recs[i].mem;
+        if (!m || m == ICD_MEM_TOMBSTONE) continue;
+        size_t idx = icd_mem_hash(m) & mask;
+        while (nt[idx].mem) idx = (idx + 1) & mask;
+        nt[idx] = g_mem_recs[i];
+        nc++;
+    }
+    free(g_mem_recs);
+    g_mem_recs = nt;
+    g_mem_cap = new_cap;
+    g_mem_count = nc;
+    g_mem_used = nc;
+}
 
 static void icd_mem_record_alloc(void *mem, uint64_t size) {
-    if (!mem) return;
+    if (!mem || mem == ICD_MEM_TOMBSTONE) return;
     pthread_mutex_lock(&g_mem_mu);
-    for (size_t i = 0; i < g_mem_count; i++) {
-        if (g_mem_recs[i].mem == mem) {
-            g_mem_recs[i].size = size;
-            g_mem_recs[i].placed_addr = NULL;
-            g_mem_recs[i].placed_size = 0;
-            pthread_mutex_unlock(&g_mem_mu);
-            return;
+    if (!g_mem_cap || (g_mem_used + 1) * 10 >= g_mem_cap * 7) {
+        size_t nc = g_mem_cap ? g_mem_cap * 2 : 512;
+        if (g_mem_cap && g_mem_count * 4 < g_mem_cap) nc = g_mem_cap;
+        icd_mem_rehash(nc);
+    }
+    if (g_mem_cap) {
+        size_t mask = g_mem_cap - 1;
+        size_t idx = icd_mem_hash(mem) & mask;
+        size_t first_tomb = (size_t)-1;
+        for (;;) {
+            void *cur = g_mem_recs[idx].mem;
+            if (!cur) {
+                size_t dst = (first_tomb != (size_t)-1) ? first_tomb : idx;
+                if (g_mem_recs[dst].mem == NULL) g_mem_used++;
+                g_mem_recs[dst] = (IcdMemRec){ mem, size, NULL, 0 };
+                g_mem_count++;
+                break;
+            }
+            if (cur == mem) {
+                g_mem_recs[idx].size = size;
+                g_mem_recs[idx].placed_addr = NULL;
+                g_mem_recs[idx].placed_size = 0;
+                break;
+            }
+            if (cur == ICD_MEM_TOMBSTONE && first_tomb == (size_t)-1) first_tomb = idx;
+            idx = (idx + 1) & mask;
         }
-    }
-    if (g_mem_count == g_mem_cap) {
-        size_t nc = g_mem_cap ? g_mem_cap * 2 : 256;
-        IcdMemRec *nr = (IcdMemRec *)realloc(g_mem_recs, nc * sizeof(IcdMemRec));
-        if (nr) { g_mem_recs = nr; g_mem_cap = nc; }
-    }
-    if (g_mem_count < g_mem_cap) {
-        g_mem_recs[g_mem_count++] = (IcdMemRec){ mem, size, NULL, 0 };
     }
     pthread_mutex_unlock(&g_mem_mu);
 }
 
 static int icd_mem_get(void *mem, IcdMemRec *out) {
+    if (!mem || mem == ICD_MEM_TOMBSTONE) return 0;
     pthread_mutex_lock(&g_mem_mu);
-    for (size_t i = 0; i < g_mem_count; i++) {
-        if (g_mem_recs[i].mem == mem) {
-            if (out) *out = g_mem_recs[i];
-            pthread_mutex_unlock(&g_mem_mu);
-            return 1;
+    if (g_mem_cap) {
+        size_t mask = g_mem_cap - 1;
+        size_t idx = icd_mem_hash(mem) & mask;
+        for (;;) {
+            void *cur = g_mem_recs[idx].mem;
+            if (!cur) break;
+            if (cur == mem) {
+                if (out) *out = g_mem_recs[idx];
+                pthread_mutex_unlock(&g_mem_mu);
+                return 1;
+            }
+            idx = (idx + 1) & mask;
         }
     }
     pthread_mutex_unlock(&g_mem_mu);
@@ -835,25 +895,47 @@ static int icd_mem_get(void *mem, IcdMemRec *out) {
 }
 
 static void icd_mem_set_placed(void *mem, void *addr, uint64_t size) {
+    if (!mem || mem == ICD_MEM_TOMBSTONE) return;
     pthread_mutex_lock(&g_mem_mu);
-    for (size_t i = 0; i < g_mem_count; i++) {
-        if (g_mem_recs[i].mem == mem) {
-            g_mem_recs[i].placed_addr = addr;
-            g_mem_recs[i].placed_size = size;
-            break;
+    if (g_mem_cap) {
+        size_t mask = g_mem_cap - 1;
+        size_t idx = icd_mem_hash(mem) & mask;
+        for (;;) {
+            void *cur = g_mem_recs[idx].mem;
+            if (!cur) break;
+            if (cur == mem) {
+                g_mem_recs[idx].placed_addr = addr;
+                g_mem_recs[idx].placed_size = size;
+                break;
+            }
+            idx = (idx + 1) & mask;
         }
     }
     pthread_mutex_unlock(&g_mem_mu);
 }
 
 static void icd_mem_remove(void *mem, IcdMemRec *out) {
+    if (!mem || mem == ICD_MEM_TOMBSTONE) {
+        if (out) memset(out, 0, sizeof(*out));
+        return;
+    }
     pthread_mutex_lock(&g_mem_mu);
-    for (size_t i = 0; i < g_mem_count; i++) {
-        if (g_mem_recs[i].mem == mem) {
-            if (out) *out = g_mem_recs[i];
-            g_mem_recs[i] = g_mem_recs[--g_mem_count];
-            pthread_mutex_unlock(&g_mem_mu);
-            return;
+    if (g_mem_cap) {
+        size_t mask = g_mem_cap - 1;
+        size_t idx = icd_mem_hash(mem) & mask;
+        for (;;) {
+            void *cur = g_mem_recs[idx].mem;
+            if (!cur) break;
+            if (cur == mem) {
+                if (out) *out = g_mem_recs[idx];
+                g_mem_recs[idx].mem = ICD_MEM_TOMBSTONE;
+                g_mem_recs[idx].placed_addr = NULL;
+                g_mem_recs[idx].placed_size = 0;
+                g_mem_count--;
+                pthread_mutex_unlock(&g_mem_mu);
+                return;
+            }
+            idx = (idx + 1) & mask;
         }
     }
     pthread_mutex_unlock(&g_mem_mu);

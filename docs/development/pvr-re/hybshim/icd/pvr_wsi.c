@@ -813,6 +813,12 @@ struct wsi_swapchain {
      * buffer and a fence per present would add churn to every frame, which is the kind of stutter
      * that reads as flashing. */
     VkCommandPool blit_pool; VkCommandBuffer blit_cb; VkFence blit_fence;
+    PFN_vkBeginCommandBuffer blit_Begin;
+    PFN_vkEndCommandBuffer blit_End;
+    PFN_vkCmdPipelineBarrier blit_Barrier;
+    PFN_vkCmdCopyImage blit_Copy;
+    PFN_vkResetCommandBuffer blit_Reset;
+    PFN_vkResetFences blit_ResetFences;
 };
 
 /* The device lock, held across an acquire so the image index, the release fence and the signal
@@ -1481,23 +1487,34 @@ static void probe_any_image(struct wsi_swapchain *sc, VkImage img, int iw, int i
     pDestroyBuffer(dev, buf, NULL); sc->FreeMemory(dev, mem, NULL);
 }
 
-static int wsi_blit_to_export(struct wsi_swapchain *sc, uint32_t idx, VkQueue q) {
+static int wsi_blit_to_export(struct wsi_swapchain *sc, uint32_t idx, VkQueue q,
+                              uint32_t wait_count, const VkSemaphore *wait_sems) {
     if (!sc || idx >= sc->count || sc->images[idx].render == VK_NULL_HANDLE) return 0;
     VkQueue submit_q = q ? q : sc->queue;
     VkDevice dev = sc->device;
     struct wsi_device_entries ecopy;
     pthread_mutex_t *qmu = NULL;
-    PFN_vkCreateCommandPool pCreatePool = (PFN_vkCreateCommandPool)dev_proc(dev, "vkCreateCommandPool");
-    PFN_vkAllocateCommandBuffers pAlloc = (PFN_vkAllocateCommandBuffers)dev_proc(dev, "vkAllocateCommandBuffers");
-    PFN_vkBeginCommandBuffer pBegin = (PFN_vkBeginCommandBuffer)dev_proc(dev, "vkBeginCommandBuffer");
-    PFN_vkEndCommandBuffer pEnd = (PFN_vkEndCommandBuffer)dev_proc(dev, "vkEndCommandBuffer");
-    PFN_vkCmdPipelineBarrier pBarrier = (PFN_vkCmdPipelineBarrier)dev_proc(dev, "vkCmdPipelineBarrier");
-    PFN_vkCmdCopyImage pCopy = (PFN_vkCmdCopyImage)dev_proc(dev, "vkCmdCopyImage");
-    PFN_vkResetCommandBuffer pReset = (PFN_vkResetCommandBuffer)dev_proc(dev, "vkResetCommandBuffer");
-    PFN_vkResetFences pResetFences = (PFN_vkResetFences)dev_proc(dev, "vkResetFences");
-    if (!wsi_copy_for_dev(dev, &ecopy, &qmu) || !ecopy.QueueSubmit || !ecopy.CreateFence || !ecopy.WaitForFences ||
-        !pCreatePool || !pAlloc || !pBegin || !pEnd || !pBarrier || !pCopy) return 0;
+    if (!wsi_copy_for_dev(dev, &ecopy, &qmu) || !ecopy.QueueSubmit || !ecopy.CreateFence || !ecopy.WaitForFences)
+        return 0;
+    if (!sc->blit_Begin) {
+        sc->blit_Begin = (PFN_vkBeginCommandBuffer)dev_proc(dev, "vkBeginCommandBuffer");
+        sc->blit_End = (PFN_vkEndCommandBuffer)dev_proc(dev, "vkEndCommandBuffer");
+        sc->blit_Barrier = (PFN_vkCmdPipelineBarrier)dev_proc(dev, "vkCmdPipelineBarrier");
+        sc->blit_Copy = (PFN_vkCmdCopyImage)dev_proc(dev, "vkCmdCopyImage");
+        sc->blit_Reset = (PFN_vkResetCommandBuffer)dev_proc(dev, "vkResetCommandBuffer");
+        sc->blit_ResetFences = (PFN_vkResetFences)dev_proc(dev, "vkResetFences");
+    }
+    PFN_vkBeginCommandBuffer pBegin = sc->blit_Begin;
+    PFN_vkEndCommandBuffer pEnd = sc->blit_End;
+    PFN_vkCmdPipelineBarrier pBarrier = sc->blit_Barrier;
+    PFN_vkCmdCopyImage pCopy = sc->blit_Copy;
+    PFN_vkResetCommandBuffer pReset = sc->blit_Reset;
+    PFN_vkResetFences pResetFences = sc->blit_ResetFences;
+    if (!pBegin || !pEnd || !pBarrier || !pCopy) return 0;
     if (!sc->blit_pool) {
+        PFN_vkCreateCommandPool pCreatePool = (PFN_vkCreateCommandPool)dev_proc(dev, "vkCreateCommandPool");
+        PFN_vkAllocateCommandBuffers pAlloc = (PFN_vkAllocateCommandBuffers)dev_proc(dev, "vkAllocateCommandBuffers");
+        if (!pCreatePool || !pAlloc) return 0;
         VkCommandPoolCreateInfo pci = { VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO };
         pci.queueFamilyIndex = ecopy.queue_family;
         pci.flags = VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT;
@@ -1559,7 +1576,23 @@ static int wsi_blit_to_export(struct wsi_swapchain *sc, uint32_t idx, VkQueue q)
              0, NULL, 0, NULL, 2, back);
     if (pEnd(sc->blit_cb) != VK_SUCCESS) return 0;
     if (pResetFences) pResetFences(dev, 1, &sc->blit_fence);
+    VkSemaphore local_sems[16];
+    VkPipelineStageFlags local_stages[16];
+    uint32_t valid_waits = 0;
+    if (wait_count > 0 && wait_sems) {
+        uint32_t cap = wait_count < 16 ? wait_count : 16;
+        for (uint32_t k = 0; k < cap; k++) {
+            if (wait_sems[k] != VK_NULL_HANDLE) {
+                local_sems[valid_waits] = wait_sems[k];
+                local_stages[valid_waits] = VK_PIPELINE_STAGE_ALL_COMMANDS_BIT;
+                valid_waits++;
+            }
+        }
+    }
     VkSubmitInfo si = { VK_STRUCTURE_TYPE_SUBMIT_INFO };
+    si.waitSemaphoreCount = valid_waits;
+    si.pWaitSemaphores = valid_waits ? local_sems : NULL;
+    si.pWaitDstStageMask = valid_waits ? local_stages : NULL;
     si.commandBufferCount = 1;
     si.pCommandBuffers = &sc->blit_cb;
     pthread_mutex_lock(qmu);
@@ -1770,7 +1803,17 @@ static VkResult wsi_queue_present(VkQueue queue, const VkPresentInfoKHR *pi) {
      * wait for all wait semaphores to finish first. Waiting with a timeout keeps a semaphore that never
      * signals from wedging the session outright. It must happen before the per-swapchain operations,
      * so all GPU work is synchronized. */
-    if (pi->pWaitSemaphores && pi->waitSemaphoreCount > 0 && pi->swapchainCount > 0) {
+    int fused_wait = 0;
+    if (pi->pWaitSemaphores && pi->waitSemaphoreCount > 0 && pi->waitSemaphoreCount <= 16 &&
+        pi->swapchainCount == 1 && pi->pSwapchains[0]) {
+        struct wsi_swapchain *sc0 = (struct wsi_swapchain *)pi->pSwapchains[0];
+        uint32_t idx0 = pi->pImageIndices[0];
+        if (sc0 && idx0 < sc0->count && sc0->images[idx0].render != VK_NULL_HANDLE &&
+            sc0->surface && (sc0->surface->kind != WSI_X11 || sc0->surface->has_dri3)) {
+            fused_wait = 1;
+        }
+    }
+    if (!fused_wait && pi->pWaitSemaphores && pi->waitSemaphoreCount > 0 && pi->swapchainCount > 0) {
         struct wsi_swapchain *sc0 = (struct wsi_swapchain *)pi->pSwapchains[0];
         if (sc0) {
             VkQueue wait_q = queue ? queue : sc0->queue;
@@ -1811,7 +1854,9 @@ static VkResult wsi_queue_present(VkQueue queue, const VkPresentInfoKHR *pi) {
                 continue;
             }
             if (wsi_readback_probe_enabled()) probe_vk_readback(sc, idx, "x11-render");
-            wsi_blit_to_export(sc, idx, queue ? queue : sc->queue);
+            wsi_blit_to_export(sc, idx, queue ? queue : sc->queue,
+                               fused_wait ? pi->waitSemaphoreCount : 0,
+                               fused_wait ? pi->pWaitSemaphores : NULL);
             if (wsi_readback_probe_enabled()) probe_vk_readback(sc, idx, "x11");
             if (!sc->images[idx].pixmap) {
                 xcb_pixmap_t px = xcb_generate_id(surf->c);
@@ -1945,7 +1990,9 @@ static VkResult wsi_queue_present(VkQueue queue, const VkPresentInfoKHR *pi) {
             for (int waited = 0; sc->images[idx].busy && waited < 100; waited += 20)
                 wsi_drain_wl_queue(sc, 20);
         }
-        wsi_blit_to_export(sc, idx, queue);
+        wsi_blit_to_export(sc, idx, queue,
+                           fused_wait ? pi->waitSemaphoreCount : 0,
+                           fused_wait ? pi->pWaitSemaphores : NULL);
         if (wsi_readback_probe_enabled()) probe_vk_readback(sc, idx, "wl");
         wl_surface_attach(surf->surface, buf, 0, 0);
         wl_surface_damage_buffer(surf->surface, 0, 0, sc->width, sc->height);

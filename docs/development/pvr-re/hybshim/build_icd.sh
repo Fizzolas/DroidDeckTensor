@@ -18,7 +18,7 @@ W=${WAYLAND_WSI:-/mnt/d/GUH/wayland-wsi}
 L=${HYBRIS_LINKS:-/mnt/d/GUH/links}
 V=${MESA_INCLUDE:-/mnt/d/GUH/mesa-build/mesa/include}
 cd "$R/icd"
-"$ZIG" cc -target aarch64-linux-gnu.2.38 -fPIC -shared -O1 \
+"$ZIG" cc -target aarch64-linux-gnu.2.38 -fPIC -shared -O2 \
   -Wl,-rpath,'$ORIGIN' -Wl,--allow-shlib-undefined \
   -I"$V" -I"$W/wlinc" -I"$W/gen" -I"$R/icd/protocols" -I"$X/inc" \
   -o libvulkan_powervr.so pvr_icd.c pvr_wsi.c protocols/wayland-protocol.c protocols/linux-dmabuf-v1-protocol.c \

@@ -651,6 +651,12 @@ class SessionService : Service() {
             // WineD3D's glClientWaitSync checks. Keep GL/Gallium submission synchronous for Zink.
             guest.add("GALLIUM_THREAD=0")
             guest.add("mesa_glthread=false")
+            // Persist DXVK pipeline state cache across launches so subsequent startups avoid
+            // recompiling shaders, cap compiler threads to avoid starving the main/compositor
+            // threads on big.LITTLE, and bound D3D9 frame latency to 1 for PowerVR TBDR.
+            guest.add("DXVK_STATE_CACHE=1")
+            guest.add("DXVK_CONFIG=dxvk.numCompilerThreads = 4; d3d9.maxFrameLatency = 1")
+            guest.add("MESA_SHADER_CACHE_MAX_SIZE=2G")
         } else if (SessionPrefs.zinkLazy(this)) {
             guest.add("ZINK_DESCRIPTORS=lazy")
             guest.add("ZINK_DEBUG=compact")
