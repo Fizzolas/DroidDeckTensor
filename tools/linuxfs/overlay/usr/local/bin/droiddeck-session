@@ -256,10 +256,6 @@ if [ -z "${BL_INSIDE:-}" ]; then
   # only once it has a controller; until then gamescope's own default made a finger a left-click
   # mouse, so the Steam interface took taps but would not scroll on a phone with no pad attached.
   [ "$mode" = steam ] && args+=(--default-touch-mode 4)
-  # On Tensor G5 (PowerVR), force windows fullscreen to prevent header borders/grey window decorations
-  if [[ "${BL_VK_DRIVER:-}" == *powervr* ]]; then
-    args+=(--force-windows-fullscreen)
-  fi
   # No --force-windows-fullscreen: it was for games that shrink their window when the Steam menu
   # opens over them (FlatOut), which no longer happens with the games on their own Xwayland server
   # (above), and it made any game drawing at another size than its display fight it. An experiment
@@ -996,7 +992,7 @@ SESSIONCONF
       # fourth sample, and a sample then costs only the browser's own task dir: two builtin reads per
       # thread (status carries the name as well as the state). Killed when its client exits.
       _bl_sampler_pid=
-      if [[ "${BL_VK_DRIVER:-}" == *powervr* ]] && [ "${BL_STALL_SAMPLER:-1}" = 1 ]; then
+      if [[ "${BL_VK_DRIVER:-}" == *powervr* ]] && [ "${BL_STALL_SAMPLER:-0}" = 1 ]; then
         (
           _bl_thread_line() { # task dir, label
             local tdir=$1 label=$2 tid name state wchan line rss
