@@ -7,7 +7,7 @@ set -euo pipefail
 echo "=== PowerVR G5 Final Pipeline ==="
 echo "=== 1. Verify device (Pixel 10 Pro XL / mustang) ==="
 if [ -z "${ADB:-}" ]; then ADB=/c/ADB/adb; fi
-$ADB devices | grep "57210DLCQ002KB" || echo "WARNING: Pixel 10 not connected"
+$ADB devices | grep -E "device$" || echo "WARNING: Pixel 10 not connected"
 
 echo "=== 2. Extract proprietary driver ==="
 mkdir -p extracted

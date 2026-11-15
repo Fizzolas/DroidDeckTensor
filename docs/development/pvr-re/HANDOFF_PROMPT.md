@@ -1,6 +1,6 @@
 # HANDOFF PROMPT — DroidDeck / Tensor G5 PowerVR: get Steam's UI running
 
-Copy the block below into a fresh session (Claude Code, working dir `D:\GUH\DroidDeck`).
+Copy the block below into a fresh session (working dir `<repo-root>`).
 
 ---
 
@@ -8,7 +8,7 @@ Copy the block below into a fresh session (Claude Code, working dir `D:\GUH\Droi
 
 You are picking up a long-running reverse-engineering / porting effort. **Read
 `docs/development/tensor-g5-powervr-state.md` (the authoritative, sectioned record; the relevant
-sections are §40–§55) and `C:\Users\sekri\.claude\projects\D--GUH\memory\*.md` first.** Do not take
+sections are §40–§55) first.** Do not take
 screenshots (images blow the context); extract state as text (adb shell, logs, `/proc`). Build with
 `JAVA_HOME=~/.jdks/jdk-17.0.20+8` (JDK 25 breaks Gradle); `assembleDebug` is signed with the public
 testkey so it installs over any build; bump `versionCode` when a bundled asset changes.
@@ -16,13 +16,13 @@ testkey so it installs over any build; bump `versionCode` when a bundled asset c
 ### The environment
 
 - **Device:** Google Pixel 10 Pro XL, `ro.board.platform=laguna`, `ro.hardware=mustang`,
-  `ro.soc.model=Tensor G5`. adb serial `57210DLCQ002KB`. Not rooted; app runs as `untrusted_app_27`.
+  `ro.soc.model=Tensor G5`. Not rooted; app runs as `untrusted_app_27`.
 - **GPU:** Imagination **PowerVR D-Series DXT-48-1536 MC1** (`vendorID 0x1010`, `deviceID 0x71061212`).
   Kernel driver `pvrsrvkm` (proprietary Google/Imagination), DRM render node `/dev/dri/renderD128`
   and card node `card2` (both `226:128`/`226:2`, one device under `34f00000.gpu0`). The node has **no
   GEM and no GBM** — that is the crux of everything below. `/dev/dma_heap/*` and `/dev/udmabuf`
   exist but are **denied** to the app.
-- **App:** DroidDeck fork at `D:\GUH\DroidDeck`, branch `feature/google-tensor-support`, `versionCode
+- **App:** DroidDeck fork, branch `feature/google-tensor-support`, `versionCode
   15`, `versionName 0.3.4` (`app/build.gradle`). It runs a **glibc ARM64 Linux rootfs under `proot`**
   and shows it in an Android SurfaceView. Single Gradle module; `CLAUDE.md` has the build/architecture.
 - **Guest graphics stack (all inside the proot guest):**
