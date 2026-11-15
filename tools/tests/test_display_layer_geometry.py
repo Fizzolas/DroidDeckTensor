@@ -5,20 +5,13 @@
   * `destination` - "the rect in the PARENT's space where this surface will be drawn"
   * `transform`   - "applied AFTER the source rect is applied to the buffer"
 
-So `destination` is the FINAL rect. Passing both a destination already computed in the rotated
-parent frame AND a non-zero transform applies the rotation twice. Measured on the Pixel 10
-(dumpsys SurfaceFlinger):
+The parent of ASurfaceControl is the window (ANativeWindow), which is already in
+sensorLandscape orientation (e.g. 2404x1080). Destination rect dstR is mapped directly
+in the window's coordinate space with uniform scaling and aspect ratio preserved.
+SurfaceFlinger handles rotation of the parent window to the physical display panel.
 
-    Layer droiddeck_wayland_game
-      opaqueRegion={0,0,1650,732}  toDisplayTransform={ scale x=3.2842 y=0.6467 }
-      bounds={0,6,1073,2404}
-
-A ROT_90 of a 1650x732 source must land on 732x1650; 1073x2404 with a non-uniform 3.28/0.65 stretch
-is a per-scanline misread - the horizontal random-colour-lines symptom.
-
-The scene -> parent mapping already swaps the axes for a 90/270 surface
-(`vkp_update_map` / `g_map_scene_swapped`), so the rect `vkp_map_rect` returns is already in the
-parent's space and the transform must be 0.
+Neither the parent extent nor the scene dimensions should be swapped. Swapping axes
+causes severe 5x non-uniform stretch / scanline shearing.
 """
 import re
 import unittest
@@ -34,18 +27,18 @@ class DisplayLayerGeometryTest(unittest.TestCase):
         self.sc = SC_LAYER.read_text(encoding='utf-8')
         self.vk = VK_PRESENT.read_text(encoding='utf-8')
 
-    def test_the_map_already_swaps_the_scene_for_a_rotated_surface(self):
-        """Basis for the fix: the destination handed to setGeometry is already rotated."""
+    def test_the_map_preserves_scene_aspect_without_swapping_axes(self):
+        """The parent window is already landscape; axes must not be swapped."""
         body = self.vk.split('int vkp_update_map(', 1)[1].split('\n}', 1)[0]
-        self.assertIn('g_map_scene_swapped', body)
-        self.assertIn('scene_w = scene_h', body)
+        self.assertNotIn('scene_w = scene_h', body,
+                         'vkp_update_map must not swap scene axes; parent window is already landscape')
 
     def test_setgeometry_does_not_rotate_a_destination_that_is_already_rotated(self):
         call = re.search(r'api\.setGeometry\([^;]*\);', self.sc)
         self.assertIsNotNone(call, 'setGeometry call not found')
         self.assertIn(', 0);', call.group(0),
                       'setGeometry must pass transform 0: the destination from vkp_map_rect is '
-                      'already in the parent frame, and the contract applies transform after it')
+                      'already in the parent window frame, and the contract applies transform after it')
 
     def test_the_transform_helper_survives_for_the_paths_that_need_it(self):
         """It is still used to learn the rotation; it just must not be passed to setGeometry."""

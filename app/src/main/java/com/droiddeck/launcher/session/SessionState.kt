@@ -112,6 +112,13 @@ object SessionState {
     @Volatile
     var firstFrameSeen = false
 
+    /** A frame has been presented at some point in THIS session. [firstFrameSeen] is re-armed when
+     *  readiness is cleared (the client restart, or a retained picture), and every re-arm put the
+     *  launch panel back over a live picture - the DroidDeck logo flashing over Steam. This one is
+     *  cleared only when a session actually starts. */
+    @Volatile
+    var frameEverSeen = false
+
     /** Where this session is writing its log, for the "it ended" message. */
     @Volatile
     var logFile: File? = null

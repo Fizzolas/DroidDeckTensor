@@ -117,7 +117,7 @@ static VkPipeline make_pipe(VkRenderPass rp) {
         .dstColorBlendFactor = VK_BLEND_FACTOR_ONE_MINUS_SRC_ALPHA, .colorBlendOp = VK_BLEND_OP_ADD,
         .srcAlphaBlendFactor = VK_BLEND_FACTOR_ONE, .dstAlphaBlendFactor = VK_BLEND_FACTOR_ONE_MINUS_SRC_ALPHA,
         .alphaBlendOp = VK_BLEND_OP_ADD,
-        .colorWriteMask = VK_COLOR_COMPONENT_R_BIT | VK_COLOR_COMPONENT_G_BIT | VK_COLOR_COMPONENT_B_BIT};
+        .colorWriteMask = VK_COLOR_COMPONENT_R_BIT | VK_COLOR_COMPONENT_G_BIT | VK_COLOR_COMPONENT_B_BIT | VK_COLOR_COMPONENT_A_BIT};
     VkPipelineColorBlendStateCreateInfo cb = {.sType = VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO,
                                               .attachmentCount = 1, .pAttachments = &ba};
     VkGraphicsPipelineCreateInfo pi = {.sType = VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO, .stageCount = 2,
@@ -126,7 +126,11 @@ static VkPipeline make_pipe(VkRenderPass rp) {
                                        .pColorBlendState = &cb, .pDynamicState = &ds, .layout = g_pl,
                                        .renderPass = rp, .subpass = 0};
     VkPipeline p = VK_NULL_HANDLE;
-    if (g_vk.CreateGraphicsPipelines(g_dev, VK_NULL_HANDLE, 1, &pi, NULL, &p) != VK_SUCCESS) return VK_NULL_HANDLE;
+    VkResult r = g_vk.CreateGraphicsPipelines(g_dev, VK_NULL_HANDLE, 1, &pi, NULL, &p);
+    if (r != VK_SUCCESS) {
+        droiddeck_log("gpu", "blendp: CreateGraphicsPipelines failed: %d", (int)r);
+        return VK_NULL_HANDLE;
+    }
     return p;
 }
 
@@ -219,10 +223,15 @@ static VkDescriptorSet src_ensure(VkImage img, VkFormat fmt, VkImageLayout layou
     OLDEST(g_src, NSRC, i);
     if (i < 0) return VK_NULL_HANDLE;
     src_release(i);
-    if (!(g_src[i].view = make_view(img, fmt))) return VK_NULL_HANDLE;
+    if (!(g_src[i].view = make_view(img, fmt))) {
+        droiddeck_log("gpu", "blendp: src_ensure make_view failed for img %p fmt %d", img, (int)fmt);
+        return VK_NULL_HANDLE;
+    }
     VkDescriptorSetAllocateInfo ai = {.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO,
                                       .descriptorPool = g_dpool, .descriptorSetCount = 1, .pSetLayouts = &g_dsl};
-    if (g_vk.AllocateDescriptorSets(g_dev, &ai, &g_src[i].ds) != VK_SUCCESS) {
+    VkResult ar = g_vk.AllocateDescriptorSets(g_dev, &ai, &g_src[i].ds);
+    if (ar != VK_SUCCESS) {
+        droiddeck_log("gpu", "blendp: AllocateDescriptorSets failed: %d", (int)ar);
         g_src[i].ds = VK_NULL_HANDLE;
         src_release(i);
         return VK_NULL_HANDLE;
@@ -247,11 +256,16 @@ static VkFramebuffer dst_ensure(VkImage img, VkFormat fmt, int w, int h, VkRende
     if (i == NDST) OLDEST(g_dst, NDST, i);
     if (i < 0) return VK_NULL_HANDLE;
     dst_release(i);
-    if (!(g_dst[i].view = make_view(img, fmt))) return VK_NULL_HANDLE;
+    if (!(g_dst[i].view = make_view(img, fmt))) {
+        droiddeck_log("gpu", "blendp: dst_ensure make_view failed for img %p fmt %d", img, (int)fmt);
+        return VK_NULL_HANDLE;
+    }
     VkFramebufferCreateInfo fi = {.sType = VK_STRUCTURE_TYPE_FRAMEBUFFER_CREATE_INFO, .renderPass = rp,
                                   .attachmentCount = 1, .pAttachments = &g_dst[i].view, .width = (uint32_t)w,
                                   .height = (uint32_t)h, .layers = 1};
-    if (g_vk.CreateFramebuffer(g_dev, &fi, NULL, &g_dst[i].fb) != VK_SUCCESS) {
+    VkResult fr = g_vk.CreateFramebuffer(g_dev, &fi, NULL, &g_dst[i].fb);
+    if (fr != VK_SUCCESS) {
+        droiddeck_log("gpu", "blendp: CreateFramebuffer %dx%d failed: %d", w, h, (int)fr);
         g_dst[i].fb = VK_NULL_HANDLE;
         dst_release(i);
         return VK_NULL_HANDLE;
@@ -272,16 +286,35 @@ static void src_layout(VkCommandBuffer cmd, VkImage img, VkImageLayout from, VkI
                             0, 0, NULL, 0, NULL, 1, &b);
 }
 
-int blendp_draw(VkCommandBuffer cmd, VkImage src, VkFormat src_fmt, int src_w, int src_h, int src_general,
+int blendp_draw(VkCommandBuffer cmd, VkImage src, VkFormat src_fmt, int src_w, int src_h, int tex_w, int src_general,
                 VkImage dst, VkFormat dst_fmt, int dst_w, int dst_h, const VkImageBlit *blit) {
-    if (!src || !dst || src_w <= 0 || src_h <= 0 || dst_w <= 0 || dst_h <= 0 || objects_ensure() != 0) return -1;
+    int tw = (tex_w > 0) ? tex_w : src_w;
+    static int logged = 0;
+    if (logged < 5) {
+        droiddeck_log("gpu", "blendp_draw: src=%p (%dx%d [tex %d] fmt %d gen %d) -> dst=%p (%dx%d fmt %d)",
+                      src, src_w, src_h, tw, (int)src_fmt, src_general, dst, dst_w, dst_h, (int)dst_fmt);
+    }
+    if (!src || !dst || src_w <= 0 || src_h <= 0 || tw <= 0 || dst_w <= 0 || dst_h <= 0 || objects_ensure() != 0) {
+        droiddeck_log("gpu", "blendp_draw invalid param: src=%p dst=%p %dx%d -> %dx%d ready=%d",
+                      src, dst, src_w, src_h, dst_w, dst_h, g_ready);
+        return -1;
+    }
     int slot = out_slot(dst_fmt);
-    if (slot < 0) return -1;
+    if (slot < 0) {
+        droiddeck_log("gpu", "blendp_draw out_slot failed for fmt %d", (int)dst_fmt);
+        return -1;
+    }
     VkImageLayout sampled = src_general ? VK_IMAGE_LAYOUT_GENERAL : VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
     VkDescriptorSet ds = src_ensure(src, src_fmt, sampled);
-    if (!ds) return -1;
+    if (!ds) {
+        droiddeck_log("gpu", "blendp_draw src_ensure failed");
+        return -1;
+    }
     VkFramebuffer fb = dst_ensure(dst, dst_fmt, dst_w, dst_h, g_out[slot].rp);
-    if (!fb) return -1;
+    if (!fb) {
+        droiddeck_log("gpu", "blendp_draw dst_ensure failed");
+        return -1;
+    }
 
     const VkOffset3D *d = blit->dstOffsets, *s = blit->srcOffsets;
     int x0 = d[0].x < d[1].x ? d[0].x : d[1].x, x1 = d[0].x < d[1].x ? d[1].x : d[0].x;
@@ -295,7 +328,7 @@ int blendp_draw(VkCommandBuffer cmd, VkImage src, VkFormat src_fmt, int src_w, i
     struct pc_blend pc = {
         .dst = {2.0f * d[0].x / dst_w - 1.0f, 2.0f * d[0].y / dst_h - 1.0f,
                 2.0f * d[1].x / dst_w - 1.0f, 2.0f * d[1].y / dst_h - 1.0f},
-        .src = {(float)s[0].x / src_w, (float)s[0].y / src_h, (float)s[1].x / src_w, (float)s[1].y / src_h}};
+        .src = {(float)s[0].x / tw, (float)s[0].y / src_h, (float)s[1].x / tw, (float)s[1].y / src_h}};
 
     if (!src_general) src_layout(cmd, src, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, sampled);
     VkRenderPassBeginInfo rpi = {.sType = VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO, .renderPass = g_out[slot].rp,
@@ -311,5 +344,9 @@ int blendp_draw(VkCommandBuffer cmd, VkImage src, VkFormat src_fmt, int src_w, i
     g_vk.CmdDraw(cmd, 4, 1, 0, 0);
     g_vk.CmdEndRenderPass(cmd);
     if (!src_general) src_layout(cmd, src, sampled, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
+    if (logged < 5) {
+        logged++;
+        droiddeck_log("gpu", "blendp_draw: completed successfully for slot %d", slot);
+    }
     return 0;
 }

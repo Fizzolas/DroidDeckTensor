@@ -145,6 +145,13 @@ static void dmabuf_build_formats(void) {
             g_dmabuf_fmts[f].mods[k++] = got[i];
             if (got[i] == VKP_MOD_QCOM_COMPRESSED) compressed++;
         }
+        /* INVALID must stay offered even though this compositor cannot import it (see the import
+         * path): gamescope's wlroots feedback compiler keeps only the modifiers its device supports,
+         * and this GPU supports none explicitly - drop INVALID from the list and the table it builds
+         * is empty, so it aborts with `feedback_compile: Assertion 'table_len > 0' failed` before the
+         * client starts (measured 2026-11-13, logs-dd14). Gamescope therefore binds at v3 and picks
+         * INVALID from this legacy list over the LINEAR beside it (logs-dd13). The importer has to
+         * learn the implicit layout; the advertisement cannot be fixed from this side. */
         g_dmabuf_fmts[f].mods[k++] = MOD_INVALID;
         g_dmabuf_fmts[f].n = k;
         uint32_t fmt = g_dmabuf_fmts[f].fmt;
@@ -320,6 +327,13 @@ void bind_dmabuf(struct wl_client *c, void *data, uint32_t ver, uint32_t id) {
     struct wl_resource *r = wl_resource_create(c, &zwp_linux_dmabuf_v1_interface, ver, id);
     wl_resource_set_implementation(r, &dmabuf_impl, NULL, NULL);
     if (!g_dmabuf_fmts_ready) dmabuf_build_formats();
+    /* Which list the client is working from: 3 and below only get the legacy format+modifier events
+     * (which include INVALID, i.e. "implicit layout, you work it out"), 4 and above get feedback,
+     * which never offers INVALID. Gamescope hands us implicit dma-bufs and a client that sent LINEAR
+     * from the same code path imported fine, so this is the measurement that says which list it read. */
+    droiddeck_log("dmabuf", "%s bound zwp_linux_dmabuf_v1 v%u (%s)", droiddeck_client_name(c), ver,
+                  ver >= 4 ? "feedback, LINEAR and driver modifiers only"
+                           : "legacy format/modifier events, INVALID included");
     /* From version 4 the format and modifier events are gone: the client asks for feedback
      * instead, and sending both would only confuse it about which list is authoritative. */
     if (ver >= 4) return;

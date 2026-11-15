@@ -244,6 +244,7 @@ class SessionService : Service() {
         // The desktop too: its Steam launchers run the client right there (droiddeck-steam-launch).
         if (SessionState.mode == MODE_STEAM || SessionState.mode == MODE_DESKTOP) RivalClients.stopBeforeSession(this)
         SessionState.firstFrameSeen = false
+        SessionState.frameEverSeen = false
         SessionState.guestPid = -1
         SessionEvents.transition(SessionPhase.STARTING_GUEST, "service.started", mapOf("mode" to SessionState.mode))
         // Re-arm after clearing readiness: a retained picture can present between the activity's
@@ -639,14 +640,25 @@ class SessionService : Service() {
         // the mode Zink recommends where the driver has no descriptor buffer, and what Ludashi ships
         // by default for its Zink path; a switch here because on one Fold the menus run at 14 fps.
         // compact packs Zink's descriptor sets into fewer, so a draw binds less (WinNative's default).
-        if (SessionPrefs.zinkLazy(this)) {
+        val isPowerVr = SessionPrefs.linuxDriver(this).ifEmpty { bundledId() ?: "" }
+            .contains("powervr", ignoreCase = true)
+        if (isPowerVr) {
+            // PowerVR TBDR leaves uninitialized tile memory behind Zink's renderpass load/store
+            // tracking (ZINK_DEBUG=rp), producing static/animated red-teal quads on UI layers.
+            guest.add("ZINK_DEBUG=norp")
+            // Gallium threaded context (tc_batch_execute) and mesa_glthread race with Zink's
+            // resource/kopper barrier state on PowerVR, faulting in libgallium and failing
+            // WineD3D's glClientWaitSync checks. Keep GL/Gallium submission synchronous for Zink.
+            guest.add("GALLIUM_THREAD=0")
+            guest.add("mesa_glthread=false")
+        } else if (SessionPrefs.zinkLazy(this)) {
             guest.add("ZINK_DESCRIPTORS=lazy")
             guest.add("ZINK_DEBUG=compact")
         }
         // The rest of the client-interface switches (SessionPrefs): GL marshalled off the calling
         // thread, no GL error checks, and the client run as SteamOS runs it (the script reads
         // BL_STEAMDECK; it is the one that builds the command line).
-        if (SessionPrefs.glThread(this)) guest.add("mesa_glthread=true")
+        if (!isPowerVr && SessionPrefs.glThread(this)) guest.add("mesa_glthread=true")
         if (SessionPrefs.noGlError(this)) guest.add("MESA_NO_ERROR=1")
         // Mesa's shader cache as one database instead of a file per entry. Every lookup in the
         // file cache is an open and every store an open and a rename, each a proot stop (a rename
@@ -701,7 +713,8 @@ class SessionService : Service() {
         // changes what games do and leaves the client alone. The microphone is its own opt-in on
         // top, and the helper only opens an input stream when asked - so a user who wants game
         // sound but no recording gets exactly that, and Android's recording indicator stays off.
-        val wantsDirectAudio = SessionState.mode == MODE_STEAM && SessionPrefs.directAudio(this)
+        val directAudioAvailable = File(applicationInfo.nativeLibraryDir, "libdirectaudiorelay.so").isFile
+        val wantsDirectAudio = directAudioAvailable && SessionState.mode == MODE_STEAM && SessionPrefs.directAudio(this)
         val wantsMic = SessionPrefs.micEnabled(this) &&
             checkSelfPermission(android.Manifest.permission.RECORD_AUDIO) == PackageManager.PERMISSION_GRANTED
         // Both paths sit under the app's files directory, which the session binds at its own path,
@@ -715,7 +728,7 @@ class SessionService : Service() {
         // With DirectAudio on, the client's own sound goes through the relay too: the daemon
         // fills the relay's ring and the relay, outside proot, drives the device.
         // The client's own sound: the classic AAudio sink unless the user chose the relay.
-        val clientDirectAudio = SessionState.mode == MODE_STEAM && SessionPrefs.clientDirectAudio(this)
+        val clientDirectAudio = directAudioAvailable && SessionState.mode == MODE_STEAM && SessionPrefs.clientDirectAudio(this)
         if (clientDirectAudio) pulse.setRelaySocket(relaySocket.absolutePath)
         pulse.setLogFile(audioLog)
         pulse.attach(this)

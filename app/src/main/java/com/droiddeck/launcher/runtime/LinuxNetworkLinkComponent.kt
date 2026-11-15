@@ -287,10 +287,32 @@ class LinuxNetworkLinkComponent(
             val staged = File(etc, "resolv.conf.staged")
             staged.writeText(text)
             if (!staged.renameTo(File(etc, "resolv.conf"))) throw IOException("Could not replace resolv.conf")
+            // Steam's Big Picture UI reaches the client's own web server at https://steamloopback.host,
+            // which the client expects to resolve to loopback (Steam's installer writes this entry on
+            // a normal machine). The image's hosts file only names localhost, so every login poll from
+            // the UI failed with "Transport Error: 2" and Big Picture never left its splash.
             val hosts = File(etc, "hosts")
-            if (!hosts.isFile || !hosts.readText().contains("localhost")) {
-                hosts.writeText("127.0.0.1 localhost\n::1 localhost\n")
+            val required = listOf(
+                "127.0.0.1 localhost",
+                "::1 localhost",
+                // IPv4 only: Steam's web server listens on 127.0.0.1, and Chromium prefers ::1 for a
+                // dual-stack name, which made the UI's login poll fail with "Transport Error: 2".
+                "127.0.0.1 steamloopback.host",
+            )
+            val current = runCatching { hosts.readText() }.getOrDefault("")
+            // Drop any earlier steamloopback.host line first: an ::1 entry written by an older build
+            // keeps Chromium on IPv6, where nothing is listening, and the poll fails again.
+            val lines = current.lineSequence().map { it.trim() }
+                .filter { it.isNotEmpty() && !it.contains("steamloopback.host") }
+                .toMutableList()
+            var added = false
+            for (entry in required) {
+                if (lines.none { it == entry }) {
+                    lines += entry
+                    added = true
+                }
             }
+            if (added || !hosts.isFile) hosts.writeText(lines.joinToString("\n") + "\n")
             Log.i(TAG, "resolver: " + servers.joinToString(" "))
         } catch (e: IOException) {
             Log.w(TAG, "Could not write the resolver", e)

@@ -4,6 +4,7 @@ import android.content.Context
 import androidx.annotation.StringRes
 import com.droiddeck.launcher.R
 import com.droiddeck.launcher.core.TextureFiltering
+import com.droiddeck.launcher.gpu.GpuInfo
 import com.droiddeck.launcher.gpu.ScreenEffects
 import org.json.JSONObject
 
@@ -34,11 +35,12 @@ object SessionPrefs {
     private fun prefs(context: Context) = context.getSharedPreferences("session", Context.MODE_PRIVATE)
 
     /**
-     * Force the old swapchain copy path instead of the display-layer path, for an A/B of the
-     * compositor's presentation. Off by default: the display layer is the normal path.
+     * Force the swapchain copy path instead of the display-layer path, for an A/B of the
+     * compositor's presentation. Enabled by default on PowerVR / Tensor G5 where the display
+     * layer encounters Hardware Composer linear rotation artifacts, and off by default on Adreno.
      */
     fun swapchainCopy(context: Context): Boolean =
-        prefs(context).getBoolean("swapchainCopy", false)
+        prefs(context).getBoolean("swapchainCopy", GpuInfo.detect().family.vendor == GpuInfo.Vendor.POWERVR)
 
     /** Whether the launcher hides Android's status and navigation bars. */
     fun launcherFullscreen(context: Context): Boolean = prefs(context).getBoolean("launcherFullscreen", true)

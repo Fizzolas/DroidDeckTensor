@@ -18,6 +18,8 @@ import java.io.InputStream;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.StandardCopyOption;
+import java.security.MessageDigest;
+import java.security.NoSuchAlgorithmException;
 import java.util.ArrayList;
 import java.util.Collections;
 import java.util.List;
@@ -153,6 +155,8 @@ public class LinuxVulkanDriverManager {
             meta.put("bundled", true);
             // What lets the next apk tell this extract apart from one it should replace (builtByThisApk).
             meta.put("installedByVersionCode", BuildConfig.VERSION_CODE);
+            String assetSha = assetSha256(id);
+            if (assetSha != null) meta.put("bundledAssetSha256", assetSha);
             if (!FileUtils.writeString(new File(dir, META_NAME), meta.toString(2))) return null;
         } catch (org.json.JSONException e) {
             Log.e(TAG, "bundled manifest write failed", e);
@@ -186,7 +190,27 @@ public class LinuxVulkanDriverManager {
     private boolean builtByThisApk(String id) {
         JSONObject meta = readMeta(id);
         if (meta == null) return false;
-        return meta.optInt("installedByVersionCode", -1) == BuildConfig.VERSION_CODE;
+        if (meta.optInt("installedByVersionCode", -1) != BuildConfig.VERSION_CODE) return false;
+        String currentSha = assetSha256(id);
+        String installedSha = meta.optString("bundledAssetSha256", "");
+        return currentSha != null && currentSha.equals(installedSha);
+    }
+
+    private String assetSha256(String id) {
+        String asset = ASSET_DIR + id + ASSET_SUFFIX;
+        try (InputStream in = context.getAssets().open(asset)) {
+            MessageDigest md = MessageDigest.getInstance("SHA-256");
+            byte[] buf = new byte[16384];
+            int n;
+            while ((n = in.read(buf)) > 0) md.update(buf, 0, n);
+            byte[] digest = md.digest();
+            StringBuilder sb = new StringBuilder(digest.length * 2);
+            for (byte b : digest) sb.append(String.format("%02x", b & 0xff));
+            return sb.toString();
+        } catch (IOException | NoSuchAlgorithmException e) {
+            Log.w(TAG, "assetSha256 failed for " + asset, e);
+            return null;
+        }
     }
 
     /**

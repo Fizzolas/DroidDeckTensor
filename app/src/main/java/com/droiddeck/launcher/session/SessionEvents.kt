@@ -90,6 +90,7 @@ object SessionEvents {
 
     fun firstFrame() {
         SessionState.firstFrameSeen = true
+        SessionState.frameEverSeen = true
         record("frame.first")
         markReadyIfPossible()
     }

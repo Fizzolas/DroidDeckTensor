@@ -238,6 +238,7 @@ struct surface {
     struct dmabuf_buffer *dmabuf_buf;       /* its imported image, kept until replaced or the surface goes */
     struct wl_listener dmabuf_destroy;
     int buf_w, buf_h, has_content;
+    int probe_logged;                       /* one-line dump of the producer's first buffer */
     int buf_alpha;
     int opaque[4], pending_opaque[4], pending_opaque_set; /* x, y, w, h; w = 0: none */
     int src_set, dst_set;
@@ -627,20 +628,34 @@ static int tree_has_content(const struct surface *s, int depth) {
     return 0;
 }
 
-/* The size of what a window actually shows: its own surface when that has content, else the
- * largest content-bearing descendant (subsurfaces are positioned relative to the parent, so
- * their own sizes are the best available extent). */
+/* The size of what a window actually shows: the largest content-bearing extent in its tree
+ * (subsurfaces are positioned relative to the parent, so their sizes represent the window's
+ * real visual extent, while gamescope's toplevel only commits a 1x1 placeholder). */
 static void tree_size(const struct surface *s, int *w, int *h) {
     const struct surface *c;
-    int best = 0;
-    if (s->has_content) { surface_size(s, w, h); return; }
-    *w = *h = 0;
-    if (s->buf_w > 0 && s->buf_h > 0) { *w = s->buf_w; *h = s->buf_h; }
+    int best_w = 0, best_h = 0;
+    long long best_area = 0;
+
+    if (s->has_content) {
+        surface_size(s, &best_w, &best_h);
+        best_area = (long long)best_w * best_h;
+    } else if (s->buf_w > 0 && s->buf_h > 0) {
+        best_w = s->buf_w;
+        best_h = s->buf_h;
+        best_area = (long long)best_w * best_h;
+    }
+
     wl_list_for_each(c, &s->children, child_link) {
         int cw, ch;
         tree_size(c, &cw, &ch);
-        if ((long long)cw * ch > best) { best = (long long)cw * ch; *w = cw; *h = ch; }
+        if ((long long)cw * ch > best_area) {
+            best_area = (long long)cw * ch;
+            best_w = cw;
+            best_h = ch;
+        }
     }
+    *w = best_w;
+    *h = best_h;
 }
 
 static void surface_size(const struct surface *s, int *w, int *h) {
@@ -743,6 +758,12 @@ static void on_pending_buffer_destroyed(struct wl_listener *l, void *data) {
     s->pending_buffer = NULL;
 }
 
+/* Frame-ack accounting, reported in the stats line every 10 s. A client asks for one frame callback
+ * per frame and Mesa's swapchain blocks until it arrives, so a request that is never answered stalls
+ * the presenter and looks exactly like a hung UI. Comparing asked against answered says whether that
+ * is happening, instead of inferring it from the client's behaviour. */
+static unsigned g_frames_asked, g_frames_answered, g_fb_asked, g_fb_answered;
+
 static void fire_frames(struct wl_list *frames) {
     struct wl_resource *cb, *tmp;
     uint32_t t;
@@ -752,6 +773,7 @@ static void fire_frames(struct wl_list *frames) {
     wl_resource_for_each_safe(cb, tmp, frames) {
         wl_callback_send_done(cb, t);
         wl_resource_destroy(cb);
+        g_frames_answered++;
     }
 }
 
@@ -812,18 +834,42 @@ static void take_dmabuf(struct surface *s, struct dmabuf_buffer *b, struct wl_re
                   b->format, (unsigned long long)b->modifier);
         }
     }
+    /* One line per surface describing exactly what the producer handed us, so a black picture can be
+     * told apart from a wrong import: a mismatched stride, offset or modifier imports cleanly and
+     * samples as black, and nothing else in the log distinguishes the two. */
+    if (!s->probe_logged) {
+        s->probe_logged = 1;
+        char name[160];
+        describe(s, name, sizeof(name));
+        droiddeck_log("probe", "%s first buffer: %dx%d fmt=0x%08x mod=0x%llx stride=%u off=%u planes=%d imported=%d fd=%d",
+                   name, b->width, b->height, b->format, (unsigned long long)b->modifier,
+                   b->stride[0], b->offset[0], b->n_planes, b->img != NULL, b->fd[0]);
+    }
     if (s->shm_img) { vkp_image_destroy(s->shm_img); s->shm_img = NULL; }
     /* The size of the frames a window commits, when it changes after the first announcement: the
      * program rebuilt its swapchain. It earns a line of its own, because a game whose swapchain
      * came back smaller than it was is exactly what a picture suddenly filling one corner of the
      * screen looks like from here - and the two sizes are the whole of the evidence. Rare by
      * nature, so there is nothing to rate-limit. */
-    if (s->announced_vulkan && s->buf_w && s->buf_h &&
+    /* A 1x1 commit is not a resize: gamescope's toplevel only ever commits a 1x1 placeholder and
+     * keeps the picture it shows in a subsurface (see tree_size above). Counting one as a frame
+     * size meant every placeholder commit logged a "changed its frame size: 1x1 -> WxH" pair and
+     * re-announced the window, which read as the client flip-flopping between sizes. Keep the last
+     * real extent instead, and say nothing about placeholders. */
+    const int placeholder = b->width <= 1 || b->height <= 1;
+    if (!placeholder && s->announced_vulkan && s->buf_w && s->buf_h &&
         (s->buf_w != b->width || s->buf_h != b->height)) {
         char name[160];
         describe(s, name, sizeof(name));
         droiddeck_log("vulkan", "%s changed its frame size: %dx%d -> %dx%d", name,
                    s->buf_w, s->buf_h, b->width, b->height);
+    }
+    if (placeholder && s->buf_w && s->buf_h) {
+        /* The picture did not change size; the buffer that arrived is the placeholder. Leave the
+         * announced extent alone so the scene keeps the size it was last given. */
+        s->has_content = s->has_content || b->img != NULL;
+        g_stat_dmabuf++;
+        return;
     }
     s->buf_w = b->width;
     s->buf_h = b->height;
@@ -944,6 +990,7 @@ static void feedback_discard_all(struct wl_list *list) {
     wl_resource_for_each_safe(fb, tmp, list) {
         wp_presentation_feedback_send_discarded(fb);
         wl_resource_destroy(fb);
+        g_fb_answered++;
     }
 }
 
@@ -969,6 +1016,7 @@ static void feedback_present_all(struct wl_list *list, int64_t t) {
                                                 nominal_refresh_ns(), 0, 0,
                                                 WP_PRESENTATION_FEEDBACK_KIND_VSYNC);
         wl_resource_destroy(fb);
+        g_fb_answered++;
     }
 }
 
@@ -982,6 +1030,7 @@ static void presentation_feedback(struct wl_client *c, struct wl_resource *r,
     wl_resource_set_implementation(fb, NULL, NULL, feedback_resource_destroy);
     if (!s) { wp_presentation_feedback_send_discarded(fb); wl_resource_destroy(fb); return; }
     wl_list_insert(s->pending_feedback.prev, wl_resource_get_link(fb));
+    g_fb_asked++;
 }
 static const struct wp_presentation_interface presentation_impl = {
     .destroy = presentation_destroy,
@@ -1172,19 +1221,27 @@ static void surface_commit(struct wl_client *c, struct wl_resource *r) {
     constraints_surface_commit(s);
     droiddeck_color_commit(s->resource); /* wp_color_management_surface_v1 state (returns at once when HDR is off) */
 
-    if (s->role == ROLE_TOPLEVEL && s->xdg_toplevel) {
-        /* A client that draws into a SUBSURFACE (gamescope) commits its toplevel empty between
-         * frames, and a null attach clears has_content on that surface - but the picture is
-         * still in the children. Map on any content in the tree, and only unmap once the whole
-         * tree has been empty for a moment, or the window would close and reopen every frame
-         * (measured: "window closed gamescope" 12 s into a vkcube run, then a black screen). */
-        if (tree_has_content(s, 0)) {
-            s->empty_since_ns = 0;
-            map_toplevel(s);
-        } else if (s->mapped) {
-            int64_t now = now_ns();
-            if (!s->empty_since_ns) s->empty_since_ns = now;
-            else if (now - s->empty_since_ns > 500000000LL) unmap_toplevel(s);
+    /* A client that draws into a SUBSURFACE (gamescope) commits its toplevel empty between
+     * frames, and subsurfaces commit directly with desynchronized presentation. Find the
+     * root surface of the tree: whenever ANY surface in the tree commits and there is content
+     * in the tree, ensure the toplevel is mapped.
+     * Furthermore, gamescope is the session's compositor client - it must NEVER be unmapped
+     * by an inactivity timeout during window transitions (which caused vkcube and Steam to fall
+     * back to an unmapped black screen indefinitely). */
+    struct surface *root = s;
+    while (root->parent) root = root->parent;
+    if (root->role == ROLE_TOPLEVEL && root->xdg_toplevel) {
+        if (tree_has_content(root, 0)) {
+            root->empty_since_ns = 0;
+            map_toplevel(root);
+        } else if (root->mapped) {
+            const char *cname = client_name(wl_resource_get_client(root->resource));
+            int is_gamescope = (cname && strstr(cname, "gamescope"));
+            if (!is_gamescope) {
+                int64_t now = now_ns();
+                if (!root->empty_since_ns) root->empty_since_ns = now;
+                else if (now - root->empty_since_ns > 30000000000LL) unmap_toplevel(root);
+            }
         }
     }
     schedule_render();
@@ -2151,12 +2208,10 @@ static void render_scene(void) {
      * Falls through to the old paths when the layer is unavailable, when frame generation needs
      * per-vblank presents (a layer latches one buffer per refresh), or when the display switch
      * Download/droiddeck-env can turn off for an A/B. */
-    static int display_off = -1;
-    if (display_off < 0) {
-        /* The compositor runs in the APP process, so a shell or guest variable cannot reach it -
-         * the switch is set from Kotlin through nativeSetSwapchainCopy, like every other compositor
-         * switch here (g_ubwc, g_zero_copy, HDR). */
-        display_off = g_swapchain_copy;
+    const int display_off = g_swapchain_copy;
+    static int logged_display_off = -1;
+    if (logged_display_off != display_off) {
+        logged_display_off = display_off;
         droiddeck_log("layer", "display-layer path %s (%s)",
                       display_off ? "OFF: the scene goes through the screen swapchain"
                                   : "ON: the scene goes on the game's display layer, no swapchain",
@@ -2175,8 +2230,11 @@ static void render_scene(void) {
         int drw = 0, drh = 0;
         sc_layer_hide_overlay();
         int pr = -1;
-        if (vkp_render_display(w, h, dl.d, dl.n, &dimg, &drw, &drh) == 0)
+        int rdr = vkp_render_display(w, h, dl.d, dl.n, &dimg, &drw, &drh);
+        if (rdr == 0)
             pr = sc_layer_present_display(dimg, drw, drh, w, h);
+        else if (rdr > 0)
+            pr = 1;
         if (pr == 0) {
             on_display = 1;
             rendered = 1;
@@ -2199,110 +2257,86 @@ static void render_scene(void) {
                 droiddeck_log("layer", "the display-layer path did not take this frame; using the screen "
                            "swapchain for it");
             }
-            /* If that frame DID reach the layer but was refused, the layer may still be showing an
-             * older buffer, which would cover the swapchain frame drawn underneath it. Take it down
-             * before falling back; the old paths raise their own layer when they want one. */
-            sc_layer_hide();
+            /* If that frame DID reach the layer but was refused, only hide if not on display_route */
+            if (!display_route) sc_layer_hide();
         }
     }
     if (!on_display) {
-    int li = (g_zero_copy && !framegen) ? layer_candidate(&dl, w, h) : -1;
-    int over = li >= 0 ? dl.n - 1 - li : 0; /* draws above the fullscreen game (0 or 1) */
-    const int fx_blocks = (li >= 0 && fx_on && over > 0);
-    if (fx_blocks) { li = -1; over = 0; }
-    /* A window above the game needs a SECOND display layer, and on some displays that costs the
-     * hardware composition the first layer was worth having (sc_layer_overlay_affordable). Where it
-     * does, the whole scene goes down the copy path exactly as it did before the layer set existed.
-     * Decided HERE, before the game is committed to a layer: deciding it after the present would
-     * show the game layer and hide it again on every frame. */
-    const int ov_blocks = (li >= 0 && over > 0 && !fx_blocks && !sc_layer_overlay_affordable());
-    if (ov_blocks) { li = -1; over = 0; }
-    const int blocked = framegen ? 1 : (fx_blocks ? 2 : (ov_blocks ? 3 : 0));
-    if (g_zero_copy && blocked != g_zero_copy_paused) {
-        g_zero_copy_paused = blocked;
-        if (blocked == 1)
-            droiddeck_log("framegen", "zero-copy paused: frame generation needs the compositor pass");
-        else if (blocked == 2)
-            droiddeck_log("effects", "zero-copy paused: a window above the game needs the compositor pass for the whole scene");
-        else if (blocked == 3)
-            droiddeck_log("layer", "zero-copy paused: a window above the game would need a second display layer, "
-                                "which this display cannot compose in hardware - whole scene on the copy path");
-        else
-            droiddeck_log("effects", "zero-copy resumed: the game is back on its own display layer");
-    }
-    struct surface *ls = li >= 0 ? surface_for_image(dl.d[li].img) : NULL;
-    /* A frame this renderer could not import can only be shown on the layer, effects or not. */
-    if (li < 0) ls = ahb_layer_only_candidate(w, h);
-    /* HDR: the same, for a game's SUBSURFACE swapchain whose 10-bit frame the compositor could not
-     * import (NULL whenever the HDR gate is closed - nothing is ever noted then). */
-    if (li < 0 && !ls) ls = hdr_unimported_fullscreen(&dl, w, h);
-    if (ls && pass_on && li < 0 && !g_zero_copy_fx_skip_said) {
-        g_zero_copy_fx_skip_said = 1;
-        droiddeck_log(framegen ? "framegen" : "effects",
-                   "the game's frames cannot be imported by the compositor: shown zero-copy, %s skipped",
-                   framegen ? "frame generation" : "effects");
-    }
-    if (li >= 0 || ls) {
-        /* Layer mode: the fullscreen window goes on the game layer and (at most) one window above
-         * it on the overlay layer; whatever is under the game is hidden by it, so the screen
-         * surface only needs to be black. The game's frame goes on its layer as is when it is one
-         * of the game's own AHardwareBuffers (zero-copy, ahb_swapchain.c), through the effects
-         * chain's result when a Look is on, else through one blit into the pool. If a layer can't
-         * take its frame, the whole scene is drawn the usual way. */
-        /* The layers go up FIRST and the base surface's black frame is presented after them. The
-         * order matters: a present holds an acquired swapchain image, and the acquire semaphore is
-         * a vblank gate - putting the effects chain or the layer transaction behind it costs a
-         * whole refresh (measured on the Pocket FIT: 72 fps that way, 111 fps this way, with Retro
-         * CRT at 1920x1080). The window request the app may have left is applied here instead,
-         * since vkp_render no longer runs before the layer path. */
-        vkp_apply_window_request();
-        int r = -1;
-        /* The game's own buffer can only go on the layer AS IS - with a Look on, the frame has to
-         * go through the chain first, so the raw buffer is skipped in favour of the pass (a frame
-         * this renderer could not import has no draw, li < 0, and stays zero-copy with the effects
-         * skipped, said once above). */
-        if (!(fx_on && li >= 0) && ls && ls->dmabuf_buf && ahb_swapchain_has_ahb(ls->dmabuf_buf))
-            r = ahb_swapchain_present(ls->dmabuf_buf, ls, w, h);
-        if (r != 0 && li >= 0)
-            r = fx_on ? sc_layer_present_pass(&dl.d[li], 1, w, h)
-                      : sc_layer_present(dl.d[li].img, w, h, ls ? droiddeck_surface_color(ls) : NULL);
-        if (r == 0) {
-            if (ls) ls->drawn = 1;
-            /* The one window above the game keeps the game off the copy path entirely: it goes on
-             * its own layer, cropped and placed by the display. */
-            int go[8], ov = 0;
-            if (over == 1 && li >= 0 && vkp_map_draw(&dl.d[li + 1], go))
-                ov = sc_layer_present_overlay(dl.d[li + 1].img, go, dl.d[li + 1].blend) == 0 ? 1 : -1;
-            if (ov <= 0) sc_layer_hide_overlay();
-            if (ov < 0) { /* the overlay layer refused it: draw the whole scene the old way */
-                sc_layer_hide();
+        int li = (g_zero_copy && !framegen && !display_off) ? layer_candidate(&dl, w, h) : -1;
+        int over = li >= 0 ? dl.n - 1 - li : 0; /* draws above the fullscreen game (0 or 1) */
+        const int fx_blocks = (li >= 0 && fx_on && over > 0);
+        if (fx_blocks) { li = -1; over = 0; }
+        /* A window above the game needs a SECOND display layer, and on some displays that costs the
+         * hardware composition the first layer was worth having (sc_layer_overlay_affordable). Where it
+         * does, the whole scene goes down the copy path exactly as it did before the layer set existed.
+         * Decided HERE, before the game is committed to a layer: deciding it after the present would
+         * show the game layer and hide it again on every frame. */
+        const int ov_blocks = (li >= 0 && over > 0 && !fx_blocks && !sc_layer_overlay_affordable());
+        if (ov_blocks) { li = -1; over = 0; }
+        const int blocked = framegen ? 1 : (fx_blocks ? 2 : (ov_blocks ? 3 : 0));
+        if (g_zero_copy && !display_off && blocked != g_zero_copy_paused) {
+            g_zero_copy_paused = blocked;
+            if (blocked == 1)
+                droiddeck_log("framegen", "zero-copy paused: frame generation needs the compositor pass");
+            else if (blocked == 2)
+                droiddeck_log("effects", "zero-copy paused: a window above the game needs the compositor pass for the whole scene");
+            else if (blocked == 3)
+                droiddeck_log("layer", "zero-copy paused: a window above the game would need a second display layer, "
+                                    "which this display cannot compose in hardware - whole scene on the copy path");
+            else
+                droiddeck_log("effects", "zero-copy resumed: the game is back on its own display layer");
+        }
+        struct surface *ls = (li >= 0 && !display_off) ? surface_for_image(dl.d[li].img) : NULL;
+        /* HDR: the same, for a game's SUBSURFACE swapchain whose 10-bit frame the compositor could not
+         * import (NULL whenever the HDR gate is closed - nothing is ever noted then). */
+        if (li < 0 && !ls && !display_off) ls = hdr_unimported_fullscreen(&dl, w, h);
+        if (ls && pass_on && li < 0 && !g_zero_copy_fx_skip_said) {
+            g_zero_copy_fx_skip_said = 1;
+            droiddeck_log(framegen ? "framegen" : "effects",
+                       "the game's frames cannot be imported by the compositor: shown zero-copy, %s skipped",
+                       framegen ? "frame generation" : "effects");
+        }
+        if (!display_off && (li >= 0 || ls)) {
+            /* Layer mode: the fullscreen window goes on the game layer and (at most) one window above
+             * it on the overlay layer; whatever is under the game is hidden by it, so the screen
+             * surface only needs to be black. */
+            vkp_apply_window_request();
+            int r = -1;
+            if (!(fx_on && li >= 0) && ls && ls->dmabuf_buf && ahb_swapchain_has_ahb(ls->dmabuf_buf))
+                r = ahb_swapchain_present(ls->dmabuf_buf, ls, w, h);
+            if (r != 0 && li >= 0)
+                r = fx_on ? sc_layer_present_pass(&dl.d[li], 1, w, h)
+                          : sc_layer_present(dl.d[li].img, w, h, ls ? droiddeck_surface_color(ls) : NULL);
+            if (r == 0) {
+                if (ls) ls->drawn = 1;
+                int go[8], ov = 0;
+                if (over == 1 && li >= 0 && vkp_map_draw(&dl.d[li + 1], go))
+                    ov = sc_layer_present_overlay(dl.d[li + 1].img, go, dl.d[li + 1].blend) == 0 ? 1 : -1;
+                if (ov <= 0) sc_layer_hide_overlay();
+                if (ov < 0) {
+                    sc_layer_hide();
+                    rendered = vkp_render(w, h, dl.d, dl.n) == 0;
+                    copy = 1;
+                    hdr_copy = "the overlay layer refused the window above it";
+                } else {
+                    rendered = vkp_base_black(w, h) == 0;
+                }
+            } else {
                 rendered = vkp_render(w, h, dl.d, dl.n) == 0;
                 copy = 1;
-                hdr_copy = "the overlay layer refused the window above it";
-            } else {
-                /* Black under the opaque layers. It is a plain black frame (no effects, no frame
-                 * generation on it: they would only run on black), and it is presented only when the
-                 * base surface does not already show one - entering layer mode, after a copy-path or
-                 * frame-generation frame, after a swapchain rebuild. Every other layer frame draws and
-                 * presents nothing here: the display layers are all that changes on screen. This loop
-                 * is paced by the Choreographer's ticks (on_vsync), not by this present. */
-                rendered = vkp_base_black(w, h) == 0;
+                hdr_copy = "its display layer was unavailable this frame";
             }
         } else {
+            sc_layer_hide();
             rendered = vkp_render(w, h, dl.d, dl.n) == 0;
             copy = 1;
-            hdr_copy = "its display layer was unavailable this frame";
+            hdr_copy = display_off ? "swapchain copy forced for PowerVR"
+                     : ov_blocks ? "a window is above it and this display cannot compose a second layer in hardware"
+                     : fx_blocks ? "a window is above it and screen effects need the whole scene"
+                     : !g_zero_copy ? "zero-copy presentation is off"
+                     : framegen ? "frame generation needs the compositor pass"
+                     : "it is not the one fullscreen window (only that one gets its own display layer)";
         }
-    } else {
-        sc_layer_hide();
-        rendered = vkp_render(w, h, dl.d, dl.n) == 0;
-        copy = 1;
-        hdr_copy = ov_blocks ? "a window is above it and this display cannot compose a second layer in hardware"
-                 : fx_blocks ? "a window is above it and screen effects need the whole scene"
-                 : !g_zero_copy ? "zero-copy presentation is off"
-                 : framegen ? "frame generation needs the compositor pass"
-                 : "it is not the one fullscreen window (only that one gets its own display layer)";
-    }
     }
     } /* routes 0 and 3 */
     free(hs.is_hdr);
@@ -3432,6 +3466,12 @@ static int on_stats_timer(void *data) {
         droiddeck_log("stats", "last 10 s: %u frames on screen (%.1f fps) | %u GPU frames from games | %u window redraws | %d windows open%s",
                    g_stat_frames + generated, (g_stat_frames + generated) / 10.0, g_stat_dmabuf, g_stat_shm, windows, extra);
     }
+    /* The ack side of the same interval: what clients asked the compositor for and what they got back. */
+    if (g_frames_asked || g_frames_answered || g_fb_asked || g_fb_answered) {
+        droiddeck_log("ack", "client frame callbacks asked %u, answered %u | presentation feedback asked %u, answered %u",
+                      g_frames_asked, g_frames_answered, g_fb_asked, g_fb_answered);
+        g_frames_asked = g_frames_answered = g_fb_asked = g_fb_answered = 0;
+    }
     /* The perf line, next to the stats line and only when something happened: the compositor thread's
      * time per scene and inside the driver (avg/max), what the base surface did, and how long games
      * waited for their buffers back. See the audit memory for how to read it. */
@@ -3596,6 +3636,10 @@ int droiddeck_wayland_run(void) {
     /* libdecor binds wl_output at 4; a lower version is a protocol error for the client. */
     wl_global_create(display, &wl_output_interface, 4, NULL, bind_output);
     wl_global_create(display, &xdg_wm_base_interface, 1, NULL, bind_xdg_wm_base);
+    /* Not optional: gamescope's Wayland backend builds its Vulkan swapchain on this protocol
+     * ("xdg_backend: Couldn't create Wayland objects" and "Failed to create backend" without it),
+     * and the guest's pvr_wsi says outright "no zwp_linux_dmabuf_v1 on the display; present will be
+     * unavailable" - so a wl_shm-only fallback does not exist on either side. Measured 2026-11-13. */
     wl_global_create(display, &zwp_linux_dmabuf_v1_interface, 4, NULL, bind_dmabuf);
     /* gamescope's Wayland backend refuses a seat older than 8. */
     wl_global_create(display, &wl_seat_interface, 9, NULL, bind_seat);

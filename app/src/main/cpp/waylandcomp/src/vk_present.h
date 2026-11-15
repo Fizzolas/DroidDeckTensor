@@ -76,6 +76,7 @@ void vkp_image_upload_shm(struct vkp_image *img, const void *data, int stride);
 
 int vkp_image_width(const struct vkp_image *img);
 int vkp_image_height(const struct vkp_image *img);
+uint64_t vkp_image_row_pitch(const struct vkp_image *img);
 void vkp_image_destroy(struct vkp_image *img);
 
 // One scene draw: the src rectangle of an image (image pixels) scaled into the dst

@@ -18,6 +18,7 @@
 #include <poll.h>
 #include <time.h>
 #include <pthread.h>
+#include <sys/mman.h>
 #include <android/log.h>
 
 #define TAG "DroidDeckWayland"
@@ -29,6 +30,7 @@ struct vkp_image {
     VkImage image;
     VkDeviceMemory mem;
     int w, h;
+    int tex_w;                /* texture extent width in pixels (matches row_pitch / 4 when row_pitch > w * 4) */
     int dmabuf;               /* imported from a client; owned by the foreign queue family */
     int blit_dst;             /* layer mode: a pool buffer this backend blits into (never a source) */
     void *map;                /* shm images: persistently mapped linear memory */
@@ -36,6 +38,7 @@ struct vkp_image {
     int in_general;           /* shm images: moved from PREINITIALIZED to GENERAL */
     VkFormat fmt;
     int sampled;              /* created with SAMPLED usage: the alpha pass can read it */
+    int can_render;           /* created with COLOR_ATTACHMENT: can be drawn into via blendp_draw */
 };
 
 static ANativeWindow *g_window;  /* the window frames go to; compositor thread only */
@@ -967,24 +970,91 @@ struct vkp_image *vkp_image_from_dmabuf(int fd, uint32_t drm_format, uint64_t mo
 
 int vkp_image_is_dmabuf(const struct vkp_image *img) { return img && img->dmabuf && !img->blit_dst; }
 
+static void dump_ppm_direct(const char *name, const void *pixels, int w, int h, int pitch) {
+    if (!name || !pixels || w <= 0 || h <= 0 || pitch <= 0) return;
+    char path[256];
+    snprintf(path, sizeof(path), "/data/user/0/com.droiddeck.launcher/files/%s", name);
+    FILE *f = fopen(path, "wb");
+    if (!f) return;
+    fprintf(f, "P6\n%d %d\n255\n", w, h);
+    const unsigned char *row = (const unsigned char *)pixels;
+    unsigned char *line = malloc((size_t)w * 3);
+    if (!line) { fclose(f); return; }
+    for (int y = 0; y < h; y++) {
+        const uint32_t *px = (const uint32_t *)(row + y * pitch);
+        for (int x = 0; x < w; x++) {
+            uint32_t c = px[x];
+            line[x * 3 + 0] = (unsigned char)(c & 0xff);
+            line[x * 3 + 1] = (unsigned char)((c >> 8) & 0xff);
+            line[x * 3 + 2] = (unsigned char)((c >> 16) & 0xff);
+        }
+        fwrite(line, 1, (size_t)w * 3, f);
+    }
+    free(line);
+    fclose(f);
+    droiddeck_log("dump", "wrote %s (%dx%d, pitch %d)", path, w, h, pitch);
+}
+
 struct vkp_image *vkp_image_import_dmabuf(int fd, uint32_t drm_format, uint64_t modifier, int w, int h,
                                           uint32_t stride, uint32_t offset, int as_blit_dst) {
-    if (modifier == MOD_INVALID || w <= 0 || h <= 0) return NULL;
+    if (w <= 0 || h <= 0) return NULL;
+    if (modifier == MOD_INVALID) {
+        /* Reverse-engineering the implicit layout starts with the buffer's physical facts, measured
+         * here once per distinct size: a dma-buf reports its length through lseek, and the linear
+         * image the protocol describes needs row_pitch * height. If the allocation is smaller, the
+         * layout is tiled and no linear import can ever bind it (which is what OUT_OF_HOST_MEMORY
+         * said when this path was tried with the modifier forced to LINEAR). mmap says whether the
+         * buffer is mappable at all, i.e. whether a CPU-side decode is even possible. */
+        static unsigned long long seen[8][2]; static int nseen;
+        unsigned long long key = (unsigned long long)w << 32 | (unsigned)h;
+        int i, dup = 0;
+        for (i = 0; i < nseen; i++) if (seen[i][0] == key && seen[i][1] == stride) { dup = 1; break; }
+        if (!dup && modifier == MOD_INVALID && fd >= 0) {
+            if (nseen < 8) { seen[nseen][0] = key; seen[nseen][1] = stride; nseen++; }
+            off_t sz = lseek(fd, 0, SEEK_END);
+            void *mp = mmap(NULL, 4096, PROT_READ, MAP_SHARED, fd, 0);
+            droiddeck_log("dmabuf",
+                          "implicit dma-buf %dx%d stride=%u fmt=0x%08x: allocation=%lld bytes, "
+                          "linear would need %lld, mmap-4k=%s",
+                          w, h, stride, drm_format, (long long)sz, (long long)stride * h,
+                          mp == MAP_FAILED ? strerror(errno) : "ok");
+            if (mp != MAP_FAILED) munmap(mp, 4096);
+        }
+        /* INVALID means "derive the layout from the dma-buf" and this compositor can only bind
+         * LINEAR, so the import is attempted as LINEAR. That is exact for producers whose images the
+         * ICD created LINEAR (PVR_ICD_FORCE_LINEAR, set for the session - see pvr_icd.c), and it is
+         * what made this fail with OUT_OF_HOST_MEMORY before that: an OPTIMAL-tiled allocation is
+         * 82 % of its own linear size, so the bind had no memory to work with. A buffer from a
+         * producer that is still tiled fails the bind and is refused as before, now with the size
+         * line above saying why. */
+        modifier = 0;
+    }
     if (dev_init() != 0) return NULL;
 
+    static int client_dumped = 0;
+    if (!as_blit_dst && !client_dumped && w > 100 && h > 100) {
+        client_dumped = 1;
+        size_t map_sz = (size_t)stride * h + offset;
+        void *p = mmap(NULL, map_sz, PROT_READ, MAP_SHARED, fd, 0);
+        if (p != MAP_FAILED) {
+            dump_ppm_direct("dump_client_incoming.ppm", (const char *)p + offset, w, h, (int)stride);
+            munmap(p, map_sz);
+        } else {
+            droiddeck_log("dump", "failed to mmap client dma-buf fd %d: errno %d", fd, errno);
+        }
+    }
+
+    int tex_w = w;
+    if (stride > 0 && stride >= (uint32_t)w * 4) {
+        tex_w = (int)(stride / 4);
+    }
     struct vkp_image *img = calloc(1, sizeof(*img));
     if (!img) return NULL;
-    img->w = w; img->h = h; img->dmabuf = 1; img->blit_dst = as_blit_dst ? 1 : 0;
+    img->w = w; img->h = h; img->tex_w = tex_w; img->dmabuf = 1; img->blit_dst = as_blit_dst ? 1 : 0;
     img->fmt = drm_to_vk(drm_format);
-    const VkImageUsageFlags sampled_usage = VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_SAMPLED_BIT;
-    img->sampled = !as_blit_dst && g_vk.GetPhysicalDeviceImageFormatProperties2 &&
-                   modifier_importable(img->fmt, modifier, sampled_usage);
+    img->row_pitch = stride;
+    img->offset = offset;
 
-    /* The buffer's own row pitch has to reach the image, or every row is read from the wrong
-     * offset. Measured on this HAL: importing a 2404x1080 dma-buf as a plain LINEAR image gave
-     * the image a 9616 pitch for the buffer's 16384-byte rows (scrambled picture); the
-     * DRM-format-modifier path hands the pitch over and gets 16384 back. "Linear" is a DRM
-     * modifier value here, so a linear buffer keeps this path rather than the plain linear one. */
     VkSubresourceLayout plane = {.offset = offset, .rowPitch = stride};
     VkImageDrmFormatModifierExplicitCreateInfoEXT modInfo = {
         .sType = VK_STRUCTURE_TYPE_IMAGE_DRM_FORMAT_MODIFIER_EXPLICIT_CREATE_INFO_EXT,
@@ -994,13 +1064,37 @@ struct vkp_image *vkp_image_import_dmabuf(int fd, uint32_t drm_format, uint64_t 
         .handleTypes = VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT};
     VkImageCreateInfo ici = {
         .sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO, .pNext = &extImg,
-        .imageType = VK_IMAGE_TYPE_2D, .format = img->fmt, .extent = {w, h, 1},
+        .imageType = VK_IMAGE_TYPE_2D, .format = img->fmt, .extent = {(uint32_t)tex_w, (uint32_t)h, 1},
         .mipLevels = 1, .arrayLayers = 1, .samples = VK_SAMPLE_COUNT_1_BIT,
         .tiling = VK_IMAGE_TILING_DRM_FORMAT_MODIFIER_EXT,
-        .usage = as_blit_dst ? VK_IMAGE_USAGE_TRANSFER_DST_BIT
-                 : img->sampled ? sampled_usage : VK_IMAGE_USAGE_TRANSFER_SRC_BIT,
         .sharingMode = VK_SHARING_MODE_EXCLUSIVE, .initialLayout = VK_IMAGE_LAYOUT_UNDEFINED};
-    VkResult cr = g_vk.CreateImage(g_dev, &ici, NULL, &img->image);
+
+    VkResult cr = VK_ERROR_INITIALIZATION_FAILED;
+    if (as_blit_dst) {
+        ici.usage = VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_SAMPLED_BIT;
+        cr = g_vk.CreateImage(g_dev, &ici, NULL, &img->image);
+        if (cr == VK_SUCCESS) {
+            img->can_render = 1;
+        } else {
+            ici.usage = VK_IMAGE_USAGE_TRANSFER_DST_BIT;
+            cr = g_vk.CreateImage(g_dev, &ici, NULL, &img->image);
+            img->can_render = 0;
+        }
+        droiddeck_log("layer", "import layer pool dmabuf %dx%d stride %u: can_render=%d (cr=%s)",
+                      w, h, stride, img->can_render, vk_result_name(cr));
+    } else {
+        ici.usage = VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_SAMPLED_BIT;
+        cr = g_vk.CreateImage(g_dev, &ici, NULL, &img->image);
+        if (cr == VK_SUCCESS) {
+            img->sampled = 1;
+        } else {
+            ici.usage = VK_IMAGE_USAGE_TRANSFER_SRC_BIT;
+            cr = g_vk.CreateImage(g_dev, &ici, NULL, &img->image);
+            img->sampled = 0;
+        }
+        droiddeck_log("dmabuf", "import client dmabuf %dx%d (tex %dx%d) stride %u: sampled=%d (cr=%s)",
+                      w, h, tex_w, h, stride, img->sampled, vk_result_name(cr));
+    }
     if (cr != VK_SUCCESS) {
         LOGE("%s: vkCreateImage(%s, %dx%d, pitch %u, offset %u) -> %s%s", as_blit_dst ? "layer" : "dmabuf",
              vkp_modifier_name(modifier), w, h, stride, offset, vk_result_name(cr),
@@ -1149,6 +1243,7 @@ void vkp_image_upload_shm(struct vkp_image *img, const void *data, int stride) {
 
 int vkp_image_width(const struct vkp_image *img) { return img ? img->w : 0; }
 int vkp_image_height(const struct vkp_image *img) { return img ? img->h : 0; }
+uint64_t vkp_image_row_pitch(const struct vkp_image *img) { return img ? (uint64_t)img->row_pitch : 0; }
 
 void vkp_image_destroy(struct vkp_image *img) {
     if (!img) return;
@@ -1203,16 +1298,36 @@ static int draw_to_scene_blit(const struct vkp_draw *d, int scene_w, int scene_h
     return map_draw(d, 1.0f, 1.0f, 0.0f, 0.0f, 0.0f, 0.0f, (float)scene_w, (float)scene_h, blit);
 }
 
-/* A translucent draw needs source-over blending; every other draw keeps the existing blit path. */
+/* A translucent draw needs source-over blending; on tile-based GPUs like PowerVR (Tensor G5),
+ * vkCmdBlitImage from a LINEAR dma-buf with row pitch != w*4 corrupts scanlines. A sampled shader
+ * draw (blendp_draw) uses the hardware texture sampler which respects linear row pitch and drm format
+ * modifiers correctly. Fall back to CmdBlitImage only when the image is not sampled. */
 static void record_draw(VkCommandBuffer cmd, const struct vkp_draw *d, const VkImageBlit *blit, VkImage target,
                         VkFormat target_fmt, int target_w, int target_h, VkFilter filter) {
     const struct vkp_image *im = d->img;
-    if (d->blend && im->sampled &&
-        blendp_draw(cmd, im->image, im->fmt, im->w, im->h, !im->dmabuf, target, target_fmt, target_w, target_h,
-                    blit) == 0)
-        return;
-    g_vk.CmdBlitImage(cmd, im->image, im->dmabuf ? VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL : VK_IMAGE_LAYOUT_GENERAL,
-                      target, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, blit, filter);
+    static int draw_count = 0;
+    int use_blend = 0;
+    int tw = (im->tex_w > 0) ? im->tex_w : im->w;
+    if (im->sampled) {
+        int br = blendp_draw(cmd, im->image, im->fmt, im->w, im->h, tw, !im->dmabuf, target, target_fmt, target_w, target_h, blit);
+        if (draw_count < 10) {
+            droiddeck_log("gpu", "record_draw #%d: blendp_draw returned %d (im->sampled=1, %dx%d [tex %d] -> %dx%d)",
+                          draw_count, br, im->w, im->h, tw, target_w, target_h);
+        }
+        if (br == 0) use_blend = 1;
+    } else {
+        if (draw_count < 10) {
+            droiddeck_log("gpu", "record_draw #%d: im->sampled=0, skipping blendp_draw", draw_count);
+        }
+    }
+    if (!use_blend) {
+        if (draw_count < 10) {
+            droiddeck_log("gpu", "record_draw #%d: FALLING BACK TO CmdBlitImage", draw_count);
+        }
+        g_vk.CmdBlitImage(cmd, im->image, im->dmabuf ? VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL : VK_IMAGE_LAYOUT_GENERAL,
+                          target, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, blit, filter);
+    }
+    draw_count++;
 }
 
 static void destroy_scene_image(void) {
@@ -1494,17 +1609,13 @@ static void check_surface_changed(void) {
          * change from nothing. */
         if (g_extent.width == 0 || g_extent.height == 0) return;
         int was = (g_extent.width << 16) ^ g_extent.height;
-        VkExtent2D parent = e;
-        int rot = (tr == 0x4 || tr == 0x8);
-        if (rot) { uint32_t x = parent.width; parent.width = parent.height; parent.height = x; }
-        int now_ = (parent.width << 16) ^ parent.height;
-        if (now_ == was && rot == g_map_scene_swapped) return;
-        droiddeck_log("gpu", "display surface changed (%ux%u rot=%d -> %ux%u rot=%d): rebuilding the mapping",
-                      g_extent.width, g_extent.height, g_map_scene_swapped,
-                      parent.width, parent.height, rot);
-        g_extent = parent;
+        int now_ = (e.width << 16) ^ e.height;
+        if (now_ == was) return;
+        droiddeck_log("gpu", "display surface changed (%ux%u -> %ux%u): rebuilding the mapping",
+                      g_extent.width, g_extent.height, e.width, e.height);
+        g_extent = e;
         g_map.valid = 0;
-        g_map_scene_swapped = rot;
+        g_map_scene_swapped = 0;
         return;
     }
     if (!g_surface) return;
@@ -1708,7 +1819,8 @@ static int render_impl(int scene_w, int scene_h, const struct vkp_draw *draws, i
                 .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER, .oldLayout = VK_IMAGE_LAYOUT_UNDEFINED,
                 .newLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
                 .srcQueueFamilyIndex = VK_QUEUE_FAMILY_FOREIGN_EXT, .dstQueueFamilyIndex = g_qfam,
-                .image = im->image, .subresourceRange = range, .dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT};
+                .image = im->image, .subresourceRange = range,
+                .dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_SHADER_READ_BIT};
         } else if (!im->in_general) {
             bars[nb++] = (VkImageMemoryBarrier){
                 .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER, .oldLayout = VK_IMAGE_LAYOUT_PREINITIALIZED,
@@ -1821,6 +1933,18 @@ static int render_impl(int scene_w, int scene_h, const struct vkp_draw *draws, i
             ngen = vkp_framegen_run(cmd, result, VK_NULL_HANDLE, rw, rh, scene_fmt, gens);
             if (ngen < 0) ngen = 0;
             if (ngen > VKP_FG_MAX_GENERATIONS) ngen = VKP_FG_MAX_GENERATIONS;
+        }
+
+        /* Evidence about the composed scene BEFORE it is blitted to the swapchain, so the copy path
+         * is measurable too. Off unless BL_FRAME_DIGEST is set. On this path the frame has not been
+         * through setGeometry or a SurfaceControl layer, so a digest here that is coherent while the
+         * panel is not isolates the fault to the presentation step. */
+        if (fd_level() > 0 && result != VK_NULL_HANDLE) {
+            static struct vkp_image scene_view;
+            scene_view.image = result;
+            scene_view.w = rw; scene_view.h = rh;
+            scene_view.fmt = scene_fmt;
+            vkp_frame_digest(&scene_view, fd_level());
         }
 
         /* 4. Mapping/blit: the first present carries generated frame 0, or the result itself. */
@@ -1941,8 +2065,8 @@ static int render_display_impl(int scene_w, int scene_h, const struct vkp_draw *
                                void **out, int *rw, int *rh) {
     if (!out || !rw || !rh) return -1;
     if (g_dev_state == -2) return -1;
-    if (dev_init() != 0 || !g_window || scene_w <= 0 || scene_h <= 0 || n <= 0) return -1;
-    if (!draws) return -1;
+    if (dev_init() != 0 || !g_window || scene_w <= 0 || scene_h <= 0 || n < 0) return -1;
+    if (n > 0 && !draws) return -1;
     /* The scene image is the target; it is already the right size for the scene. */
     if (ensure_scene_image(scene_w, scene_h) != 0) return -1;
     VkImage scene_img = g_scene.img;
@@ -1975,7 +2099,8 @@ static int render_display_impl(int scene_w, int scene_h, const struct vkp_draw *
                 .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER, .oldLayout = VK_IMAGE_LAYOUT_UNDEFINED,
                 .newLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
                 .srcQueueFamilyIndex = VK_QUEUE_FAMILY_FOREIGN_EXT, .dstQueueFamilyIndex = g_qfam,
-                .image = im->image, .subresourceRange = range, .dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT};
+                .image = im->image, .subresourceRange = range,
+                .dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_SHADER_READ_BIT};
         } else if (!im->in_general) {
             bars[nb++] = (VkImageMemoryBarrier){
                 .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER, .oldLayout = VK_IMAGE_LAYOUT_PREINITIALIZED,
@@ -1988,7 +2113,7 @@ static int render_display_impl(int scene_w, int scene_h, const struct vkp_draw *
     }
     g_vk.CmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_HOST_BIT | VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT |
                                  VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
-                            VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, NULL, 0, NULL, (uint32_t)nb, bars);
+                            VK_PIPELINE_STAGE_TRANSFER_BIT | VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT, 0, 0, NULL, 0, NULL, (uint32_t)nb, bars);
     free(bars);
 
     /* Black under the scene: a window tree that does not cover every pixel (letterboxed program,
@@ -2012,7 +2137,12 @@ static int render_display_impl(int scene_w, int scene_h, const struct vkp_draw *
         record_draw(cmd, &draws[i], &blit, scene_img, SCENE_FMT, scene_w, scene_h, VK_FILTER_LINEAR);
         drawn++;
     }
-    if (!drawn) { g_vk.EndCommandBuffer(cmd); return -1; }
+    /* If there are no draws to composite (e.g. before any window opens or during window transitions),
+     * do NOT wipe the screen with black if a frame was already presented: hold the previous frame. */
+    if (drawn == 0 && g_first_frame_done) {
+        g_vk.EndCommandBuffer(cmd);
+        return 1;
+    }
 
     /* Hand it over as a blit source, which is what vkp_blit_image and the layer pool expect. */
     VkImageMemoryBarrier b_src = {
@@ -2044,7 +2174,7 @@ static int render_display_impl(int scene_w, int scene_h, const struct vkp_draw *
 
     *out = (void *)scene_img;
     *rw = scene_w; *rh = scene_h;
-    if (!g_first_frame_done) { g_first_frame_done = 1; droiddeck_on_first_frame(); }
+    if (drawn > 0 && !g_first_frame_done) { g_first_frame_done = 1; droiddeck_on_first_frame(); }
     return 0;
 }
 
@@ -2077,12 +2207,15 @@ int vkp_blit_scene_to(struct vkp_image *dst, int wait_fd) {
          .newLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
          .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED, .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
          .image = g_scene.img, .subresourceRange = range,
-         .srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT, .dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT},
+         .srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT,
+         .dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_SHADER_READ_BIT},
         {.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER, .oldLayout = VK_IMAGE_LAYOUT_UNDEFINED,
          .newLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
          .srcQueueFamilyIndex = VK_QUEUE_FAMILY_FOREIGN_EXT, .dstQueueFamilyIndex = g_qfam,
-         .image = dst->image, .subresourceRange = range, .dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT}};
-    g_vk.CmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT,
+         .image = dst->image, .subresourceRange = range,
+         .dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT | VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT}};
+    g_vk.CmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TRANSFER_BIT | VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
+                            VK_PIPELINE_STAGE_TRANSFER_BIT | VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT | VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT,
                             0, 0, NULL, 0, NULL, 2, acq);
     int bw = g_scene.w < dst->w ? g_scene.w : dst->w;
     int bh = g_scene.h < dst->h ? g_scene.h : dst->h;
@@ -2090,14 +2223,36 @@ int vkp_blit_scene_to(struct vkp_image *dst, int wait_fd) {
                         .srcOffsets = {{0, 0, 0}, {bw, bh, 1}},
                         .dstSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1},
                         .dstOffsets = {{0, 0, 0}, {bw, bh, 1}}};
-    g_vk.CmdBlitImage(cmd, g_scene.img, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
-                      dst->image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &blit, VK_FILTER_NEAREST);
+    static int blit_scene_count = 0;
+    int use_blend = 0;
+    if (dst->can_render) {
+        int br = blendp_draw(cmd, g_scene.img, SCENE_FMT, g_scene.w, g_scene.h, g_scene.w, 0,
+                             dst->image, dst->fmt, dst->w, dst->h, &blit);
+        if (blit_scene_count < 10) {
+            droiddeck_log("layer", "vkp_blit_scene_to #%d: blendp_draw returned %d (dst->can_render=1, scene %dx%d -> dst %dx%d)",
+                          blit_scene_count, br, g_scene.w, g_scene.h, dst->w, dst->h);
+        }
+        if (br == 0) use_blend = 1;
+    } else {
+        if (blit_scene_count < 10) {
+            droiddeck_log("layer", "vkp_blit_scene_to #%d: dst->can_render=0, skipping blendp_draw", blit_scene_count);
+        }
+    }
+    if (!use_blend) {
+        if (blit_scene_count < 10) {
+            droiddeck_log("layer", "vkp_blit_scene_to #%d: FALLING BACK TO CmdBlitImage", blit_scene_count);
+        }
+        g_vk.CmdBlitImage(cmd, g_scene.img, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+                          dst->image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &blit, VK_FILTER_NEAREST);
+    }
+    blit_scene_count++;
     VkImageMemoryBarrier rel = {
         .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER, .oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
         .newLayout = VK_IMAGE_LAYOUT_GENERAL, .srcQueueFamilyIndex = g_qfam,
         .dstQueueFamilyIndex = VK_QUEUE_FAMILY_FOREIGN_EXT, .image = dst->image, .subresourceRange = range,
-        .srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT};
-    g_vk.CmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT,
+        .srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT | VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT};
+    g_vk.CmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TRANSFER_BIT | VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
+                            VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT,
                             0, 0, NULL, 0, NULL, 1, &rel);
     if (g_vk.EndCommandBuffer(cmd) != VK_SUCCESS) return -1;
 
@@ -2198,16 +2353,13 @@ static void ensure_extent_from_window(void) {
          * a 1080x2404 parent gives a 1080x485 destination - a letterbox for the wrong aspect).
          *
          * Only reached with no swapchain, so the swapchain path's own extent is untouched. */
-        VkExtent2D parent = caps_extent;
-        int rot = (transform == 0x4 /* ROT_90 */ || transform == 0x8 /* ROT_270 */);
-        if (rot) { uint32_t t = parent.width; parent.width = parent.height; parent.height = t; }
-        if (parent.width != g_extent.width || parent.height != g_extent.height) {
-            g_extent = parent;
+        if (caps_extent.width != g_extent.width || caps_extent.height != g_extent.height) {
+            g_extent = caps_extent;
             droiddeck_log("screen", "layer space %ux%u (surface %ux%u, rotation 0x%x)",
                           g_extent.width, g_extent.height, caps_extent.width, caps_extent.height,
                           (unsigned)transform);
         }
-        g_map_scene_swapped = rot;
+        g_map_scene_swapped = 0;
         return;
     }
     int w = ANativeWindow_getWidth(g_window), h = ANativeWindow_getHeight(g_window);
@@ -2265,9 +2417,7 @@ int vkp_update_map(int scene_w, int scene_h) {
          * the rotated frame. */
         g_map_scene_swapped = 0;
     }
-    /* The layer carries the panel's rotation, so the mapping must see the scene in the frame the
-     * PARENT displays (a 90/270 rotation swaps the scene's axes). Only set on the display path. */
-    if (g_map_scene_swapped) { int t = scene_w; scene_w = scene_h; scene_h = t; }
+    g_map_scene_swapped = 0;
     update_map(scene_w, scene_h);
     return g_map.valid ? 0 : -1;
 }
@@ -2714,10 +2864,12 @@ int vkp_digest_pool_buffer(struct vkp_image *dst, int src_w, int src_h, int leve
          .image = g_fd->image, .subresourceRange = range, .dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT}};
     g_vk.CmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT,
                             0, 0, NULL, 0, NULL, 2, pre);
+    int bw = src_w < dst->w ? src_w : dst->w;
+    int bh = src_h < dst->h ? src_h : dst->h;
     VkImageBlit blit = {.srcSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1},
-                        .srcOffsets = {{0, 0, 0}, {dst->w, dst->h, 1}},
+                        .srcOffsets = {{0, 0, 0}, {bw, bh, 1}},
                         .dstSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1},
-                        .dstOffsets = {{0, 0, 0}, {dst->w, dst->h, 1}}};
+                        .dstOffsets = {{0, 0, 0}, {bw, bh, 1}}};
     g_vk.CmdBlitImage(cmd, dst->image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
                       g_fd->image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &blit, VK_FILTER_NEAREST);
     VkImageMemoryBarrier post = {
@@ -2736,7 +2888,15 @@ int vkp_digest_pool_buffer(struct vkp_image *dst, int src_w, int src_h, int leve
     if (timed_wait(g_fence, 1000000000ULL) != VK_SUCCESS) return -1;
 
     if (fd_digest_rgba((const unsigned char *)g_fd->map + g_fd->offset,
-                       dst->w, dst->h, (int)g_fd->row_pitch, &d) != 0) return -1;
+                       bw, bh, (int)g_fd->row_pitch, &d) != 0) return -1;
+
+    static int pool_dump_done = 0;
+    if (pool_dump_done < 3) {
+        pool_dump_done++;
+        char fname[64];
+        snprintf(fname, sizeof(fname), "dump_layer_%d.ppm", pool_dump_done);
+        dump_ppm_direct(fname, (const unsigned char *)g_fd->map + g_fd->offset, bw, bh, (int)g_fd->row_pitch);
+    }
 
     clock_gettime(CLOCK_MONOTONIC, &ts);
     mono = ts.tv_sec * 1000L + ts.tv_nsec / 1000000L;
@@ -2854,7 +3014,8 @@ static int pass_begin_impl(int scene_w, int scene_h, const struct vkp_draw *draw
                 .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER, .oldLayout = VK_IMAGE_LAYOUT_UNDEFINED,
                 .newLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
                 .srcQueueFamilyIndex = VK_QUEUE_FAMILY_FOREIGN_EXT, .dstQueueFamilyIndex = g_qfam,
-                .image = im->image, .subresourceRange = range, .dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT};
+                .image = im->image, .subresourceRange = range,
+                .dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_SHADER_READ_BIT};
         } else if (!im->in_general) {
             bars[nb++] = (VkImageMemoryBarrier){
                 .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER, .oldLayout = VK_IMAGE_LAYOUT_PREINITIALIZED,
@@ -2867,7 +3028,7 @@ static int pass_begin_impl(int scene_w, int scene_h, const struct vkp_draw *draw
     }
     g_vk.CmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_HOST_BIT | VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT |
                                  VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
-                            VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, NULL, 0, NULL, (uint32_t)nb, bars);
+                            VK_PIPELINE_STAGE_TRANSFER_BIT | VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT, 0, 0, NULL, 0, NULL, (uint32_t)nb, bars);
     free(bars);
 
     if (hf) {
@@ -2929,13 +3090,21 @@ int vkp_pass_copy_to(struct vkp_image *dst, int wait_fd) {
     /* The result stands for the whole scene, and so does the layer buffer (the DPU maps it onto
      * the output), so this is 1:1 whenever the buffer was allocated at the size begin() reported;
      * a stale-sized buffer is resampled rather than shown wrong. */
+    int bw = g_pass.rw < dst->w ? g_pass.rw : dst->w;
+    int bh = g_pass.rh < dst->h ? g_pass.rh : dst->h;
     VkImageBlit blit = {.srcSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1},
                         .srcOffsets = {{0, 0, 0}, {g_pass.rw, g_pass.rh, 1}},
                         .dstSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1},
-                        .dstOffsets = {{0, 0, 0}, {dst->w, dst->h, 1}}};
-    g_vk.CmdBlitImage(cmd, g_pass.result, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, dst->image,
-                      VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &blit,
-                      (g_pass.rw == dst->w && g_pass.rh == dst->h) ? VK_FILTER_NEAREST : VK_FILTER_LINEAR);
+                        .dstOffsets = {{0, 0, 0}, {bw, bh, 1}}};
+    if (dst->can_render &&
+        blendp_draw(cmd, g_pass.result, SCENE_FMT, g_pass.rw, g_pass.rh, g_pass.rw, 0,
+                    dst->image, dst->fmt, dst->w, dst->h, &blit) == 0) {
+        /* Rendered directly via 3D pass */
+    } else {
+        g_vk.CmdBlitImage(cmd, g_pass.result, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, dst->image,
+                          VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &blit,
+                          (g_pass.rw == bw && g_pass.rh == bh) ? VK_FILTER_NEAREST : VK_FILTER_LINEAR);
+    }
     VkImageMemoryBarrier rel = {
         .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER, .oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
         .newLayout = VK_IMAGE_LAYOUT_GENERAL, .srcQueueFamilyIndex = g_qfam,

@@ -25,9 +25,54 @@
 #include <string.h>
 #include <unistd.h>
 #include <fcntl.h>
+#include <sys/mman.h>
+#include <errno.h>
 #include <pthread.h>
+#include <poll.h>
 
-#define WSI_LOG(fmt, ...) fprintf(stderr, "pvr_wsi[%d]: " fmt, (int)getpid(), ##__VA_ARGS__)
+#include <stdarg.h>
+#include <fcntl.h>
+#include <errno.h>
+#include <unistd.h>
+extern const char *pvr_proc_cmd(void);
+static int g_wsi_log_fd = -2;
+static pthread_mutex_t g_wsi_log_mu = PTHREAD_MUTEX_INITIALIZER;
+static void wsi_log_write(const char *fmt, ...) __attribute__((format(printf, 1, 2)));
+static void wsi_log_write(const char *fmt, ...) {
+    char buf[1024];
+    const char *cmd = pvr_proc_cmd();
+    int prefix = snprintf(buf, sizeof(buf), "pvr_wsi[%d:%.64s]: ", (int)getpid(), cmd ? cmd : "?");
+    if (prefix < 0) prefix = 0;
+    if ((size_t)prefix >= sizeof(buf)) prefix = (int)sizeof(buf) - 1;
+    va_list ap;
+    va_start(ap, fmt);
+    int n = vsnprintf(buf + prefix, sizeof(buf) - (size_t)prefix, fmt, ap);
+    va_end(ap);
+    if (n < 0) n = 0;
+    size_t total = (size_t)prefix + (size_t)n;
+    if (total >= sizeof(buf) - 1) total = sizeof(buf) - 2;
+    buf[total++] = '\n';
+    buf[total] = '\0';
+    fwrite(buf, 1, total, stderr);
+    fflush(stderr);
+    pthread_mutex_lock(&g_wsi_log_mu);
+    if (g_wsi_log_fd == -2) {
+        g_wsi_log_fd = open("/tmp/pvr_wsi.log", O_WRONLY | O_CREAT | O_APPEND, 0666);
+        if (g_wsi_log_fd < 0) g_wsi_log_fd = -1;
+    }
+    int fd = g_wsi_log_fd;
+    pthread_mutex_unlock(&g_wsi_log_mu);
+    if (fd >= 0) {
+        ssize_t w = write(fd, buf, total);
+        (void)w;
+    }
+}
+#define WSI_LOG(fmt, ...) wsi_log_write(fmt, ##__VA_ARGS__)
+static int wsi_verbose_log(void) {
+    static int on = -1;
+    if (on < 0) { const char *e = getenv("PVR_WSI_VERBOSE"); on = (e && *e && *e != '0') ? 1 : 0; }
+    return on;
+}
 
 /* Resolve a device entrypoint through the HAL (never the global vkGetDeviceProcAddr). */
 extern void *pvr_icd_resolve(void *instance, const char *name);
@@ -48,37 +93,261 @@ static void *dev_proc(VkDevice dev, const char *name) {
  * vkGetDeviceProcAddr -- resolving them through pvr_icd_resolve would hand back THIS file's own
  * vkQueueSubmit, and the internal submits below would then recurse into the entrypoint that made
  * them. Filled in when the device is created (see wsi_register_device). */
+typedef VkResult (VKAPI_PTR *PFN_pvr_QueueSubmit2)(VkQueue, uint32_t, const void *, VkFence);
+typedef void (VKAPI_PTR *PFN_pvr_GetDeviceQueue2)(VkDevice, const void *, VkQueue *);
+
 struct wsi_device_entries {
+    int in_use;
+    int mu_init;
     VkDevice dev;
     uint32_t queue_family;      /* from the create-info: which family the app's queues come from */
+    /* Recursive per-device mutex serializing all HAL queue submits & wait-idles (PowerVR HAL's
+     * vkQueueSubmit is not thread-safe across zcfq0 / present / acquire threads). Lock order:
+     * wsi_lock -> sc->lock -> queue_mu. Unlock queue_mu BEFORE WaitForFences. */
+    pthread_mutex_t queue_mu;
     PFN_vkQueueSubmit QueueSubmit;
+    PFN_pvr_QueueSubmit2 QueueSubmit2;
+    PFN_pvr_QueueSubmit2 QueueSubmit2KHR;
+    PFN_vkQueueWaitIdle QueueWaitIdle;
+    PFN_vkDeviceWaitIdle DeviceWaitIdle;
     PFN_vkCreateFence CreateFence;
     PFN_vkWaitForFences WaitForFences;
     PFN_vkDestroyFence DestroyFence;
     PFN_vkGetDeviceQueue GetDeviceQueue;
+    PFN_pvr_GetDeviceQueue2 GetDeviceQueue2;
+    PFN_vkDestroyDevice DestroyDevice;
 };
-static struct wsi_device_entries g_devs[4];
+#define WSI_MAX_DEVS 64
+#define WSI_MAX_QUEUES 256
+struct wsi_queue_map {
+    int in_use;
+    VkQueue queue;
+    VkDevice dev;
+    struct wsi_device_entries *entry;
+};
+static struct wsi_device_entries g_devs[WSI_MAX_DEVS];
+static struct wsi_queue_map g_queues[WSI_MAX_QUEUES];
 static int g_ndevs;
+static pthread_mutex_t g_devs_mu = PTHREAD_MUTEX_INITIALIZER;
+
+static struct wsi_device_entries *wsi_find_dev_locked(VkDevice dev) {
+    for (int i = 0; i < WSI_MAX_DEVS; i++) {
+        if (g_devs[i].in_use && g_devs[i].dev == dev) return &g_devs[i];
+    }
+    return NULL;
+}
 
 /* Called by the ICD when it creates the device, with the HAL entrypoints already resolved. The
  * queue family comes from the first VkDeviceQueueCreateInfo, which is the family an app's graphics
  * queue is on here -- this device has a single general queue family. */
 void pvr_wsi_register_device(VkDevice dev, uint32_t queue_family, void *queue_submit, void *create_fence,
-                             void *wait_fences, void *destroy_fence, void *get_device_queue) {
-    if (g_ndevs >= 4) return;
-    struct wsi_device_entries *e = &g_devs[g_ndevs++];
+                             void *wait_fences, void *destroy_fence, void *get_device_queue,
+                             void *queue_submit2, void *queue_submit2_khr, void *queue_wait_idle,
+                             void *device_wait_idle, void *get_device_queue2, void *destroy_device) {
+    pthread_mutex_lock(&g_devs_mu);
+    struct wsi_device_entries *e = wsi_find_dev_locked(dev);
+    if (!e) {
+        for (int i = 0; i < WSI_MAX_DEVS; i++) {
+            if (!g_devs[i].in_use) { e = &g_devs[i]; break; }
+        }
+    }
+    if (!e) {
+        e = &g_devs[g_ndevs % WSI_MAX_DEVS];
+    }
+    g_ndevs++;
+    if (!e->mu_init) {
+        pthread_mutexattr_t attr;
+        pthread_mutexattr_init(&attr);
+        pthread_mutexattr_settype(&attr, PTHREAD_MUTEX_RECURSIVE);
+        pthread_mutex_init(&e->queue_mu, &attr);
+        pthread_mutexattr_destroy(&attr);
+        e->mu_init = 1;
+    }
+    e->in_use = 1;
     e->dev = dev;
     e->queue_family = queue_family;
     e->QueueSubmit = (PFN_vkQueueSubmit)queue_submit;
+    e->QueueSubmit2 = (PFN_pvr_QueueSubmit2)queue_submit2;
+    e->QueueSubmit2KHR = (PFN_pvr_QueueSubmit2)queue_submit2_khr;
+    e->QueueWaitIdle = (PFN_vkQueueWaitIdle)queue_wait_idle;
+    e->DeviceWaitIdle = (PFN_vkDeviceWaitIdle)device_wait_idle;
     e->CreateFence = (PFN_vkCreateFence)create_fence;
     e->WaitForFences = (PFN_vkWaitForFences)wait_fences;
     e->DestroyFence = (PFN_vkDestroyFence)destroy_fence;
     e->GetDeviceQueue = (PFN_vkGetDeviceQueue)get_device_queue;
+    e->GetDeviceQueue2 = (PFN_pvr_GetDeviceQueue2)get_device_queue2;
+    e->DestroyDevice = (PFN_vkDestroyDevice)destroy_device;
+    pthread_mutex_unlock(&g_devs_mu);
+}
+
+void pvr_wsi_note_queue(VkDevice dev, VkQueue queue) {
+    if (!dev || !queue) return;
+    pthread_mutex_lock(&g_devs_mu);
+    struct wsi_device_entries *e = wsi_find_dev_locked(dev);
+    int slot = -1;
+    for (int i = 0; i < WSI_MAX_QUEUES; i++) {
+        if (g_queues[i].in_use && g_queues[i].queue == queue) { slot = i; break; }
+        if (!g_queues[i].in_use && slot < 0) slot = i;
+    }
+    if (slot >= 0) {
+        g_queues[slot].in_use = 1;
+        g_queues[slot].queue = queue;
+        g_queues[slot].dev = dev;
+        g_queues[slot].entry = e;
+    }
+    pthread_mutex_unlock(&g_devs_mu);
+}
+
+void pvr_wsi_unregister_device(VkDevice dev) {
+    if (!dev) return;
+    pthread_mutex_lock(&g_devs_mu);
+    for (int i = 0; i < WSI_MAX_QUEUES; i++) {
+        if (g_queues[i].in_use && g_queues[i].dev == dev) {
+            g_queues[i].in_use = 0;
+            g_queues[i].queue = VK_NULL_HANDLE;
+            g_queues[i].dev = VK_NULL_HANDLE;
+            g_queues[i].entry = NULL;
+        }
+    }
+    struct wsi_device_entries *e = wsi_find_dev_locked(dev);
+    if (e) {
+        e->in_use = 0;
+        e->dev = VK_NULL_HANDLE;
+        /* Keep queue_mu initialized so any in-flight caller holding its pointer stays valid. */
+    }
+    pthread_mutex_unlock(&g_devs_mu);
 }
 
 static struct wsi_device_entries *wsi_entries(VkDevice dev) {
-    for (int i = 0; i < g_ndevs; i++) if (g_devs[i].dev == dev) return &g_devs[i];
-    return NULL;
+    pthread_mutex_lock(&g_devs_mu);
+    struct wsi_device_entries *e = wsi_find_dev_locked(dev);
+    pthread_mutex_unlock(&g_devs_mu);
+    return e;
+}
+
+static int wsi_copy_for_dev(VkDevice dev, struct wsi_device_entries *out, pthread_mutex_t **out_mu) {
+    pthread_mutex_lock(&g_devs_mu);
+    struct wsi_device_entries *e = wsi_find_dev_locked(dev);
+    if (!e) {
+        pthread_mutex_unlock(&g_devs_mu);
+        return 0;
+    }
+    *out = *e;
+    *out_mu = &e->queue_mu;
+    pthread_mutex_unlock(&g_devs_mu);
+    return 1;
+}
+
+static int wsi_copy_for_queue(VkQueue queue, struct wsi_device_entries *out, pthread_mutex_t **out_mu) {
+    pthread_mutex_lock(&g_devs_mu);
+    struct wsi_device_entries *e = NULL;
+    for (int i = 0; i < WSI_MAX_QUEUES; i++) {
+        if (g_queues[i].in_use && g_queues[i].queue == queue) {
+            e = g_queues[i].entry;
+            if (!e || !e->in_use) e = wsi_find_dev_locked(g_queues[i].dev);
+            break;
+        }
+    }
+    if (!e) {
+        /* Fallback only if exactly one live device exists. */
+        int active = 0;
+        struct wsi_device_entries *only = NULL;
+        for (int i = 0; i < WSI_MAX_DEVS; i++) {
+            if (g_devs[i].in_use) { active++; only = &g_devs[i]; }
+        }
+        if (active == 1) e = only;
+    }
+    if (!e) {
+        pthread_mutex_unlock(&g_devs_mu);
+        return 0;
+    }
+    *out = *e;
+    *out_mu = &e->queue_mu;
+    pthread_mutex_unlock(&g_devs_mu);
+    return 1;
+}
+
+VkResult VKAPI_PTR pvr_wsi_queue_submit(VkQueue queue, uint32_t submitCount, const VkSubmitInfo *pSubmits, VkFence fence) {
+    struct wsi_device_entries ec;
+    pthread_mutex_t *mu = NULL;
+    if (!wsi_copy_for_queue(queue, &ec, &mu) || !ec.QueueSubmit) {
+        WSI_LOG("queue_submit: unknown queue=%p", (void *)queue);
+        return VK_ERROR_DEVICE_LOST;
+    }
+    pthread_mutex_lock(mu);
+    VkResult r = ec.QueueSubmit(queue, submitCount, pSubmits, fence);
+    pthread_mutex_unlock(mu);
+    return r;
+}
+
+VkResult VKAPI_PTR pvr_wsi_queue_submit2(VkQueue queue, uint32_t submitCount, const void *pSubmits, VkFence fence) {
+    struct wsi_device_entries ec;
+    pthread_mutex_t *mu = NULL;
+    if (!wsi_copy_for_queue(queue, &ec, &mu) || !ec.QueueSubmit2) {
+        WSI_LOG("queue_submit2: missing HAL entry for queue=%p", (void *)queue);
+        return VK_ERROR_DEVICE_LOST;
+    }
+    pthread_mutex_lock(mu);
+    VkResult r = ec.QueueSubmit2(queue, submitCount, pSubmits, fence);
+    pthread_mutex_unlock(mu);
+    return r;
+}
+
+VkResult VKAPI_PTR pvr_wsi_queue_submit2_khr(VkQueue queue, uint32_t submitCount, const void *pSubmits, VkFence fence) {
+    struct wsi_device_entries ec;
+    pthread_mutex_t *mu = NULL;
+    if (!wsi_copy_for_queue(queue, &ec, &mu)) return VK_ERROR_DEVICE_LOST;
+    PFN_pvr_QueueSubmit2 fn = ec.QueueSubmit2KHR ? ec.QueueSubmit2KHR : ec.QueueSubmit2;
+    if (!fn) return VK_ERROR_DEVICE_LOST;
+    pthread_mutex_lock(mu);
+    VkResult r = fn(queue, submitCount, pSubmits, fence);
+    pthread_mutex_unlock(mu);
+    return r;
+}
+
+VkResult VKAPI_PTR pvr_wsi_queue_wait_idle(VkQueue queue) {
+    struct wsi_device_entries ec;
+    pthread_mutex_t *mu = NULL;
+    if (!wsi_copy_for_queue(queue, &ec, &mu) || !ec.QueueWaitIdle) return VK_ERROR_DEVICE_LOST;
+    pthread_mutex_lock(mu);
+    VkResult r = ec.QueueWaitIdle(queue);
+    pthread_mutex_unlock(mu);
+    return r;
+}
+
+VkResult VKAPI_PTR pvr_wsi_device_wait_idle(VkDevice dev) {
+    struct wsi_device_entries ec;
+    pthread_mutex_t *mu = NULL;
+    if (!wsi_copy_for_dev(dev, &ec, &mu) || !ec.DeviceWaitIdle) return VK_ERROR_DEVICE_LOST;
+    pthread_mutex_lock(mu);
+    VkResult r = ec.DeviceWaitIdle(dev);
+    pthread_mutex_unlock(mu);
+    return r;
+}
+
+void VKAPI_PTR pvr_wsi_get_device_queue(VkDevice dev, uint32_t qf, uint32_t qi, VkQueue *pQueue) {
+    struct wsi_device_entries ec;
+    pthread_mutex_t *mu = NULL;
+    PFN_vkGetDeviceQueue fn = wsi_copy_for_dev(dev, &ec, &mu) ? ec.GetDeviceQueue : (PFN_vkGetDeviceQueue)dev_proc(dev, "vkGetDeviceQueue");
+    if (fn) fn(dev, qf, qi, pQueue);
+    if (pQueue && *pQueue) pvr_wsi_note_queue(dev, *pQueue);
+}
+
+void VKAPI_PTR pvr_wsi_get_device_queue2(VkDevice dev, const void *pQueueInfo, VkQueue *pQueue) {
+    struct wsi_device_entries ec;
+    pthread_mutex_t *mu = NULL;
+    PFN_pvr_GetDeviceQueue2 fn = wsi_copy_for_dev(dev, &ec, &mu) ? ec.GetDeviceQueue2 : (PFN_pvr_GetDeviceQueue2)dev_proc(dev, "vkGetDeviceQueue2");
+    if (fn) fn(dev, pQueueInfo, pQueue);
+    if (pQueue && *pQueue) pvr_wsi_note_queue(dev, *pQueue);
+}
+
+void VKAPI_PTR pvr_wsi_destroy_device(VkDevice dev, const VkAllocationCallbacks *alloc) {
+    if (!dev) return;
+    struct wsi_device_entries ec;
+    pthread_mutex_t *mu = NULL;
+    PFN_vkDestroyDevice fn = wsi_copy_for_dev(dev, &ec, &mu) ? ec.DestroyDevice : (PFN_vkDestroyDevice)dev_proc(dev, "vkDestroyDevice");
+    if (fn) fn(dev, alloc);
+    pvr_wsi_unregister_device(dev);
 }
 
 /* Fill a freshly created swapchain image through the TRANSFER path, once, before any app work.
@@ -105,19 +374,19 @@ static void wsi_clear_image_once(VkDevice device, VkQueue queue, VkImage img, Vk
     PFN_vkCmdClearColorImage Clear = (PFN_vkCmdClearColorImage)dev_proc(device, "vkCmdClearColorImage");
     PFN_vkFreeCommandBuffers FreeCB = (PFN_vkFreeCommandBuffers)dev_proc(device, "vkFreeCommandBuffers");
     PFN_vkDestroyCommandPool DestroyPool = (PFN_vkDestroyCommandPool)dev_proc(device, "vkDestroyCommandPool");
-    PFN_vkQueueWaitIdle WaitIdle = (PFN_vkQueueWaitIdle)dev_proc(device, "vkQueueWaitIdle");
-    PFN_vkQueueSubmit Submit = (PFN_vkQueueSubmit)dev_proc(device, "vkQueueSubmit");
-    struct wsi_device_entries *e = wsi_entries(device);
+    struct wsi_device_entries ecopy;
+    pthread_mutex_t *qmu = NULL;
+    int have_dev = wsi_copy_for_dev(device, &ecopy, &qmu);
     WSI_LOG("clear: enter dev=%p pool=%d cb=%d begin=%d end=%d bar=%d clear=%d submit=%d entries=%d qf=%u",
-            (void *)device, !!CreateCommandPool, !!AllocCB, !!Begin, !!End, !!Barrier, !!Clear, !!Submit,
-            !!e, e ? e->queue_family : 0u);
+            (void *)device, !!CreateCommandPool, !!AllocCB, !!Begin, !!End, !!Barrier, !!Clear,
+            have_dev ? !!ecopy.QueueSubmit : 0, have_dev, have_dev ? ecopy.queue_family : 0u);
     /* queue family 0 is a VALID family on this device (there is exactly one), so its value
      * cannot be used to mean "missing" - only the entry itself can. */
-    if (!CreateCommandPool || !AllocCB || !Begin || !End || !Barrier || !Clear || !Submit || !e)
+    if (!CreateCommandPool || !AllocCB || !Begin || !End || !Barrier || !Clear || !have_dev || !ecopy.QueueSubmit)
         return;
 
     VkCommandPoolCreateInfo pci = { VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO };
-    pci.queueFamilyIndex = e->queue_family;
+    pci.queueFamilyIndex = ecopy.queue_family;
     pci.flags = VK_COMMAND_POOL_CREATE_TRANSIENT_BIT;
     VkCommandPool pool = VK_NULL_HANDLE;
     if (CreateCommandPool(device, &pci, NULL, &pool) != VK_SUCCESS) return;
@@ -155,10 +424,20 @@ static void wsi_clear_image_once(VkDevice device, VkQueue queue, VkImage img, Vk
         ok = End(cb) == VK_SUCCESS;
     }
     if (ok) {
+        VkFence f = VK_NULL_HANDLE;
+        if (ecopy.CreateFence) {
+            VkFenceCreateInfo fci = { VK_STRUCTURE_TYPE_FENCE_CREATE_INFO };
+            ecopy.CreateFence(device, &fci, NULL, &f);
+        }
         VkSubmitInfo si = { VK_STRUCTURE_TYPE_SUBMIT_INFO };
         si.commandBufferCount = 1; si.pCommandBuffers = &cb;
-        ok = Submit(queue, 1, &si, VK_NULL_HANDLE) == VK_SUCCESS;
-        if (ok && WaitIdle) WaitIdle(queue);
+        pthread_mutex_lock(qmu);
+        ok = ecopy.QueueSubmit(queue, 1, &si, f) == VK_SUCCESS;
+        pthread_mutex_unlock(qmu);
+        if (ok && f != VK_NULL_HANDLE && ecopy.WaitForFences) {
+            ok = ecopy.WaitForFences(device, 1, &f, VK_TRUE, 1000000000ull) == VK_SUCCESS;
+        }
+        if (f != VK_NULL_HANDLE && ecopy.DestroyFence) ecopy.DestroyFence(device, f, NULL);
     }
     if (FreeCB) FreeCB(device, pool, 1, &cb);
     if (DestroyPool) DestroyPool(device, pool, NULL);
@@ -169,12 +448,16 @@ static void wsi_clear_image_once(VkDevice device, VkQueue queue, VkImage img, Vk
 /* The HAL's vkQueueSubmit: signal [sem] and/or complete [fence] on [queue] with an empty submit. */
 static int wsi_signal_on_queue(VkDevice dev, VkQueue queue, VkFence fence, VkSemaphore sem) {
     if (!fence && !sem) return 1;
-    struct wsi_device_entries *e = wsi_entries(dev);
-    if (!e || !e->QueueSubmit || !queue) return 0;
+    struct wsi_device_entries ecopy;
+    pthread_mutex_t *qmu = NULL;
+    if (!wsi_copy_for_dev(dev, &ecopy, &qmu) || !ecopy.QueueSubmit || !queue) return 0;
     VkSubmitInfo si = { VK_STRUCTURE_TYPE_SUBMIT_INFO };
     si.signalSemaphoreCount = sem ? 1 : 0;
     si.pSignalSemaphores = sem ? &sem : NULL;
-    return e->QueueSubmit(queue, 1, &si, fence) == VK_SUCCESS;
+    pthread_mutex_lock(qmu);
+    VkResult r = ecopy.QueueSubmit(queue, 1, &si, fence);
+    pthread_mutex_unlock(qmu);
+    return r == VK_SUCCESS;
 }
 
 
@@ -195,7 +478,13 @@ struct wsi_surface {
     /* X11 (kind == WSI_X11) */
     xcb_connection_t *c;
     xcb_window_t window;
+    xcb_gcontext_t gc;
     uint8_t x_depth, x_bpp;
+    int has_dri3, has_present;
+    /* Filled on the first caps query for this surface: the physical device and its memory types, so
+     * the present-time readback can find a host-visible type (the HAL exposes none that is also
+     * coherent, and the swapchain used to keep an all-zero copy of this struct). */
+    void *pd; VkPhysicalDeviceMemoryProperties memProps; int have_mem;
     int32_t width, height;
 };
 
@@ -222,16 +511,27 @@ static struct wl_registry_listener g_reg_listener = { reg_global, reg_remove };
 /* Track one display->dmabuf binding, discovery done once per display. */
 static struct wsi_display g_displays[8];
 static int g_ndisplays;
+static pthread_mutex_t g_display_mu = PTHREAD_MUTEX_INITIALIZER;
 
 static struct wsi_display *wsi_for_display(struct wl_display *d) {
-    for (int i = 0; i < g_ndisplays; i++) if (g_displays[i].display == d) return &g_displays[i];
-    if (g_ndisplays >= 8) return NULL;
+    pthread_mutex_lock(&g_display_mu);
+    for (int i = 0; i < g_ndisplays; i++) {
+        if (g_displays[i].display == d) {
+            pthread_mutex_unlock(&g_display_mu);
+            return &g_displays[i];
+        }
+    }
+    if (g_ndisplays >= 8) {
+        pthread_mutex_unlock(&g_display_mu);
+        return NULL;
+    }
     struct wsi_display *wd = &g_displays[g_ndisplays++];
     wd->display = d;
     wd->registry = wl_display_get_registry(d);
     wl_registry_add_listener(wd->registry, &g_reg_listener, wd);
     wl_display_roundtrip(d);   /* fire the globals */
     wl_display_roundtrip(d);   /* dmabuf format events */
+    pthread_mutex_unlock(&g_display_mu);
     return wd;
 }
 
@@ -291,8 +591,8 @@ static VkResult wsi_create_xcb_surface(VkInstance instance, const VkXcbSurfaceCr
     (void)instance; (void)alloc;
     if (!ci || !ci->connection || !ci->window) return VK_ERROR_INITIALIZATION_FAILED;
     xcb_connection_t *c = (xcb_connection_t *)ci->connection;
-    xcb_query_extension_reply_t *dri3 = xcb_get_extension_data(c, &xcb_dri3_id);
-    xcb_query_extension_reply_t *present = xcb_get_extension_data(c, &xcb_present_id);
+    const xcb_query_extension_reply_t *dri3 = xcb_get_extension_data(c, &xcb_dri3_id);
+    const xcb_query_extension_reply_t *present = xcb_get_extension_data(c, &xcb_present_id);
     if (!dri3 || !dri3->present || !present || !present->present) {
         WSI_LOG("X server has no DRI3/Present (%d/%d); present will be unavailable",
                 dri3 ? dri3->present : 0, present ? present->present : 0);
@@ -300,6 +600,8 @@ static VkResult wsi_create_xcb_surface(VkInstance instance, const VkXcbSurfaceCr
     struct wsi_surface *s = calloc(1, sizeof(*s));
     if (!s) return VK_ERROR_OUT_OF_HOST_MEMORY;
     s->kind = WSI_X11; s->c = c; s->window = ci->window;
+    s->has_dri3 = (dri3 && dri3->present) ? 1 : 0;
+    s->has_present = (present && present->present) ? 1 : 0;
     /* The window's own depth, not an assumed 24: a DRI3 pixmap whose depth differs from its window
      * is a protocol error. depth 24 draws into a 32-bit pixmap, so the bpp is the depth rounded up. */
     xcb_get_geometry_cookie_t gc = xcb_get_geometry(c, ci->window);
@@ -330,15 +632,33 @@ static VkResult wsi_create_xlib_surface(VkInstance instance, const VkXlibSurface
 
 static void wsi_destroy_surface(VkInstance instance, VkSurfaceKHR surface, const VkAllocationCallbacks *alloc) {
     (void)instance; (void)alloc;
-    free((struct wsi_surface *)surface);
+    struct wsi_surface *s = (struct wsi_surface *)surface;
+    if (s && s->kind == WSI_X11 && s->gc && s->c && !xcb_connection_has_error(s->c))
+        xcb_free_gc(s->c, s->gc);
+    free(s);
 }
 
 /* ---- surface queries ------------------------------------------------------------ */
+
+static VkPhysicalDeviceMemoryProperties g_cached_memProps;
+static int g_have_cached_mem = 0;
+static pthread_mutex_t g_memprops_mu = PTHREAD_MUTEX_INITIALIZER;
 
 static VkResult wsi_surface_caps(VkPhysicalDevice pd, VkSurfaceKHR surface, VkSurfaceCapabilitiesKHR *caps) {
     (void)pd;
     struct wsi_surface *s = (struct wsi_surface *)surface;
     memset(caps, 0, sizeof(*caps));
+    { extern int pvr_icd_mem_props(void *, void *);
+      if (pd && !s->have_mem) {
+          if (pvr_icd_mem_props((void *)pd, &s->memProps) == 0 && s->memProps.memoryTypeCount > 0) {
+              s->pd = (void *)pd;
+              s->have_mem = 1;
+              pthread_mutex_lock(&g_memprops_mu);
+              g_cached_memProps = s->memProps;
+              g_have_cached_mem = 1;
+              pthread_mutex_unlock(&g_memprops_mu);
+          }
+      } }
     caps->minImageCount = 2;
     caps->maxImageCount = 3;
     /* The size of the window this presents into, re-read every time. Reporting a hardcoded extent is
@@ -357,15 +677,10 @@ static VkResult wsi_surface_caps(VkPhysicalDevice pd, VkSurfaceKHR surface, VkSu
             s->width = s->height = -1;   /* unreadable: let the app pick, see below */
         }
     } else if (s->kind == WSI_WAYLAND && s->surface) {
-        /* wl_surface has no size of its own before a buffer is committed. The output mode is the
-         * best available size for a fullscreen surface (the game runs fullscreen in gamescope);
-         * without it the client picks 1x1. Re-read each call so a mode change is picked up. */
-        if (s->wd && s->wd->out_w > 0 && s->wd->out_h > 0) {
-            s->width = s->wd->out_w;
-            s->height = s->wd->out_h;
-        } else {
-            s->width = s->height = -1;
-        }
+        /* Per VK_KHR_wayland_surface, a Wayland surface does not dictate a fixed extent;
+         * reporting UINT32_MAX lets the client (e.g. Zink/CEF) choose the swapchain size that
+         * matches its actual buffer instead of forcing the compositor's output mode. */
+        s->width = s->height = -1;
     }
     /* DIAG (Phase 2): log every caps query with surface identity + the returned currentExtent, so the
      * main UI surface and the update-UI surface can be told apart and their extents compared. For an
@@ -376,11 +691,15 @@ static VkResult wsi_surface_caps(VkPhysicalDevice pd, VkSurfaceKHR surface, VkSu
         xcb_get_window_attributes_reply_t *a = xcb_get_window_attributes_reply(s->c, ac, NULL);
         if (a) { mapst = a->map_state; free(a); }
     }
-    WSI_LOG("caps: surf=%p kind=%d window=0x%x geom=%dx%d out=%dx%d map=%d -> currentExtent=%ux%u",
-            (void *)s, s->kind, (unsigned)s->window, s->width, s->height,
-            s->wd ? s->wd->out_w : -1, s->wd ? s->wd->out_h : -1, mapst,
-            (s->width <= 0 || s->height <= 0) ? UINT32_MAX : (uint32_t)s->width,
-            (s->width <= 0 || s->height <= 0) ? UINT32_MAX : (uint32_t)s->height);
+    { static int cap_n;
+      if (cap_n < 16 || wsi_verbose_log()) {
+          cap_n++;
+          WSI_LOG("caps: surf=%p kind=%d window=0x%x geom=%dx%d out=%dx%d map=%d -> currentExtent=%ux%u",
+                  (void *)s, s->kind, (unsigned)s->window, s->width, s->height,
+                  s->wd ? s->wd->out_w : -1, s->wd ? s->wd->out_h : -1, mapst,
+                  (s->width <= 0 || s->height <= 0) ? UINT32_MAX : (uint32_t)s->width,
+                  (s->width <= 0 || s->height <= 0) ? UINT32_MAX : (uint32_t)s->height);
+      } }
     if (s->width <= 0 || s->height <= 0) {
         caps->currentExtent.width = UINT32_MAX;
         caps->currentExtent.height = UINT32_MAX;
@@ -454,11 +773,23 @@ static VkResult wsi_surface_present_modes(VkPhysicalDevice pd, VkSurfaceKHR surf
 
 /* ---- swapchain ------------------------------------------------------------------ */
 
-struct wsi_swapchain_image { VkImage image; VkDeviceMemory mem; int fd; struct wl_buffer *buffer; xcb_pixmap_t pixmap; };
+struct wsi_swapchain_image {
+    VkImage image;              /* LINEAR, dma-buf exportable: what gamescope imports */
+    VkDeviceMemory mem;
+    int fd; struct wl_buffer *buffer; xcb_pixmap_t pixmap;
+    int busy;                   /* held by Wayland compositor until wl_buffer.release fires */
+    int acquired;               /* checked out by AcquireNextImage until QueuePresent */
+    /* What the app actually renders into. The HAL's render-pass writes into a LINEAR image are the
+     * incomplete path (see wsi_clear_image_once), so the visible image is filled by a copy from this
+     * one at present time rather than being drawn into directly. */
+    VkImage render; VkDeviceMemory render_mem;
+};
 struct wsi_swapchain {
     VkSwapchainKHR handle;
     VkDevice device;
     struct wsi_surface *surface;
+    struct wl_event_queue *wl_queue;
+    struct zwp_linux_dmabuf_v1 *dmabuf_wrap;
     uint32_t count;
     uint32_t pending;  /* the image the next acquire hands out */
     int32_t width, height;
@@ -478,6 +809,10 @@ struct wsi_swapchain {
     PFN_vkFreeMemory FreeMemory; PFN_vkDestroyImage DestroyImage;
     PFN_vkGetMemoryFdKHR GetMemoryFdKHR; PFN_vkGetPhysicalDeviceMemoryProperties GetPhysDevMemProps;
     VkPhysicalDeviceMemoryProperties memProps;
+    /* Persistent present-time copy resources (created on first use): allocating a pool, a command
+     * buffer and a fence per present would add churn to every frame, which is the kind of stutter
+     * that reads as flashing. */
+    VkCommandPool blit_pool; VkCommandBuffer blit_cb; VkFence blit_fence;
 };
 
 /* The device lock, held across an acquire so the image index, the release fence and the signal
@@ -485,16 +820,40 @@ struct wsi_swapchain {
  * buffer is handed to the compositor. See the note on [struct wsi_swapchain]. */
 static pthread_mutex_t wsi_lock = PTHREAD_MUTEX_INITIALIZER;
 
-/* One fd per buffer, carried to the release listener through wl_buffer user_data. */
-struct wsi_buffer_binding { struct wsi_swapchain *sc; uint32_t index; };
-
+/* Each swapchain image keeps one wl_buffer for the lifetime of the swapchain and is destroyed
+ * once in wsi_destroy_swapchain; destroying/freeing inside buffer_release caused double-frees
+ * and use-after-free on sc when events drained after reuse or swapchain teardown. Using a
+ * dedicated wl_event_queue per swapchain lets us clear img->busy safely under sc->lock without
+ * touching the app's own Wayland queue. */
 static void buffer_release(void *data, struct wl_buffer *buffer) {
-    struct wsi_buffer_binding *b = data;
-    if (b && b->sc) b->sc->images[b->index].buffer = NULL;  /* reusable again */
-    wl_buffer_destroy(buffer);
-    free(b);
+    (void)buffer;
+    struct wsi_swapchain_image *img = (struct wsi_swapchain_image *)data;
+    if (img) img->busy = 0;
 }
 static const struct wl_buffer_listener g_buffer_listener = { buffer_release };
+
+static void wsi_drain_wl_queue(struct wsi_swapchain *sc, int wait_ms) {
+    if (!sc || !sc->wl_queue || !sc->surface || !sc->surface->display) return;
+    struct wl_display *d = sc->surface->display;
+    if (wl_display_dispatch_queue_pending(d, sc->wl_queue) > 0 || wait_ms <= 0) return;
+    for (int tries = 0; tries < 4; tries++) {
+        if (wl_display_prepare_read_queue(d, sc->wl_queue) == 0) {
+            wl_display_flush(d);
+            struct pollfd pfd;
+            pfd.fd = wl_display_get_fd(d);
+            pfd.events = POLLIN;
+            pfd.revents = 0;
+            if (pfd.fd >= 0 && poll(&pfd, 1, wait_ms) > 0 && (pfd.revents & POLLIN)) {
+                wl_display_read_events(d);
+            } else {
+                wl_display_cancel_read(d);
+            }
+            wl_display_dispatch_queue_pending(d, sc->wl_queue);
+            break;
+        }
+        if (wl_display_dispatch_queue_pending(d, sc->wl_queue) <= 0) break;
+    }
+}
 
 static VkResult wsi_create_swapchain(VkDevice device, const VkSwapchainCreateInfoKHR *ci,
                                      const VkAllocationCallbacks *alloc, VkSwapchainKHR *out) {
@@ -502,11 +861,22 @@ static VkResult wsi_create_swapchain(VkDevice device, const VkSwapchainCreateInf
     struct wsi_swapchain *sc = calloc(1, sizeof(*sc));
     if (!sc) return VK_ERROR_OUT_OF_HOST_MEMORY;
     pthread_mutex_init(&sc->lock, NULL);
+    for (uint32_t i = 0; i < 3; i++) sc->images[i].fd = -1;
     sc->device = device; sc->surface = surf; sc->pending = 0;
+    if (surf && surf->kind == WSI_WAYLAND && surf->display && surf->dmabuf) {
+        sc->wl_queue = wl_display_create_queue(surf->display);
+        if (sc->wl_queue) {
+            sc->dmabuf_wrap = (struct zwp_linux_dmabuf_v1 *)wl_proxy_create_wrapper(surf->dmabuf);
+            if (sc->dmabuf_wrap) wl_proxy_set_queue((struct wl_proxy *)sc->dmabuf_wrap, sc->wl_queue);
+        }
+    }
     /* The queue the app renders on and will present to. It may not have asked the HAL for it yet, so
      * fetch it here and let its own vkGetDeviceQueue return the same one. */
     struct wsi_device_entries *de = wsi_entries(device);
-    if (de && de->GetDeviceQueue) de->GetDeviceQueue(device, de->queue_family, 0, &sc->queue);
+    if (de && de->GetDeviceQueue) {
+        de->GetDeviceQueue(device, de->queue_family, 0, &sc->queue);
+        if (sc->queue) pvr_wsi_note_queue(device, sc->queue);
+    }
     sc->width = ci->imageExtent.width; sc->height = ci->imageExtent.height;
     /* DIAG (Phase 2): what the caller asked for and which surface it is. */
     WSI_LOG("create_swapchain: surf=%p kind=%d window=0x%x requested=%ux%u minImg=%u",
@@ -523,6 +893,23 @@ static VkResult wsi_create_swapchain(VkDevice device, const VkSwapchainCreateInf
     sc->DestroyImage = (PFN_vkDestroyImage)dev_proc(device, "vkDestroyImage");
     sc->GetMemoryFdKHR = (PFN_vkGetMemoryFdKHR)dev_proc(device, "vkGetMemoryFdKHR");
     (void)sc->GetPhysDevMemProps;
+    { extern int pvr_icd_mem_props(void *, void *);
+      pthread_mutex_lock(&g_memprops_mu);
+      if (surf && !surf->have_mem) {
+          if (pvr_icd_mem_props(surf->pd, &surf->memProps) == 0 && surf->memProps.memoryTypeCount > 0) {
+              surf->have_mem = 1;
+              g_cached_memProps = surf->memProps;
+              g_have_cached_mem = 1;
+          }
+      }
+      if (surf && surf->have_mem) {
+          sc->memProps = surf->memProps;
+      } else if (g_have_cached_mem) {
+          sc->memProps = g_cached_memProps;
+      } else {
+          pvr_icd_mem_props(NULL, &sc->memProps);
+      }
+      pthread_mutex_unlock(&g_memprops_mu); }
 
     VkExternalMemoryImageCreateInfo emi = { VK_STRUCTURE_TYPE_EXTERNAL_MEMORY_IMAGE_CREATE_INFO };
     emi.handleTypes = VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT;
@@ -555,11 +942,33 @@ static VkResult wsi_create_swapchain(VkDevice device, const VkSwapchainCreateInf
         if (r != VK_SUCCESS) { WSI_LOG("vkAllocateMemory failed %d", r); goto fail; }
         r = sc->BindImageMemory(device, sc->images[i].image, sc->images[i].mem, 0);
         if (r != VK_SUCCESS) goto fail;
+        /* The render target the app is handed: TILING_OPTIMAL, no external handle, same format and
+         * extent, with the transfer source bit the present-time copy needs. */
+        {
+            VkImageCreateInfo rici = ici;
+            rici.pNext = NULL;
+            rici.tiling = VK_IMAGE_TILING_OPTIMAL;
+            rici.usage = ci->imageUsage | VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT |
+                         VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT;
+            rici.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+            r = sc->CreateImage(device, &rici, alloc, &sc->images[i].render);
+            if (r != VK_SUCCESS) { WSI_LOG("render image create failed %d", r); goto fail; }
+            VkMemoryRequirements rmr; sc->GetImageMemoryRequirements(device, sc->images[i].render, &rmr);
+            VkMemoryDedicatedAllocateInfo rded = { VK_STRUCTURE_TYPE_MEMORY_DEDICATED_ALLOCATE_INFO };
+            rded.image = sc->images[i].render;
+            VkMemoryAllocateInfo rmai = { VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO };
+            rmai.pNext = &rded; rmai.allocationSize = rmr.size; rmai.memoryTypeIndex = 0;
+            for (uint32_t t = 0; t < 32; t++) if (rmr.memoryTypeBits & (1u << t)) { rmai.memoryTypeIndex = t; break; }
+            r = sc->AllocateMemory(device, &rmai, alloc, &sc->images[i].render_mem);
+            if (r != VK_SUCCESS) { WSI_LOG("render image alloc failed %d", r); goto fail; }
+            r = sc->BindImageMemory(device, sc->images[i].render, sc->images[i].render_mem, 0);
+            if (r != VK_SUCCESS) { WSI_LOG("render image bind failed %d", r); goto fail; }
+        }
         /* The real pitch, not width*4: a linear image may be padded, and the wl_buffer must be told
          * the pitch the driver actually used or the compositor reads the wrong rows. */
-        VkImageSubresourceLayers sl = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 };
+        VkImageSubresource subres = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0 };
         VkSubresourceLayout layout; memset(&layout, 0, sizeof(layout));
-        if (sc->GetImageSubresourceLayout) sc->GetImageSubresourceLayout(device, sc->images[i].image, &sl, &layout);
+        if (sc->GetImageSubresourceLayout) sc->GetImageSubresourceLayout(device, sc->images[i].image, &subres, &layout);
         sc->stride = (uint32_t)(layout.rowPitch > 0 ? layout.rowPitch : (uint32_t)(sc->width * 4));
         /* Is the allocation big enough for the rows we are about to describe? If it is not, the
          * tail of every described row lies outside the memory the buffer can reach, and a reader
@@ -581,9 +990,15 @@ static VkResult wsi_create_swapchain(VkDevice device, const VkSwapchainCreateInf
         sc->images[i].fd = -1;
         if (sc->GetMemoryFdKHR) sc->GetMemoryFdKHR(device, &gfi, &sc->images[i].fd);
         /* Write every row once, through the transfer path that is measured to cover the whole image
-         * (see wsi_clear_image_once). The app's first render pass must not be the first writer. */
+         * (see wsi_clear_image_once), and clear sc->images[i].render too so both start in GENERAL. */
+        pthread_mutex_lock(&wsi_lock);
         wsi_clear_image_once(device, sc->queue, sc->images[i].image, ci->imageFormat,
                              (uint32_t)sc->width, (uint32_t)sc->height);
+        if (sc->images[i].render != VK_NULL_HANDLE) {
+            wsi_clear_image_once(device, sc->queue, sc->images[i].render, ci->imageFormat,
+                                 (uint32_t)sc->width, (uint32_t)sc->height);
+        }
+        pthread_mutex_unlock(&wsi_lock);
         made = i + 1;
     }
     WSI_LOG("swapchain: %u images %dx%d stride %u fmt %d (fd0=%d)", sc->count, sc->width, sc->height,
@@ -592,11 +1007,17 @@ static VkResult wsi_create_swapchain(VkDevice device, const VkSwapchainCreateInf
     return VK_SUCCESS;
 fail:
     /* Destroy what was made, so a failure to build the swapchain does not leak images, memory and fds. */
-    for (uint32_t i = 0; i < made; i++) {
+    (void)made;
+    for (uint32_t i = 0; i < sc->count; i++) {
         if (sc->images[i].fd >= 0) { close(sc->images[i].fd); sc->images[i].fd = -1; }
-        if (sc->images[i].image) sc->DestroyImage(device, sc->images[i].image, alloc);
-        if (sc->images[i].mem) sc->FreeMemory(device, sc->images[i].mem, alloc);
+        if (sc->images[i].render && sc->DestroyImage) sc->DestroyImage(device, sc->images[i].render, alloc);
+        if (sc->images[i].render_mem && sc->FreeMemory) sc->FreeMemory(device, sc->images[i].render_mem, alloc);
+        if (sc->images[i].image && sc->DestroyImage) sc->DestroyImage(device, sc->images[i].image, alloc);
+        if (sc->images[i].mem && sc->FreeMemory) sc->FreeMemory(device, sc->images[i].mem, alloc);
     }
+    if (sc->dmabuf_wrap) { wl_proxy_wrapper_destroy(sc->dmabuf_wrap); sc->dmabuf_wrap = NULL; }
+    if (sc->wl_queue) { wl_event_queue_destroy(sc->wl_queue); sc->wl_queue = NULL; }
+    pthread_mutex_destroy(&sc->lock);
     free(sc);
     return VK_ERROR_INITIALIZATION_FAILED;
 }
@@ -605,17 +1026,43 @@ static void wsi_destroy_swapchain(VkDevice device, VkSwapchainKHR sw, const VkAl
     struct wsi_swapchain *sc = (struct wsi_swapchain *)sw;
     if (!sc) return;
     WSI_LOG("destroy_swapchain: sw=%p %dx%d", (void *)sw, sc->width, sc->height);
+    pthread_mutex_lock(&wsi_lock);
+    struct wsi_device_entries ecopy;
+    pthread_mutex_t *qmu = NULL;
+    int have_dev = wsi_copy_for_dev(device, &ecopy, &qmu);
+    if (have_dev && ecopy.QueueWaitIdle && sc->queue) {
+        pthread_mutex_lock(qmu);
+        ecopy.QueueWaitIdle(sc->queue);
+        pthread_mutex_unlock(qmu);
+    }
+    if (sc->blit_fence && have_dev && ecopy.DestroyFence) {
+        ecopy.DestroyFence(device, sc->blit_fence, alloc);
+        sc->blit_fence = VK_NULL_HANDLE;
+    }
+    if (sc->blit_pool) {
+        PFN_vkDestroyCommandPool pDestroyPool = (PFN_vkDestroyCommandPool)dev_proc(device, "vkDestroyCommandPool");
+        if (pDestroyPool) pDestroyPool(device, sc->blit_pool, alloc);
+        sc->blit_pool = VK_NULL_HANDLE;
+        sc->blit_cb = VK_NULL_HANDLE;
+    }
     /* The compositor may still hold a wl_buffer on a presented image; drop our reference without
-     * waiting, then release everything we own. fds, images and memory are closed/destroyed so a
-     * swapchain teardown does not leak one per resize. */
+     * waiting, then release everything we own. Destroy wl_buffers BEFORE wl_queue/wrapper. */
     for (uint32_t i = 0; i < sc->count; i++) {
         if (sc->images[i].buffer) { wl_buffer_destroy(sc->images[i].buffer); sc->images[i].buffer = NULL; }
-        if (sc->images[i].pixmap && sc->surface && sc->surface->kind == WSI_X11)
+        if (sc->images[i].pixmap && sc->surface && sc->surface->kind == WSI_X11 &&
+            sc->surface->c && !xcb_connection_has_error(sc->surface->c)) {
             xcb_free_pixmap(sc->surface->c, sc->images[i].pixmap);
+            xcb_flush(sc->surface->c);
+        }
         if (sc->images[i].fd >= 0) { close(sc->images[i].fd); sc->images[i].fd = -1; }
+        if (sc->images[i].render && sc->DestroyImage) sc->DestroyImage(device, sc->images[i].render, alloc);
+        if (sc->images[i].render_mem && sc->FreeMemory) sc->FreeMemory(device, sc->images[i].render_mem, alloc);
         if (sc->images[i].image && sc->DestroyImage) sc->DestroyImage(device, sc->images[i].image, alloc);
         if (sc->images[i].mem && sc->FreeMemory) sc->FreeMemory(device, sc->images[i].mem, alloc);
     }
+    if (sc->dmabuf_wrap) { wl_proxy_wrapper_destroy(sc->dmabuf_wrap); sc->dmabuf_wrap = NULL; }
+    if (sc->wl_queue) { wl_event_queue_destroy(sc->wl_queue); sc->wl_queue = NULL; }
+    pthread_mutex_unlock(&wsi_lock);
     pthread_mutex_destroy(&sc->lock);
     free(sc);
 }
@@ -626,21 +1073,59 @@ static VkResult wsi_get_swapchain_images(VkDevice device, VkSwapchainKHR sw, uin
     WSI_LOG("get_images: sw=%p want=%u have=%u -> %s", (void *)sw, images ? *count : 0, sc->count, images ? "fill" : "count");
     if (!images) { *count = sc->count; return VK_SUCCESS; }
     uint32_t n = *count < sc->count ? *count : sc->count;
-    for (uint32_t i = 0; i < n; i++) images[i] = sc->images[i].image;
+    for (uint32_t i = 0; i < n; i++) images[i] = sc->images[i].render ? sc->images[i].render : sc->images[i].image;
     *count = n;
     return VK_SUCCESS;
+}
+
+static uint32_t wsi_pick_free_image(struct wsi_swapchain *sc, int require_unbusy) {
+    for (uint32_t k = 0; k < sc->count; k++) {
+        uint32_t j = (sc->pending + k) % sc->count;
+        if (!sc->images[j].acquired && (!require_unbusy || !sc->images[j].busy)) return j;
+    }
+    return UINT32_MAX;
 }
 
 static VkResult wsi_acquire_next_image(VkDevice device, VkSwapchainKHR sw, uint64_t timeout,
                                        VkSemaphore sem, VkFence fence, uint32_t *index) {
     (void)timeout;
-    WSI_LOG("acquire: enter sw=%p sem=%p fence=%p", (void *)sw, (void *)sem, (void *)fence);
+    static int acq_log_n = 0;
+    int log_it = (acq_log_n < 16 || wsi_verbose_log());
+    if (log_it) {
+        acq_log_n++;
+        WSI_LOG("acquire: enter sw=%p sem=%p fence=%p", (void *)sw, (void *)sem, (void *)fence);
+    }
     if (!sw || !index) return VK_ERROR_INITIALIZATION_FAILED;
     struct wsi_swapchain *sc = (struct wsi_swapchain *)sw;
     pthread_mutex_lock(&sc->lock);
-    uint32_t idx = sc->pending;
+    if (sc->wl_queue) wsi_drain_wl_queue(sc, 0);
+    uint32_t idx = wsi_pick_free_image(sc, 1);
+    int wait_ms = (timeout == 0) ? 0 : (timeout >= 250000000ull ? 250 : (int)((timeout + 999999ull) / 1000000ull));
+    if (timeout > 0 && wait_ms < 1) wait_ms = 1;
+    for (int waited = 0; idx == UINT32_MAX && sc->wl_queue && waited < wait_ms; ) {
+        int slice = wait_ms - waited;
+        if (slice > 25) slice = 25;
+        wsi_drain_wl_queue(sc, slice);
+        waited += slice;
+        idx = wsi_pick_free_image(sc, 1);
+    }
+    if (idx == UINT32_MAX && timeout == 0) {
+        pthread_mutex_unlock(&sc->lock);
+        return VK_NOT_READY;
+    }
+    if (idx == UINT32_MAX) {
+        static int busy_acq_warn = 0;
+        if (busy_acq_warn < 8) {
+            busy_acq_warn++;
+            WSI_LOG("acquire: sw=%p no unbusy image after %dms, falling back", (void *)sw, wait_ms);
+        }
+        idx = wsi_pick_free_image(sc, 0);
+    }
+    if (idx == UINT32_MAX) idx = sc->pending;
+    sc->images[idx].acquired = 1;
     sc->pending = (idx + 1) % sc->count;
     int ok = wsi_signal_on_queue(device, sc->queue, fence, sem);
+    if (!ok && (sem || fence)) sc->images[idx].acquired = 0;
     pthread_mutex_unlock(&sc->lock);
     if (!ok && (sem || fence)) {
         /* Say so rather than hand back an image the app will wait on forever. */
@@ -648,7 +1133,7 @@ static VkResult wsi_acquire_next_image(VkDevice device, VkSwapchainKHR sw, uint6
         return VK_ERROR_INITIALIZATION_FAILED;
     }
     *index = idx;
-    WSI_LOG("acquire: sw=%p -> image %u", (void *)sw, idx);
+    if (log_it) WSI_LOG("acquire: sw=%p -> image %u", (void *)sw, idx);
     return VK_SUCCESS;
 }
 
@@ -666,114 +1151,818 @@ static VkResult wsi_acquire_next_image2(VkDevice device, const VkAcquireNextImag
 
 /* ---- present: dmabuf fd -> wl_buffer -> attach -> commit ------------------------ */
 
-/* Wait for a binary semaphore the app signaled through vkQueueSubmit. There is no host-side
- * vkWaitSemaphores for a binary semaphore (that entrypoint is for timelines), so the wait is
- * expressed as a queue operation: an empty submit that takes the semaphore as a WAIT and a fresh
- * fence, then a wait on that fence. The timeout exists only so a semaphore that never signals is
- * reported instead of hanging the session. */
-static VkResult wsi_wait_binary(VkDevice dev, VkQueue queue, VkSemaphore sem) {
-    struct wsi_device_entries *e = wsi_entries(dev);
-    if (!e || !e->QueueSubmit || !e->CreateFence || !e->WaitForFences || !e->DestroyFence) {
+/* Wait for binary semaphores the app signaled through vkQueueSubmit. There is no host-side
+ * vkWaitSemaphores for binary semaphores, so the wait is expressed as a single queue operation: an
+ * empty submit taking all wait semaphores and a fresh fence, then waiting on that fence outside
+ * queue_mu so other threads (like Zink's zcfq0) can keep submitting without deadlocking. */
+static VkResult wsi_wait_semaphores(VkDevice dev, VkQueue queue, uint32_t count, const VkSemaphore *sems) {
+    if (!count || !sems) return VK_SUCCESS;
+    struct wsi_device_entries ecopy;
+    pthread_mutex_t *qmu = NULL;
+    if (!wsi_copy_for_dev(dev, &ecopy, &qmu) || !ecopy.QueueSubmit || !ecopy.CreateFence ||
+        !ecopy.WaitForFences || !ecopy.DestroyFence) {
         WSI_LOG("present: no HAL fence entries for %p; not waiting on the semaphore", (void *)dev);
         return VK_ERROR_INITIALIZATION_FAILED;
     }
-    VkFenceCreateInfo fci = { VK_STRUCTURE_TYPE_FENCE_CREATE_INFO };
-    VkFence f = VK_NULL_HANDLE;
-    VkResult r = e->CreateFence(dev, &fci, NULL, &f);
-    if (r != VK_SUCCESS) return r;
-    VkPipelineStageFlags stage = VK_PIPELINE_STAGE_ALL_COMMANDS_BIT;
-    VkSubmitInfo si = { VK_STRUCTURE_TYPE_SUBMIT_INFO };
-    si.waitSemaphoreCount = 1; si.pWaitSemaphores = &sem; si.pWaitDstStageMask = &stage;
-    r = e->QueueSubmit(queue, 1, &si, f);
-    if (r == VK_SUCCESS) r = e->WaitForFences(dev, 1, &f, VK_TRUE, 1000000000ull /* 1s */);
-    e->DestroyFence(dev, f, NULL);
+    VkSemaphore local_sems[16];
+    VkPipelineStageFlags local_stages[16];
+    VkSemaphore *wsems = count <= 16 ? local_sems : malloc(sizeof(VkSemaphore) * count);
+    VkPipelineStageFlags *wstages = count <= 16 ? local_stages : malloc(sizeof(VkPipelineStageFlags) * count);
+    if (!wsems || !wstages) {
+        if (wsems != local_sems) free(wsems);
+        if (wstages != local_stages) free(wstages);
+        return VK_ERROR_OUT_OF_HOST_MEMORY;
+    }
+    uint32_t n = 0;
+    for (uint32_t i = 0; i < count; i++) {
+        if (sems[i] != VK_NULL_HANDLE) {
+            wsems[n] = sems[i];
+            wstages[n] = VK_PIPELINE_STAGE_ALL_COMMANDS_BIT;
+            n++;
+        }
+    }
+    VkResult r = VK_SUCCESS;
+    if (n > 0) {
+        VkFenceCreateInfo fci = { VK_STRUCTURE_TYPE_FENCE_CREATE_INFO };
+        VkFence f = VK_NULL_HANDLE;
+        r = ecopy.CreateFence(dev, &fci, NULL, &f);
+        if (r == VK_SUCCESS) {
+            VkSubmitInfo si = { VK_STRUCTURE_TYPE_SUBMIT_INFO };
+            si.waitSemaphoreCount = n;
+            si.pWaitSemaphores = wsems;
+            si.pWaitDstStageMask = wstages;
+            pthread_mutex_lock(qmu);
+            r = ecopy.QueueSubmit(queue, 1, &si, f);
+            pthread_mutex_unlock(qmu);
+            if (r == VK_SUCCESS) r = ecopy.WaitForFences(dev, 1, &f, VK_TRUE, 1000000000ull /* 1s */);
+            ecopy.DestroyFence(dev, f, NULL);
+        }
+    }
+    if (wsems != local_sems) free(wsems);
+    if (wstages != local_stages) free(wstages);
     return r;
 }
 
+/* What the compositor will actually get. Reads the very dma-buf about to be handed to Xwayland/Wayland
+ * and reports its mean, so "black on screen" can be split into its two possible causes with one line:
+ * black here means the client's own raster (or the buffer we export is not the one it rendered into);
+ * non-black here means the hand-off - a missing finish/fence, or a different fd/pitch reaching the
+ * compositor. Four rows sampled with pread: no mapping, no format assumptions, safe on tiled memory
+ * because a tiled image would already be an import bug this dump is meant to expose. */
+static void probe_export(const struct wsi_swapchain *sc, uint32_t idx, const char *where) {
+    static int logged;
+    if (!sc || idx >= sc->count || sc->images[idx].fd < 0) return;
+    if (logged >= 60) return;
+    logged++;
+    const int fd = sc->images[idx].fd;
+    const uint32_t stride = sc->stride;
+    const size_t bytes = (size_t)stride * (size_t)sc->height;
+    /* mmap, not pread: a dma-buf fd is not seekable, so pread() on it returns -1 and the probe would
+     * report a mean of -1 (measured: export[x11] ... mean=-1.0 nonblack_bytes=0/0). */
+    if (bytes == 0 || sc->width <= 0 || sc->height <= 0) return;
+    unsigned char *map = (unsigned char *)mmap(NULL, bytes, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+    if (map == MAP_FAILED) /* a dma-buf exports its mmap with write access, not read-only */
+        map = (unsigned char *)mmap(NULL, bytes, PROT_READ, MAP_SHARED, fd, 0);
+    if (map == MAP_FAILED) { WSI_LOG("export[%s] mmap failed: %s", where, strerror(errno)); return; }
+    double sum = 0; long n = 0; int nonblack = 0;
+    for (int r = 0; r < 4; r++) {
+        const unsigned char *rowp = map + (size_t)stride * (size_t)((sc->height * r) / 4);
+        const uint32_t row = stride < 256 ? stride : 256;
+        for (uint32_t i = 0; i < row; i++) { sum += rowp[i]; if (rowp[i]) nonblack++; }
+    }
+    n = (long)((stride < 256 ? stride : 256) * 4);
+    munmap(map, bytes);
+    WSI_LOG("export[%s] image=%u fd=%d %dx%d stride=%u rows4 mean=%.1f nonblack_bytes=%ld/%ld",
+            where, idx, fd, sc->width, sc->height, stride, n ? sum / (double)n : -1.0, (long)nonblack, n);
+}
+
+/* The fd route is closed (a dma-buf is not seekable and its mmap is refused EACCES), so the content
+ * test goes through the API: copy the very image being presented into a host-visible buffer, wait,
+ * and report what is in it. One run per swapchain image, four sampled rows plus four quadrants, so
+ * the answer is "does the frame the compositor is about to receive contain anything". */
+static void probe_vk_readback(struct wsi_swapchain *sc, uint32_t idx, const char *where) {
+    static int logged;
+    if (!sc || idx >= sc->count) return;
+    /* Only the picture: Steam's X11 helper popups are 32x32/64x24 and are never mapped (map=0), and
+     * they were consuming the whole probe budget before the real 1602x720 surface appeared. */
+    if (sc->width < 800 || sc->height < 400) return;
+    if (logged >= 40) return;
+    logged++;
+    VkDevice dev = sc->device;
+    PFN_vkCreateBuffer pCreateBuffer = (PFN_vkCreateBuffer)dev_proc(dev, "vkCreateBuffer");
+    PFN_vkGetBufferMemoryRequirements pGetBufReq = (PFN_vkGetBufferMemoryRequirements)dev_proc(dev, "vkGetBufferMemoryRequirements");
+    PFN_vkBindBufferMemory pBindBuffer = (PFN_vkBindBufferMemory)dev_proc(dev, "vkBindBufferMemory");
+    PFN_vkCreateCommandPool pCreatePool = (PFN_vkCreateCommandPool)dev_proc(dev, "vkCreateCommandPool");
+    PFN_vkAllocateCommandBuffers pAllocCmd = (PFN_vkAllocateCommandBuffers)dev_proc(dev, "vkAllocateCommandBuffers");
+    PFN_vkBeginCommandBuffer pBegin = (PFN_vkBeginCommandBuffer)dev_proc(dev, "vkBeginCommandBuffer");
+    PFN_vkEndCommandBuffer pEnd = (PFN_vkEndCommandBuffer)dev_proc(dev, "vkEndCommandBuffer");
+    PFN_vkCmdPipelineBarrier pBarrier = (PFN_vkCmdPipelineBarrier)dev_proc(dev, "vkCmdPipelineBarrier");
+    PFN_vkCmdCopyImageToBuffer pCopy = (PFN_vkCmdCopyImageToBuffer)dev_proc(dev, "vkCmdCopyImageToBuffer");
+    PFN_vkMapMemory pMap = (PFN_vkMapMemory)dev_proc(dev, "vkMapMemory");
+    PFN_vkUnmapMemory pUnmap = (PFN_vkUnmapMemory)dev_proc(dev, "vkUnmapMemory");
+    PFN_vkDestroyBuffer pDestroyBuffer = (PFN_vkDestroyBuffer)dev_proc(dev, "vkDestroyBuffer");
+    PFN_vkFreeCommandBuffers pFreeCmd = (PFN_vkFreeCommandBuffers)dev_proc(dev, "vkFreeCommandBuffers");
+    PFN_vkDestroyCommandPool pDestroyPool = (PFN_vkDestroyCommandPool)dev_proc(dev, "vkDestroyCommandPool");
+    struct wsi_device_entries *e = wsi_entries(dev);
+    if (!pCreateBuffer || !pGetBufReq || !pBindBuffer || !pCreatePool || !pAllocCmd || !pBegin ||
+        !pEnd || !pBarrier || !pCopy || !pMap || !pUnmap || !pDestroyBuffer || !pFreeCmd ||
+        !pDestroyPool || !e || !e->QueueSubmit || !e->CreateFence || !e->WaitForFences || !e->DestroyFence) {
+        WSI_LOG("readback[%s]: HAL entrypoints unavailable", where);
+        return;
+    }
+    const VkDeviceSize size = (VkDeviceSize)sc->stride * (VkDeviceSize)sc->height;
+    VkBufferCreateInfo bci = { .sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO, .size = size,
+                               .usage = VK_BUFFER_USAGE_TRANSFER_DST_BIT, .sharingMode = VK_SHARING_MODE_EXCLUSIVE };
+    VkBuffer buf = VK_NULL_HANDLE;
+    if (pCreateBuffer(dev, &bci, NULL, &buf) != VK_SUCCESS) { WSI_LOG("readback[%s]: create buffer failed", where); return; }
+    VkMemoryRequirements req; pGetBufReq(dev, buf, &req);
+    VkDeviceMemory mem = VK_NULL_HANDLE;
+    if (!sc->memProps.memoryTypeCount && sc->surface) sc->memProps = sc->surface->memProps;
+    /* Host-visible is the only requirement (coherency just saves a flush); requiring both matched no
+     * type on this HAL and ended the probe at "no host-visible memory type". */
+    int type = -1, coherent = -1;
+    for (uint32_t t = 0; t < sc->memProps.memoryTypeCount; t++) {
+        if (!(req.memoryTypeBits & (1u << t))) continue;
+        const VkMemoryPropertyFlags f = sc->memProps.memoryTypes[t].propertyFlags;
+        if (!(f & VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT)) continue;
+        if (type < 0) type = (int)t;
+        if (f & VK_MEMORY_PROPERTY_HOST_COHERENT_BIT) { coherent = (int)t; break; }
+    }
+    if (coherent >= 0) type = coherent;
+    if (type < 0) {
+        WSI_LOG("readback[%s]: no host-visible type (bits=0x%x types=%u)", where, req.memoryTypeBits,
+                sc->memProps.memoryTypeCount);
+        pDestroyBuffer(dev, buf, NULL);
+        return;
+    }
+    VkMemoryAllocateInfo mai = { .sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO, .allocationSize = req.size, .memoryTypeIndex = (uint32_t)type };
+    if (sc->AllocateMemory(dev, &mai, NULL, &mem) != VK_SUCCESS || pBindBuffer(dev, buf, mem, 0) != VK_SUCCESS) {
+        WSI_LOG("readback[%s]: buffer memory failed", where); pDestroyBuffer(dev, buf, NULL); if (mem) sc->FreeMemory(dev, mem, NULL); return;
+    }
+    VkCommandPoolCreateInfo pci = { .sType = VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO, .queueFamilyIndex = e->queue_family };
+    VkCommandPool pool = VK_NULL_HANDLE;
+    VkCommandBuffer cmd = VK_NULL_HANDLE;
+    if (pCreatePool(dev, &pci, NULL, &pool) != VK_SUCCESS) { WSI_LOG("readback[%s]: pool failed", where); goto out_buf; }
+    VkCommandBufferAllocateInfo cai = { .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO, .commandPool = pool,
+                                        .level = VK_COMMAND_BUFFER_LEVEL_PRIMARY, .commandBufferCount = 1 };
+    if (pAllocCmd(dev, &cai, &cmd) != VK_SUCCESS) { WSI_LOG("readback[%s]: cmdbuf failed", where); goto out_pool; }
+    VkCommandBufferBeginInfo bi = { .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO, .flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT };
+    pBegin(cmd, &bi);
+    VkImage target_img = (!strcmp(where, "wl-render") || !strcmp(where, "x11-render"))
+        ? sc->images[idx].render : sc->images[idx].image;
+    if (!target_img) return;
+    VkImageMemoryBarrier bar = { .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
+        .srcAccessMask = VK_ACCESS_MEMORY_WRITE_BIT, .dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT,
+        .oldLayout = VK_IMAGE_LAYOUT_GENERAL, .newLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+        .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED, .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+        .image = target_img,
+        .subresourceRange = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1 } };
+    pBarrier(cmd, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, NULL, 0, NULL, 1, &bar);
+    VkBufferImageCopy region = { .bufferOffset = 0, .bufferRowLength = sc->stride / 4, .bufferImageHeight = 0,
+        .imageSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 },
+        .imageOffset = { 0, 0, 0 }, .imageExtent = { (uint32_t)sc->width, (uint32_t)sc->height, 1 } };
+    pCopy(cmd, target_img, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, buf, 1, &region);
+    pEnd(cmd);
+    VkFenceCreateInfo fci = { .sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO };
+    VkFence fence = VK_NULL_HANDLE;
+    e->CreateFence(dev, &fci, NULL, &fence);
+    VkSubmitInfo si = { .sType = VK_STRUCTURE_TYPE_SUBMIT_INFO, .commandBufferCount = 1, .pCommandBuffers = &cmd };
+    VkResult r = e->QueueSubmit(sc->queue, 1, &si, fence);
+    if (r == VK_SUCCESS) r = e->WaitForFences(dev, 1, &fence, VK_TRUE, 500000000ull);
+    WSI_LOG("readback[%s]: submit=%d fence=%d", where, r, fence != VK_NULL_HANDLE);
+    if (r == VK_SUCCESS) {
+        void *p = NULL;
+        if (pMap(dev, mem, 0, size, 0, &p) == VK_SUCCESS && p) {
+            const unsigned char *base = (const unsigned char *)p;
+            double sum = 0; long n = 0, nonblack = 0;
+            unsigned char qpx[4][4] = {{0}};
+            for (int q = 0; q < 4; q++) {
+                long y = (long)(sc->height) * (q / 2) / 2 + 4;
+                long x0 = (long)(sc->width) * (q % 2) / 2;
+                const unsigned char *first = base + y * (long)sc->stride + x0 * 4;
+                qpx[q][0] = first[0]; qpx[q][1] = first[1]; qpx[q][2] = first[2]; qpx[q][3] = first[3];
+                for (int yy = 0; yy < 8; yy++) {
+                    const unsigned char *row = base + (y + yy) * (long)sc->stride + x0 * 4;
+                    for (int xx = 0; xx < 64; xx++) {
+                        const unsigned char *px = row + xx * 4;
+                        sum += px[0] + px[1] + px[2]; n += 3;
+                        if (px[0] | px[1] | px[2]) nonblack++;
+                    }
+                }
+            }
+            WSI_LOG("readback[%s] image=%u %dx%d stride=%u mean=%.2f nonblack_px=%ld/%d q0=(%u,%u,%u,%u) q1=(%u,%u,%u,%u) q2=(%u,%u,%u,%u) q3=(%u,%u,%u,%u)",
+                    where, idx, sc->width, sc->height, sc->stride, n ? sum / (double)n : -1.0, nonblack, 4 * 8 * 64,
+                    qpx[0][0], qpx[0][1], qpx[0][2], qpx[0][3],
+                    qpx[1][0], qpx[1][1], qpx[1][2], qpx[1][3],
+                    qpx[2][0], qpx[2][1], qpx[2][2], qpx[2][3],
+                    qpx[3][0], qpx[3][1], qpx[3][2], qpx[3][3]);
+            pUnmap(dev, mem);
+        } else WSI_LOG("readback[%s]: map failed", where);
+    }
+    if (fence) e->DestroyFence(dev, fence, NULL);
+    pFreeCmd(dev, pool, 1, &cmd);
+out_pool:
+    pDestroyPool(dev, pool, NULL);
+out_buf:
+    pDestroyBuffer(dev, buf, NULL);
+    sc->FreeMemory(dev, mem, NULL);
+}
+
+/* Hand the app an image, then copy it into the exportable one at present.
+ *
+ * The app is given the TILING_OPTIMAL image (sc->images[idx].render); the LINEAR image whose dma-buf
+ * gamescope imports never sees a render pass from the app. Both transitions are explicit, the copy is
+ * the whole extent at the format the ICD exposes, and the command resources are made once per
+ * swapchain so a present costs one submit rather than a pool + buffer + fence allocation (churn on
+ * every frame is the kind of stutter that reads as flashing).
+ */
+/* The same Vulkan readback, for an image the WSI did not create: CEF's own dynamic-rendering colour
+ * attachment, which is the copy source at present time. Its layout is taken as GENERAL (what CEF
+ * leaves it in); the copy reports the pixels either way, and the caller logs the image's create info
+ * so the tiling/format that produced a black frame is on the record. */
+static void probe_any_image(struct wsi_swapchain *sc, VkImage img, int iw, int ih, const char *tag) {
+    if (!sc || img == VK_NULL_HANDLE || iw <= 0 || ih <= 0) return;
+    static int n; if (n++ > 6) return;
+    VkDevice dev = sc->device;
+    struct wsi_device_entries *e = wsi_entries(dev);
+    PFN_vkCreateBuffer pCreateBuffer = (PFN_vkCreateBuffer)dev_proc(dev, "vkCreateBuffer");
+    PFN_vkGetBufferMemoryRequirements pGetBufReq = (PFN_vkGetBufferMemoryRequirements)dev_proc(dev, "vkGetBufferMemoryRequirements");
+    PFN_vkBindBufferMemory pBindBuffer = (PFN_vkBindBufferMemory)dev_proc(dev, "vkBindBufferMemory");
+    PFN_vkCreateCommandPool pCreatePool = (PFN_vkCreateCommandPool)dev_proc(dev, "vkCreateCommandPool");
+    PFN_vkAllocateCommandBuffers pAllocCmd = (PFN_vkAllocateCommandBuffers)dev_proc(dev, "vkAllocateCommandBuffers");
+    PFN_vkBeginCommandBuffer pBegin = (PFN_vkBeginCommandBuffer)dev_proc(dev, "vkBeginCommandBuffer");
+    PFN_vkEndCommandBuffer pEnd = (PFN_vkEndCommandBuffer)dev_proc(dev, "vkEndCommandBuffer");
+    PFN_vkCmdPipelineBarrier pBarrier = (PFN_vkCmdPipelineBarrier)dev_proc(dev, "vkCmdPipelineBarrier");
+    PFN_vkCmdCopyImageToBuffer pCopy = (PFN_vkCmdCopyImageToBuffer)dev_proc(dev, "vkCmdCopyImageToBuffer");
+    PFN_vkMapMemory pMap = (PFN_vkMapMemory)dev_proc(dev, "vkMapMemory");
+    PFN_vkDestroyBuffer pDestroyBuffer = (PFN_vkDestroyBuffer)dev_proc(dev, "vkDestroyBuffer");
+    PFN_vkFreeCommandBuffers pFreeCmd = (PFN_vkFreeCommandBuffers)dev_proc(dev, "vkFreeCommandBuffers");
+    PFN_vkDestroyCommandPool pDestroyPool = (PFN_vkDestroyCommandPool)dev_proc(dev, "vkDestroyCommandPool");
+    if (!e || !pCreateBuffer || !pGetBufReq || !pBindBuffer || !pCreatePool || !pAllocCmd || !pBegin ||
+        !pEnd || !pBarrier || !pCopy || !pMap || !pDestroyBuffer || !pFreeCmd || !pDestroyPool) return;
+    const VkDeviceSize stride = (VkDeviceSize)iw * 4;
+    const VkDeviceSize size = stride * (VkDeviceSize)ih;
+    VkBufferCreateInfo bci = { VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO };
+    bci.size = size; bci.usage = VK_BUFFER_USAGE_TRANSFER_DST_BIT;
+    VkBuffer buf = VK_NULL_HANDLE;
+    if (pCreateBuffer(dev, &bci, NULL, &buf) != VK_SUCCESS) return;
+    VkMemoryRequirements req; pGetBufReq(dev, buf, &req);
+    int type = -1;
+    for (uint32_t t = 0; t < sc->memProps.memoryTypeCount; t++)
+        if ((req.memoryTypeBits & (1u << t)) &&
+            (sc->memProps.memoryTypes[t].propertyFlags & VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT)) { type = (int)t; break; }
+    if (type < 0) { pDestroyBuffer(dev, buf, NULL); return; }
+    VkMemoryAllocateInfo mai = { VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO };
+    mai.allocationSize = req.size; mai.memoryTypeIndex = (uint32_t)type;
+    VkDeviceMemory mem = VK_NULL_HANDLE;
+    if (sc->AllocateMemory(dev, &mai, NULL, &mem) != VK_SUCCESS ||
+        pBindBuffer(dev, buf, mem, 0) != VK_SUCCESS) {
+        pDestroyBuffer(dev, buf, NULL);
+        if (mem) sc->FreeMemory(dev, mem, NULL);
+        return;
+    }
+    VkCommandPoolCreateInfo pci = { VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO };
+    pci.queueFamilyIndex = e->queue_family;
+    VkCommandPool pool = VK_NULL_HANDLE; VkCommandBuffer cb = VK_NULL_HANDLE;
+    if (pCreatePool(dev, &pci, NULL, &pool) != VK_SUCCESS) { pDestroyBuffer(dev, buf, NULL); sc->FreeMemory(dev, mem, NULL); return; }
+    VkCommandBufferAllocateInfo cai = { VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO };
+    cai.commandPool = pool; cai.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY; cai.commandBufferCount = 1;
+    if (pAllocCmd(dev, &cai, &cb) != VK_SUCCESS) { pDestroyPool(dev, pool, NULL); pDestroyBuffer(dev, buf, NULL); sc->FreeMemory(dev, mem, NULL); return; }
+    VkCommandBufferBeginInfo bi = { VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO };
+    bi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+    pBegin(cb, &bi);
+    VkImageMemoryBarrier bar; memset(&bar, 0, sizeof bar);
+    bar.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
+    bar.srcAccessMask = VK_ACCESS_MEMORY_WRITE_BIT; bar.dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
+    bar.oldLayout = VK_IMAGE_LAYOUT_GENERAL; bar.newLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
+    bar.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED; bar.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    bar.image = img; bar.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+    bar.subresourceRange.levelCount = 1; bar.subresourceRange.layerCount = 1;
+    pBarrier(cb, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, NULL, 0, NULL, 1, &bar);
+    VkBufferImageCopy region; memset(&region, 0, sizeof region);
+    region.bufferRowLength = (uint32_t)iw; region.bufferImageHeight = (uint32_t)ih;
+    region.imageSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT; region.imageSubresource.layerCount = 1;
+    region.imageExtent.width = (uint32_t)iw; region.imageExtent.height = (uint32_t)ih; region.imageExtent.depth = 1;
+    pCopy(cb, img, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, buf, 1, &region);
+    pEnd(cb);
+    pthread_mutex_t *qmu = NULL;
+    struct wsi_device_entries ecopy;
+    if (!wsi_copy_for_dev(dev, &ecopy, &qmu)) qmu = NULL;
+    VkFenceCreateInfo fci = { VK_STRUCTURE_TYPE_FENCE_CREATE_INFO };
+    VkFence fence = VK_NULL_HANDLE; e->CreateFence(dev, &fci, NULL, &fence);
+    VkSubmitInfo si = { VK_STRUCTURE_TYPE_SUBMIT_INFO };
+    si.commandBufferCount = 1; si.pCommandBuffers = &cb;
+    if (qmu) pthread_mutex_lock(qmu);
+    VkResult r = e->QueueSubmit(sc->queue, 1, &si, fence);
+    if (qmu) pthread_mutex_unlock(qmu);
+    if (r == VK_SUCCESS) r = e->WaitForFences(dev, 1, &fence, VK_TRUE, 500000000ull);
+    if (r == VK_SUCCESS) {
+        void *pp = NULL;
+        if (pMap(dev, mem, 0, size, 0, &pp) == VK_SUCCESS && pp) {
+            const unsigned char *base = (const unsigned char *)pp;
+            double sum = 0; long n2 = 0, nonblack = 0;
+            for (int q = 0; q < 4; q++) {
+                long y = (long)ih * (q / 2) / 2 + 4, x0 = (long)iw * (q % 2) / 2;
+                for (int yy = 0; yy < 8; yy++) {
+                    const unsigned char *row = base + (y + yy) * (long)stride + x0 * 4;
+                    for (int xx = 0; xx < 64 && (x0 + xx) < (long)iw; xx++) {
+                        const unsigned char *px = row + xx * 4;
+                        sum += px[0] + px[1] + px[2]; n2 += 3;
+                        if (px[0] | px[1] | px[2]) nonblack++;
+                    }
+                }
+            }
+            WSI_LOG("readback[%s] %dx%d mean=%.2f nonblack_px=%ld/2048", tag, iw, ih,
+                    n2 ? sum / (double)n2 : -1.0, nonblack);
+        }
+    } else WSI_LOG("readback[%s]: submit=%d (source not readable)", tag, r);
+    if (fence) e->DestroyFence(dev, fence, NULL);
+    pFreeCmd(dev, pool, 1, &cb); pDestroyPool(dev, pool, NULL);
+    pDestroyBuffer(dev, buf, NULL); sc->FreeMemory(dev, mem, NULL);
+}
+
+static int wsi_blit_to_export(struct wsi_swapchain *sc, uint32_t idx, VkQueue q) {
+    if (!sc || idx >= sc->count || sc->images[idx].render == VK_NULL_HANDLE) return 0;
+    VkQueue submit_q = q ? q : sc->queue;
+    VkDevice dev = sc->device;
+    struct wsi_device_entries ecopy;
+    pthread_mutex_t *qmu = NULL;
+    PFN_vkCreateCommandPool pCreatePool = (PFN_vkCreateCommandPool)dev_proc(dev, "vkCreateCommandPool");
+    PFN_vkAllocateCommandBuffers pAlloc = (PFN_vkAllocateCommandBuffers)dev_proc(dev, "vkAllocateCommandBuffers");
+    PFN_vkBeginCommandBuffer pBegin = (PFN_vkBeginCommandBuffer)dev_proc(dev, "vkBeginCommandBuffer");
+    PFN_vkEndCommandBuffer pEnd = (PFN_vkEndCommandBuffer)dev_proc(dev, "vkEndCommandBuffer");
+    PFN_vkCmdPipelineBarrier pBarrier = (PFN_vkCmdPipelineBarrier)dev_proc(dev, "vkCmdPipelineBarrier");
+    PFN_vkCmdCopyImage pCopy = (PFN_vkCmdCopyImage)dev_proc(dev, "vkCmdCopyImage");
+    PFN_vkResetCommandBuffer pReset = (PFN_vkResetCommandBuffer)dev_proc(dev, "vkResetCommandBuffer");
+    PFN_vkResetFences pResetFences = (PFN_vkResetFences)dev_proc(dev, "vkResetFences");
+    if (!wsi_copy_for_dev(dev, &ecopy, &qmu) || !ecopy.QueueSubmit || !ecopy.CreateFence || !ecopy.WaitForFences ||
+        !pCreatePool || !pAlloc || !pBegin || !pEnd || !pBarrier || !pCopy) return 0;
+    if (!sc->blit_pool) {
+        VkCommandPoolCreateInfo pci = { VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO };
+        pci.queueFamilyIndex = ecopy.queue_family;
+        pci.flags = VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT;
+        if (pCreatePool(dev, &pci, NULL, &sc->blit_pool) != VK_SUCCESS) { sc->blit_pool = VK_NULL_HANDLE; return 0; }
+        VkCommandBufferAllocateInfo cai = { VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO };
+        cai.commandPool = sc->blit_pool; cai.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY; cai.commandBufferCount = 1;
+        if (pAlloc(dev, &cai, &sc->blit_cb) != VK_SUCCESS) return 0;
+        VkFenceCreateInfo fci = { VK_STRUCTURE_TYPE_FENCE_CREATE_INFO };
+        if (ecopy.CreateFence(dev, &fci, NULL, &sc->blit_fence) != VK_SUCCESS) return 0;
+    }
+    if (pReset) pReset(sc->blit_cb, 0);
+    VkCommandBufferBeginInfo bi = { VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO };
+    bi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+    if (pBegin(sc->blit_cb, &bi) != VK_SUCCESS) return 0;
+    VkImageMemoryBarrier bars[2];
+    memset(bars, 0, sizeof(bars));
+    bars[0].sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
+    bars[0].srcAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT | VK_ACCESS_MEMORY_WRITE_BIT;
+    bars[0].dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
+    bars[0].oldLayout = VK_IMAGE_LAYOUT_GENERAL;
+    bars[0].newLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
+    bars[0].srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    bars[0].dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    bars[0].image = sc->images[idx].render;
+    bars[0].subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+    bars[0].subresourceRange.levelCount = 1;
+    bars[0].subresourceRange.layerCount = 1;
+    bars[1] = bars[0];
+    bars[1].srcAccessMask = 0;
+    bars[1].dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+    bars[1].newLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+    bars[1].image = sc->images[idx].image;
+    pBarrier(sc->blit_cb, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0,
+             0, NULL, 0, NULL, 2, bars);
+    VkImageCopy region;
+    memset(&region, 0, sizeof(region));
+    region.srcSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+    region.srcSubresource.layerCount = 1;
+    region.dstSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+    region.dstSubresource.layerCount = 1;
+    region.extent.width = (uint32_t)sc->width;
+    region.extent.height = (uint32_t)sc->height;
+    region.extent.depth = 1;
+    pCopy(sc->blit_cb, sc->images[idx].render, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+          sc->images[idx].image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &region);
+    /* Restore BOTH render and exportable images to GENERAL so render is never left stuck in TRANSFER_SRC_OPTIMAL. */
+    VkImageMemoryBarrier back[2];
+    back[0] = bars[0];
+    back[0].srcAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
+    back[0].dstAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT | VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT;
+    back[0].oldLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
+    back[0].newLayout = VK_IMAGE_LAYOUT_GENERAL;
+    back[1] = bars[1];
+    back[1].srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+    back[1].dstAccessMask = VK_ACCESS_MEMORY_READ_BIT;
+    back[1].oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+    back[1].newLayout = VK_IMAGE_LAYOUT_GENERAL;
+    pBarrier(sc->blit_cb, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0,
+             0, NULL, 0, NULL, 2, back);
+    if (pEnd(sc->blit_cb) != VK_SUCCESS) return 0;
+    if (pResetFences) pResetFences(dev, 1, &sc->blit_fence);
+    VkSubmitInfo si = { VK_STRUCTURE_TYPE_SUBMIT_INFO };
+    si.commandBufferCount = 1;
+    si.pCommandBuffers = &sc->blit_cb;
+    pthread_mutex_lock(qmu);
+    VkResult r = ecopy.QueueSubmit(submit_q, 1, &si, sc->blit_fence);
+    pthread_mutex_unlock(qmu);
+    if (r == VK_SUCCESS) r = ecopy.WaitForFences(dev, 1, &sc->blit_fence, VK_TRUE, 1000000000ull);
+    { static int n, last_w, last_h;
+      if (n < 32 || sc->width != last_w || sc->height != last_h || r != VK_SUCCESS) {
+          n++; last_w = sc->width; last_h = sc->height;
+          WSI_LOG("blit[%u]: %dx%d optimal->linear submit=%d", idx, sc->width, sc->height, r);
+      } }
+    return r == VK_SUCCESS;
+}
+
+static int wsi_x11_put_image_present(struct wsi_swapchain *sc, uint32_t idx) {
+    struct wsi_surface *surf = sc->surface;
+    if (!surf || !surf->c || xcb_connection_has_error(surf->c)) return 0;
+    VkDevice dev = sc->device;
+    struct wsi_device_entries *e = wsi_entries(dev);
+    PFN_vkCreateBuffer pCreateBuffer = (PFN_vkCreateBuffer)dev_proc(dev, "vkCreateBuffer");
+    PFN_vkGetBufferMemoryRequirements pGetBufReq = (PFN_vkGetBufferMemoryRequirements)dev_proc(dev, "vkGetBufferMemoryRequirements");
+    PFN_vkBindBufferMemory pBindBuffer = (PFN_vkBindBufferMemory)dev_proc(dev, "vkBindBufferMemory");
+    PFN_vkCreateCommandPool pCreatePool = (PFN_vkCreateCommandPool)dev_proc(dev, "vkCreateCommandPool");
+    PFN_vkAllocateCommandBuffers pAllocCmd = (PFN_vkAllocateCommandBuffers)dev_proc(dev, "vkAllocateCommandBuffers");
+    PFN_vkBeginCommandBuffer pBegin = (PFN_vkBeginCommandBuffer)dev_proc(dev, "vkBeginCommandBuffer");
+    PFN_vkEndCommandBuffer pEnd = (PFN_vkEndCommandBuffer)dev_proc(dev, "vkEndCommandBuffer");
+    PFN_vkCmdPipelineBarrier pBarrier = (PFN_vkCmdPipelineBarrier)dev_proc(dev, "vkCmdPipelineBarrier");
+    PFN_vkCmdCopyImageToBuffer pCopy = (PFN_vkCmdCopyImageToBuffer)dev_proc(dev, "vkCmdCopyImageToBuffer");
+    PFN_vkMapMemory pMap = (PFN_vkMapMemory)dev_proc(dev, "vkMapMemory");
+    PFN_vkUnmapMemory pUnmap = (PFN_vkUnmapMemory)dev_proc(dev, "vkUnmapMemory");
+    PFN_vkDestroyBuffer pDestroyBuffer = (PFN_vkDestroyBuffer)dev_proc(dev, "vkDestroyBuffer");
+    PFN_vkFreeCommandBuffers pFreeCmd = (PFN_vkFreeCommandBuffers)dev_proc(dev, "vkFreeCommandBuffers");
+    PFN_vkDestroyCommandPool pDestroyPool = (PFN_vkDestroyCommandPool)dev_proc(dev, "vkDestroyCommandPool");
+    if (!e || !e->QueueSubmit || !e->CreateFence || !e->WaitForFences || !pCreateBuffer || !pGetBufReq ||
+        !pBindBuffer || !pCreatePool || !pAllocCmd || !pBegin || !pEnd || !pBarrier || !pCopy || !pMap ||
+        !pDestroyBuffer || !pFreeCmd || !pDestroyPool) return 0;
+
+    int iw = sc->width, ih = sc->height;
+    if (iw <= 0 || ih <= 0) return 0;
+    VkImage src_img = sc->images[idx].render ? sc->images[idx].render : sc->images[idx].image;
+    if (src_img == VK_NULL_HANDLE) return 0;
+
+    if (!sc->memProps.memoryTypeCount) {
+        extern int pvr_icd_mem_props(void *, void *);
+        pthread_mutex_lock(&g_memprops_mu);
+        if (surf->have_mem) sc->memProps = surf->memProps;
+        else if (g_have_cached_mem) sc->memProps = g_cached_memProps;
+        else pvr_icd_mem_props(surf->pd, &sc->memProps);
+        pthread_mutex_unlock(&g_memprops_mu);
+    }
+
+    const VkDeviceSize row_bytes = (VkDeviceSize)iw * 4;
+    const VkDeviceSize size = row_bytes * (VkDeviceSize)ih;
+    VkBufferCreateInfo bci = { VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO };
+    bci.size = size; bci.usage = VK_BUFFER_USAGE_TRANSFER_DST_BIT;
+    VkBuffer buf = VK_NULL_HANDLE;
+    if (pCreateBuffer(dev, &bci, NULL, &buf) != VK_SUCCESS) {
+        WSI_LOG("wsi_x11_put_image_present: vkCreateBuffer failed (size=%llu)", (unsigned long long)size);
+        return 0;
+    }
+    VkMemoryRequirements req; pGetBufReq(dev, buf, &req);
+    int type = -1;
+    for (uint32_t t = 0; t < sc->memProps.memoryTypeCount; t++)
+        if ((req.memoryTypeBits & (1u << t)) &&
+            (sc->memProps.memoryTypes[t].propertyFlags & VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT)) { type = (int)t; break; }
+    if (type < 0) {
+        WSI_LOG("wsi_x11_put_image_present: no host-visible memory type (bits=0x%x types=%u)",
+                req.memoryTypeBits, sc->memProps.memoryTypeCount);
+        pDestroyBuffer(dev, buf, NULL);
+        return 0;
+    }
+    VkMemoryAllocateInfo mai = { VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO };
+    mai.allocationSize = req.size; mai.memoryTypeIndex = (uint32_t)type;
+    VkDeviceMemory mem = VK_NULL_HANDLE;
+    if (sc->AllocateMemory(dev, &mai, NULL, &mem) != VK_SUCCESS || pBindBuffer(dev, buf, mem, 0) != VK_SUCCESS) {
+        pDestroyBuffer(dev, buf, NULL);
+        if (mem) sc->FreeMemory(dev, mem, NULL);
+        return 0;
+    }
+
+    VkCommandPoolCreateInfo pci = { VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO };
+    pci.queueFamilyIndex = e->queue_family;
+    VkCommandPool pool = VK_NULL_HANDLE;
+    if (pCreatePool(dev, &pci, NULL, &pool) != VK_SUCCESS) { pDestroyBuffer(dev, buf, NULL); sc->FreeMemory(dev, mem, NULL); return 0; }
+    VkCommandBuffer cb = VK_NULL_HANDLE;
+    VkCommandBufferAllocateInfo cai = { VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO };
+    cai.commandPool = pool; cai.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY; cai.commandBufferCount = 1;
+    if (pAllocCmd(dev, &cai, &cb) != VK_SUCCESS) { pDestroyPool(dev, pool, NULL); pDestroyBuffer(dev, buf, NULL); sc->FreeMemory(dev, mem, NULL); return 0; }
+
+    VkCommandBufferBeginInfo bi = { VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO };
+    bi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+    pBegin(cb, &bi);
+    VkImageMemoryBarrier bar; memset(&bar, 0, sizeof bar);
+    bar.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
+    bar.srcAccessMask = VK_ACCESS_MEMORY_WRITE_BIT; bar.dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
+    bar.oldLayout = VK_IMAGE_LAYOUT_GENERAL; bar.newLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
+    bar.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED; bar.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    bar.image = src_img; bar.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+    bar.subresourceRange.levelCount = 1; bar.subresourceRange.layerCount = 1;
+    pBarrier(cb, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, NULL, 0, NULL, 1, &bar);
+    VkBufferImageCopy region; memset(&region, 0, sizeof region);
+    region.bufferRowLength = (uint32_t)iw; region.bufferImageHeight = (uint32_t)ih;
+    region.imageSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT; region.imageSubresource.layerCount = 1;
+    region.imageExtent.width = (uint32_t)iw; region.imageExtent.height = (uint32_t)ih; region.imageExtent.depth = 1;
+    pCopy(cb, src_img, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, buf, 1, &region);
+    VkImageMemoryBarrier back = bar;
+    back.srcAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
+    back.dstAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT | VK_ACCESS_MEMORY_WRITE_BIT;
+    back.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
+    back.newLayout = VK_IMAGE_LAYOUT_GENERAL;
+    pBarrier(cb, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, 0, NULL, 0, NULL, 1, &back);
+    pEnd(cb);
+
+    pthread_mutex_t *qmu = NULL;
+    struct wsi_device_entries ecopy;
+    if (!wsi_copy_for_dev(dev, &ecopy, &qmu)) qmu = NULL;
+    VkFenceCreateInfo fci = { VK_STRUCTURE_TYPE_FENCE_CREATE_INFO };
+    VkFence fence = VK_NULL_HANDLE; e->CreateFence(dev, &fci, NULL, &fence);
+    VkSubmitInfo si = { VK_STRUCTURE_TYPE_SUBMIT_INFO };
+    si.commandBufferCount = 1; si.pCommandBuffers = &cb;
+    if (qmu) pthread_mutex_lock(qmu);
+    VkResult r = e->QueueSubmit(sc->queue, 1, &si, fence);
+    if (qmu) pthread_mutex_unlock(qmu);
+    if (r == VK_SUCCESS) r = e->WaitForFences(dev, 1, &fence, VK_TRUE, 500000000ull);
+    int ok = 0;
+    if (r == VK_SUCCESS) {
+        void *pp = NULL;
+        if (pMap(dev, mem, 0, size, 0, &pp) == VK_SUCCESS && pp) {
+            if (!surf->x_depth) surf->x_depth = 24;
+            if (!surf->gc) {
+                surf->gc = xcb_generate_id(surf->c);
+                xcb_create_gc(surf->c, surf->gc, surf->window, 0, NULL);
+            }
+            if (!sc->images[idx].pixmap) {
+                sc->images[idx].pixmap = xcb_generate_id(surf->c);
+                xcb_create_pixmap(surf->c, surf->x_depth, sc->images[idx].pixmap, surf->window,
+                                  (uint16_t)iw, (uint16_t)ih);
+            }
+            const int swap_rb = (sc->drm_format == DRM_FORMAT_ABGR8888);
+            int chunk_rows = (int)(65536u / (uint32_t)(iw * 4));
+            if (chunk_rows < 1) chunk_rows = 1;
+            if (chunk_rows > 64) chunk_rows = 64;
+            uint8_t *tmp = swap_rb ? (uint8_t *)malloc((size_t)(chunk_rows * iw * 4)) : NULL;
+            const uint8_t *src = (const uint8_t *)pp;
+            for (int y = 0; y < ih; y += chunk_rows) {
+                int rows = (y + chunk_rows <= ih) ? chunk_rows : (ih - y);
+                const uint8_t *send_ptr = src + (size_t)y * (size_t)iw * 4;
+                if (swap_rb && tmp) {
+                    size_t n_px = (size_t)rows * (size_t)iw;
+                    for (size_t p = 0; p < n_px; p++) {
+                        tmp[p * 4 + 0] = send_ptr[p * 4 + 2];
+                        tmp[p * 4 + 1] = send_ptr[p * 4 + 1];
+                        tmp[p * 4 + 2] = send_ptr[p * 4 + 0];
+                        tmp[p * 4 + 3] = send_ptr[p * 4 + 3];
+                    }
+                    send_ptr = tmp;
+                }
+                xcb_put_image(surf->c, XCB_IMAGE_FORMAT_Z_PIXMAP, sc->images[idx].pixmap, surf->gc,
+                              (uint16_t)iw, (uint16_t)rows, 0, (int16_t)y, 0, surf->x_depth,
+                              (uint32_t)((size_t)rows * (size_t)iw * 4), send_ptr);
+            }
+            if (tmp) free(tmp);
+            if (surf->has_present) {
+                xcb_present_pixmap(surf->c, surf->window, sc->images[idx].pixmap, ++sc->serial,
+                                   XCB_NONE, XCB_NONE, 0, 0, XCB_NONE, XCB_NONE, XCB_NONE,
+                                   XCB_PRESENT_OPTION_NONE, 0, 0, 0, 0, NULL);
+            } else {
+                xcb_copy_area(surf->c, sc->images[idx].pixmap, surf->window, surf->gc,
+                              0, 0, 0, 0, (uint16_t)iw, (uint16_t)ih);
+            }
+            xcb_flush(surf->c);
+            if (pUnmap) pUnmap(dev, mem);
+            ok = 1;
+        }
+    }
+    { static int put_cnt = 0; put_cnt++;
+      if (put_cnt <= 5 || (put_cnt % 120) == 0) {
+          WSI_LOG("wsi_x11_put_image_present #%d: win=0x%x %dx%d depth=%u chunk=%d memTypes=%u type=%d ok=%d conn_err=%d",
+                  put_cnt, (unsigned)surf->window, iw, ih, surf->x_depth,
+                  (int)(65536u / (uint32_t)(iw * 4)) < 1 ? 1 : (int)(65536u / (uint32_t)(iw * 4)),
+                  sc->memProps.memoryTypeCount, type, ok, xcb_connection_has_error(surf->c));
+      } }
+    if (fence) e->DestroyFence(dev, fence, NULL);
+    pFreeCmd(dev, pool, 1, &cb); pDestroyPool(dev, pool, NULL);
+    pDestroyBuffer(dev, buf, NULL); sc->FreeMemory(dev, mem, NULL);
+    return ok;
+}
+
+static int wsi_readback_probe_enabled(void) {
+    static int enabled = -1;
+    if (enabled < 0) {
+        const char *e = getenv("PVR_WSI_READBACK_PROBE");
+        enabled = (e && e[0] == '1') ? 1 : 0;
+    }
+    return enabled;
+}
+
 static VkResult wsi_queue_present(VkQueue queue, const VkPresentInfoKHR *pi) {
-    (void)queue;
-    WSI_LOG("present: enter count=%u sw0=%p image0=%u", pi->swapchainCount,
-            pi->swapchainCount ? (void *)pi->pSwapchains[0] : NULL,
-            pi->swapchainCount ? pi->pImageIndices[0] : 0);
-    pthread_mutex_lock(&wsi_lock);
+    { static int pres_log_n = 0;
+      if (pres_log_n < 16 || wsi_verbose_log()) {
+          pres_log_n++;
+          WSI_LOG("present: enter count=%u sw0=%p image0=%u", pi->swapchainCount,
+                  pi->swapchainCount ? (void *)pi->pSwapchains[0] : NULL,
+                  pi->swapchainCount ? pi->pImageIndices[0] : 0);
+      } }
+    /* What the frame was rendered behind: the app makes the queue's rendering wait on a
+     * semaphore and presents with it here. The image is about to be read by the compositor, so
+     * wait for all wait semaphores to finish first. Waiting with a timeout keeps a semaphore that never
+     * signals from wedging the session outright. It must happen before the per-swapchain operations,
+     * so all GPU work is synchronized. */
+    if (pi->pWaitSemaphores && pi->waitSemaphoreCount > 0 && pi->swapchainCount > 0) {
+        struct wsi_swapchain *sc0 = (struct wsi_swapchain *)pi->pSwapchains[0];
+        if (sc0) {
+            VkQueue wait_q = queue ? queue : sc0->queue;
+            VkResult w = wsi_wait_semaphores(sc0->device, wait_q, pi->waitSemaphoreCount, pi->pWaitSemaphores);
+            if (w != VK_SUCCESS) WSI_LOG("present: wait on %u render semaphore(s) failed %d", pi->waitSemaphoreCount, w);
+        }
+    }
     for (uint32_t i = 0; i < pi->swapchainCount; i++) {
         struct wsi_swapchain *sc = (struct wsi_swapchain *)pi->pSwapchains[i];
         uint32_t idx = pi->pImageIndices[i];
-        /* What the frame was rendered behind: the app makes the queue's rendering wait on a
-         * semaphore and presents with it here. The image is about to be read by the compositor, so
-         * wait for that work to finish first. Waiting with a timeout keeps a semaphore that never
-         * signals from wedging the session outright. It must happen before the early-outs below, or
-         * a present that fails for any other reason would leave the app's frame outstanding. */
-        if (sc && pi->pWaitSemaphores && i < pi->waitSemaphoreCount) {
-            VkSemaphore ws = pi->pWaitSemaphores[i];
-            if (ws) {
-                VkResult w = wsi_wait_binary(sc->device, queue, ws);
-                if (w != VK_SUCCESS) WSI_LOG("present: wait on the render semaphore failed %d", w);
-            }
-        }
         if (!sc || idx >= sc->count) { if (pi->pResults) pi->pResults[i] = VK_ERROR_SURFACE_LOST_KHR; continue; }
+        pthread_mutex_lock(&sc->lock);
         struct wsi_surface *surf = sc->surface;
         if (surf->kind == WSI_X11) {
+            if (!surf->has_dri3) {
+                static int x11_put_logged;
+                if (x11_put_logged < 20) {
+                    x11_put_logged++;
+                    WSI_LOG("X11 present (PutImage): window=0x%x %dx%d depth=%u has_present=%d",
+                            (unsigned)surf->window, sc->width, sc->height, surf->x_depth, surf->has_present);
+                }
+                int ok = wsi_x11_put_image_present(sc, idx);
+                sc->images[idx].acquired = 0;
+                pthread_mutex_unlock(&sc->lock);
+                if (pi->pResults) pi->pResults[i] = ok ? VK_SUCCESS : VK_ERROR_SURFACE_LOST_KHR;
+                continue;
+            }
             /* Give the image's dma-buf to Xwayland as a DRI3 Pixmap (once per image) and show it with
              * Present. buffer_from_pixmap is the X->client direction, not needed here. */
             static int x11_logged;
             if (x11_logged < 40) { x11_logged++;
                 WSI_LOG("X11 present: window=0x%x %dx%d stride=%u depth=%u bpp=%u fd=%d (DRI3 PixmapFromBuffers)",
                         (unsigned)surf->window, sc->width, sc->height, sc->stride, surf->x_depth, surf->x_bpp, sc->images[idx].fd); }
-            if (sc->images[idx].fd < 0) { if (pi->pResults) pi->pResults[i] = VK_ERROR_SURFACE_LOST_KHR; continue; }
+            if (sc->images[idx].fd < 0) {
+                sc->images[idx].acquired = 0;
+                pthread_mutex_unlock(&sc->lock);
+                if (pi->pResults) pi->pResults[i] = VK_ERROR_SURFACE_LOST_KHR;
+                continue;
+            }
+            if (wsi_readback_probe_enabled()) probe_vk_readback(sc, idx, "x11-render");
+            wsi_blit_to_export(sc, idx, queue ? queue : sc->queue);
+            if (wsi_readback_probe_enabled()) probe_vk_readback(sc, idx, "x11");
             if (!sc->images[idx].pixmap) {
                 xcb_pixmap_t px = xcb_generate_id(surf->c);
-                int32_t fds[1] = { sc->images[idx].fd };
-                xcb_void_cookie_t ck = xcb_dri3_pixmap_from_buffers_checked(surf->c, px, surf->window, 1,
+                uint32_t size = sc->stride * sc->height;
+                xcb_void_cookie_t ck = xcb_dri3_pixmap_from_buffer_checked(surf->c, px, surf->window,
+                                             size,
                                              (uint16_t)sc->width, (uint16_t)sc->height,
-                                             sc->stride, 0, 0, 0, 0, 0, 0, 0,
-                                             surf->x_depth, surf->x_bpp, 0 /* LINEAR */, fds);
-                /* Checked: X errors are async, so the BadAlloc seen in the log could be this very
-                 * request. The error (or its absence) says which. */
+                                             (uint16_t)sc->stride,
+                                             surf->x_depth, surf->x_bpp,
+                                             dup(sc->images[idx].fd));
                 xcb_generic_error_t *err = xcb_request_check(surf->c, ck);
                 if (err) {
-                    WSI_LOG("X11 present: DRI3 PixmapFromBuffers failed: error_code=%u major=%u minor=%u "
-                            "(window=0x%x %dx%d stride=%u depth=%u)",
+                    WSI_LOG("X11 present: DRI3 PixmapFromBuffer failed: error_code=%u major=%u minor=%u "
+                            "(window=0x%x %dx%d stride=%u depth=%u size=%u), trying PixmapFromBuffers...",
                             err->error_code, err->major_code, err->minor_code,
-                            (unsigned)surf->window, sc->width, sc->height, sc->stride, surf->x_depth);
+                            (unsigned)surf->window, sc->width, sc->height, sc->stride, surf->x_depth, size);
                     free(err);
+
+                    /* Fallback to PixmapFromBuffers with DRM_FORMAT_MOD_INVALID */
+                    px = xcb_generate_id(surf->c);
+                    int32_t fds[1] = { dup(sc->images[idx].fd) };
+                    ck = xcb_dri3_pixmap_from_buffers_checked(surf->c, px, surf->window, 1,
+                                                 (uint16_t)sc->width, (uint16_t)sc->height,
+                                                 sc->stride, 0, 0, 0, 0, 0, 0, 0,
+                                                 surf->x_depth, surf->x_bpp,
+                                                 0xffffffffffffffffULL /* DRM_FORMAT_MOD_INVALID */, fds);
+                    err = xcb_request_check(surf->c, ck);
+                    if (err) {
+                        WSI_LOG("X11 present: DRI3 PixmapFromBuffers (MOD_INVALID) failed: error_code=%u major=%u minor=%u",
+                                err->error_code, err->major_code, err->minor_code);
+                        free(err);
+
+                        /* Fallback to modifier 0 (LINEAR) */
+                        px = xcb_generate_id(surf->c);
+                        int32_t fds_lin[1] = { dup(sc->images[idx].fd) };
+                        ck = xcb_dri3_pixmap_from_buffers_checked(surf->c, px, surf->window, 1,
+                                                     (uint16_t)sc->width, (uint16_t)sc->height,
+                                                     sc->stride, 0, 0, 0, 0, 0, 0, 0,
+                                                     surf->x_depth, surf->x_bpp,
+                                                     0 /* LINEAR */, fds_lin);
+                        err = xcb_request_check(surf->c, ck);
+                        if (err) {
+                            WSI_LOG("X11 present: DRI3 PixmapFromBuffers (LINEAR) failed: error_code=%u major=%u minor=%u",
+                                    err->error_code, err->major_code, err->minor_code);
+                            free(err);
+                        } else {
+                            sc->images[idx].pixmap = px;
+                            WSI_LOG("X11 present: DRI3 PixmapFromBuffers (LINEAR) succeeded! px=0x%x", px);
+                        }
+                    } else {
+                        sc->images[idx].pixmap = px;
+                        WSI_LOG("X11 present: DRI3 PixmapFromBuffers (MOD_INVALID) succeeded! px=0x%x", px);
+                    }
+                } else {
+                    sc->images[idx].pixmap = px;
+                    WSI_LOG("X11 present: DRI3 PixmapFromBuffer succeeded! px=0x%x", px);
                 }
-                sc->images[idx].pixmap = px;
             }
-            xcb_present_pixmap(surf->c, surf->window, sc->images[idx].pixmap, ++sc->serial,
-                               XCB_NONE, XCB_NONE, 0, 0, XCB_NONE, XCB_NONE, XCB_NONE,
-                               XCB_PRESENT_OPTION_NONE, 0, 0, 0, 0, NULL);
-            xcb_flush(surf->c);
+            if (sc->images[idx].pixmap) {
+                xcb_void_cookie_t pck = xcb_present_pixmap_checked(surf->c, surf->window, sc->images[idx].pixmap, ++sc->serial,
+                                   XCB_NONE, XCB_NONE, 0, 0, XCB_NONE, XCB_NONE, XCB_NONE,
+                                   XCB_PRESENT_OPTION_NONE, 0, 0, 0, 0, NULL);
+                xcb_generic_error_t *perr = xcb_request_check(surf->c, pck);
+                if (perr) {
+                    WSI_LOG("X11 present: xcb_present_pixmap error_code=%u major=%u minor=%u",
+                            perr->error_code, perr->major_code, perr->minor_code);
+                    free(perr);
+                } else {
+                    WSI_LOG("X11 present: xcb_present_pixmap ok (conn_err=%d)", xcb_connection_has_error(surf->c));
+                }
+            }
+            sc->images[idx].acquired = 0;
+            pthread_mutex_unlock(&sc->lock);
             if (pi->pResults) pi->pResults[i] = VK_SUCCESS;
             continue;
         }
-        if (!surf->dmabuf || sc->images[idx].fd < 0) { if (pi->pResults) pi->pResults[i] = VK_ERROR_SURFACE_LOST_KHR; continue; }
+        if (!surf->dmabuf || sc->images[idx].fd < 0) {
+            sc->images[idx].acquired = 0;
+            pthread_mutex_unlock(&sc->lock);
+            if (pi->pResults) pi->pResults[i] = VK_ERROR_SURFACE_LOST_KHR;
+            continue;
+        }
         /* One wl_buffer per swapchain image, reused for that image's whole life. A wl_buffer
          * describes an fd, a size and a format, all fixed once the image exists, so minting a new
-         * one per present only leaks pool entries in the compositor. Measured before this fix:
-         * presents=24 bufs_created=24 releases=0 - then gamescope stopped committing frames
-         * because every buffer it had was held. */
+         * one per present only leaks pool entries in the compositor. */
         struct wl_buffer *buf = sc->images[idx].buffer;
         if (!buf) {
-            struct zwp_linux_buffer_params_v1 *params = zwp_linux_dmabuf_v1_create_params(surf->dmabuf);
+            struct zwp_linux_dmabuf_v1 *dmabuf_iface = sc->dmabuf_wrap ? sc->dmabuf_wrap : surf->dmabuf;
+            struct zwp_linux_buffer_params_v1 *params = zwp_linux_dmabuf_v1_create_params(dmabuf_iface);
             zwp_linux_buffer_params_v1_add(params, sc->images[idx].fd, 0, 0, sc->stride, 0, 0);
             buf = zwp_linux_buffer_params_v1_create_immed(params, sc->width, sc->height, sc->drm_format, 0 /* LINEAR modifier */);
             zwp_linux_buffer_params_v1_destroy(params);
-            if (!buf) { if (pi->pResults) pi->pResults[i] = VK_ERROR_OUT_OF_HOST_MEMORY; continue; }
-            struct wsi_buffer_binding *b = calloc(1, sizeof(*b)); b->sc = sc; b->index = idx;
-            wl_buffer_add_listener(buf, &g_buffer_listener, b);
+            if (!buf) {
+                sc->images[idx].acquired = 0;
+                pthread_mutex_unlock(&sc->lock);
+                if (pi->pResults) pi->pResults[i] = VK_ERROR_OUT_OF_HOST_MEMORY;
+                continue;
+            }
+            if (sc->wl_queue) wl_proxy_set_queue((struct wl_proxy *)buf, sc->wl_queue);
+            wl_buffer_add_listener(buf, &g_buffer_listener, &sc->images[idx]);
             sc->images[idx].buffer = buf;
         }
+        { static int rp, last_w, last_h;
+          if (rp < 32 || sc->width != last_w || sc->height != last_h) {
+              rp++; last_w = sc->width; last_h = sc->height;
+              WSI_LOG("present[wl] pid=%d %dx%d cmd=%s", (int)getpid(), sc->width, sc->height, pvr_proc_cmd());
+          } }
+        if (wsi_readback_probe_enabled()) {
+            extern void pvr_icd_cmd_report(const char *, int, int);
+            extern void *pvr_icd_last_copy(int);
+            extern int pvr_icd_img_info(void *, uint32_t *);
+            static int cp;
+            if (cp++ < 24) pvr_icd_cmd_report("wl", sc->width, sc->height);
+            void *src = pvr_icd_last_copy(0), *dst = pvr_icd_last_copy(1);
+            { static int q; if (q++ < 4)
+                WSI_LOG("copy pair src=%p dst=%p | mine linear=%p render=%p frac_swapchain=%s",
+                        src, dst, (void *)sc->images[idx].image, (void *)sc->images[idx].render,
+                        (src == (void *)sc->images[idx].render || src == (void *)sc->images[idx].image) ? "YES" : "no"); }
+            if (src && src != (void *)sc->images[idx].image && src != (void *)sc->images[idx].render) {
+                uint32_t inf[5] = {0};
+                int ext = pvr_icd_img_info(src, inf);
+                static int lg; if (lg++ < 4)
+                    WSI_LOG("copy src img=%p fmt=%u tiling=%u usage=0x%x %ux%u external=%d",
+                            src, inf[0], inf[1], inf[2], inf[3], inf[4], ext);
+                if (inf[3] && inf[4]) probe_any_image(sc, (VkImage)src, (int)inf[3], (int)inf[4], "copy-src");
+            }
+            probe_vk_readback(sc, idx, "wl-render");
+        }
+        if (sc->wl_queue) {
+            wsi_drain_wl_queue(sc, 0);
+            for (int waited = 0; sc->images[idx].busy && waited < 100; waited += 20)
+                wsi_drain_wl_queue(sc, 20);
+        }
+        wsi_blit_to_export(sc, idx, queue);
+        if (wsi_readback_probe_enabled()) probe_vk_readback(sc, idx, "wl");
         wl_surface_attach(surf->surface, buf, 0, 0);
         wl_surface_damage_buffer(surf->surface, 0, 0, sc->width, sc->height);
         wl_surface_commit(surf->surface);
         wl_display_flush(surf->display);
-        { static int wl_logged; if (wl_logged < 20) { wl_logged++;
-            WSI_LOG("Wayland present: %dx%d stride=%u fmt=%u fd=%d buffer=%p (wl_buffer attach+commit)",
-                    sc->width, sc->height, sc->stride, sc->drm_format, sc->images[idx].fd, (void *)buf); } }
+        sc->images[idx].busy = 1;
+        sc->images[idx].acquired = 0;
+        if (sc->wl_queue) wsi_drain_wl_queue(sc, 0);
+        pthread_mutex_unlock(&sc->lock);
+        { static int wl_logged, wl_last_w, wl_last_h;
+          if (wl_logged < 20 || sc->width != wl_last_w || sc->height != wl_last_h) {
+              wl_logged++; wl_last_w = sc->width; wl_last_h = sc->height;
+              WSI_LOG("Wayland present: %dx%d stride=%u fmt=%u fd=%d buffer=%p (wl_buffer attach+commit)",
+                      sc->width, sc->height, sc->stride, sc->drm_format, sc->images[idx].fd, (void *)buf);
+          } }
         if (pi->pResults) pi->pResults[i] = VK_SUCCESS;
     }
-    pthread_mutex_unlock(&wsi_lock);
     return VK_SUCCESS;
 }
 
@@ -809,6 +1998,22 @@ void *pvr_wsi_proc(const char *name) {
         { "vkAcquireNextImageKHR", (void *)wsi_acquire_next_image },
         { "vkAcquireNextImage2KHR", (void *)wsi_acquire_next_image2 },
         { "vkQueuePresentKHR", (void *)wsi_queue_present },
+    };
+    for (unsigned i = 0; i < sizeof(t) / sizeof(*t); i++) if (!strcmp(name, t[i].n)) return t[i].p;
+    return NULL;
+}
+
+void *pvr_wsi_sync_proc(const char *name) {
+    if (!name) return NULL;
+    struct ent { const char *n; void *p; } t[] = {
+        { "vkQueueSubmit", (void *)pvr_wsi_queue_submit },
+        { "vkQueueSubmit2", (void *)pvr_wsi_queue_submit2 },
+        { "vkQueueSubmit2KHR", (void *)pvr_wsi_queue_submit2_khr },
+        { "vkQueueWaitIdle", (void *)pvr_wsi_queue_wait_idle },
+        { "vkDeviceWaitIdle", (void *)pvr_wsi_device_wait_idle },
+        { "vkGetDeviceQueue", (void *)pvr_wsi_get_device_queue },
+        { "vkGetDeviceQueue2", (void *)pvr_wsi_get_device_queue2 },
+        { "vkDestroyDevice", (void *)pvr_wsi_destroy_device },
     };
     for (unsigned i = 0; i < sizeof(t) / sizeof(*t); i++) if (!strcmp(name, t[i].n)) return t[i].p;
     return NULL;

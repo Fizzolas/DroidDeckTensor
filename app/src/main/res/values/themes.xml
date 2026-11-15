@@ -6,5 +6,9 @@
     <!-- A session owns the whole panel: no bars, no title, and black behind the compositor. -->
     <style name="SessionTheme" parent="@android:style/Theme.Material.NoActionBar.Fullscreen">
         <item name="android:windowBackground">@android:color/black</item>
+        <!-- No starting window: Android would otherwise draw the app's own mark (the launch splash / the
+             stored snapshot of it) whenever this window is (re)created or briefly has no buffer, which
+             is the DroidDeck logo flashing over Steam. The session paints its own black first frame. -->
+        <item name="android:windowDisablePreview">true</item>
     </style>
 </resources>

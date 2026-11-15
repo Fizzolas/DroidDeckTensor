@@ -4040,3 +4040,514 @@ sessions where the client stayed up longer.
 or it will record an ordinary shutdown and look like evidence. The GPU-process crash is reproducible
 (§82 arm A, every session that reached it) but its precondition is not yet pinned - which is itself
 the thing to establish next, before trying to catch the fault again.
+
+## 84. A/B under the current build (2026-11-14, sessions start-0912..0921)
+
+Two arms, one variable: the session env file at `Download/droiddeck-env`. Same APK, same device.
+
+| Arm | Env | Compositor | Screen | Client window |
+|---|---|---|---|---|
+| A: software | `MESA_LOADER_DRIVER_OVERRIDE=swrast`, `GALLIUM_DRIVER=llvmpipe`, `LIBGL_ALWAYS_SOFTWARE=1`, `BL_CEF_VULKAN_ICD=/tmp/swiftshader_icd.json`, `BL_CEF_OZONE=x11`, `BL_XWAYLAND_COUNT=1`, `BL_GAMESCOPE_ARGS=--force-windows-fullscreen`, `BL_STEAMDECK=0` | 7.4 fps, 74 frames/10 s | sign-in page renders (samples 12.2 -> 47.7) | flips 1650x732 <-> 1920x1080 |
+| B: hardware (no env file) | app defaults, bundled `powervr-g5x` ICD chosen by `effectiveLinuxDriver` | 0.3-4.0 fps, 3-40 frames/10 s | black, whole-frame mean 1.3 | flips 1602x720 <-> 1280x800 |
+
+Both arms flash the same way, and the mechanism is now attributed: the client's own window changes
+size (`[vulkan] "Steam Big Picture Mode" ... changed its frame size: 1602x720 -> 1280x800 ->
+1602x720`) and the compositor re-letterboxes each size (`[screen] fit, center: 1650x732 scene shown
+2404x1067` then `1920x1080 scene shown 1920x1080 at 242,0 on the 2404x1080 output`). The "flash" is
+the Big Picture window being rebuilt and resized, not a layer covering the picture and not the
+DroidDeck startup movie (that was removed in this cycle: 0 `StartupMovie` entries, 0 staged movies).
+
+Corrections to what an earlier pass of this cycle reported:
+
+* The `GPU process exited unexpectedly` lines in `cef_log.txt` are **cumulative across sessions**
+  (they carry `1113/` timestamps). Sessions on `1114/` produced none, so the CEF GPU-process crash
+  of §82 is not what is flashing today.
+* The software arm is not "the only one that reaches sign-in" by accident: it reaches it because
+  llvmpipe can rasterise the UI at all, whereas the hardware arm currently presents almost nothing.
+
+What this leaves open, in the order the evidence points:
+
+1. The client's swapchain/window size negotiation (still not a stable full-size surface).
+2. The hardware path's frame rate: 0.3-4 fps is below anything that can drive Big Picture, so even a
+   correct surface would flash while the UI cannot keep up.
+3. §82's HAL-path crash precondition: it needs the client to composite, which arm B never reaches
+   today, so the crash cannot be exercised until (1) and (2) move.
+
+## 85. Hardware arm: the resize is the 1x1 swapchain, not a sizing policy (2026-11-14, session 09:30)
+
+§84 left the hardware arm (no software env) black at 0.3-4 fps with the Big Picture window resizing.
+This pass tested the one remaining single-variable difference between the arms that could have
+explained it, and pinned what the resize actually is.
+
+**Experiment.** Env reduced to exactly one line, on the hardware arm:
+
+```
+BL_GAMESCOPE_ARGS=--force-windows-fullscreen
+```
+
+(full arm A env removed; bundled `powervr-g5x` ICD still selected by `effectiveLinuxDriver`).
+
+**Result — the flag changes nothing.**
+
+```
+[vulkan] "Steam" (gamescope) changed its frame size: 1x1 -> 1602x720
+[vulkan] "Steam" (gamescope) changed its frame size: 1602x720 -> 1x1
+[vulkan] "Steam Big Picture Mode" (gamescope) changed its frame size: 1602x720 -> 1280x800
+[vulkan] "Steam" (gamescope) changed its frame size: 1280x800 -> 1602x720
+[stats] 3 frames on screen (0.3 fps) ... 36 frames (3.6 fps) ... 10 frames (1.0 fps)
+```
+
+Screen mean brightness 6.4 whole-frame (9.7 in the centre crop) against arm A's 47.7. Two client
+windows exist at once - `"Steam"` and `"Steam Big Picture Mode"` - and the compositor alternates
+between them.
+
+**Root cause of the flip, measured.** The `1x1 -> 1602x720 -> 1x1` sequence is the client's own
+window collapsing to one pixel and back. That is the wall §44 and §56 recorded: the surface size is
+reported correctly, the client still creates a 1x1 swapchain, and a 1x1 frame presents nothing. So:
+
+* the "resize-driven flash" on the hardware arm is not a compositor letterbox policy and not a
+  missing gamescope flag - it is the client's 1x1 swapchain alternating with a real one;
+* the 0.3-4 fps follows from it: while the window is 1x1 there are no pixels to show, and every
+  transition re-rasterises the UI;
+* `--force-windows-fullscreen` cannot fix it, because the size is chosen inside CEF's swapchain, not
+  by the window manager.
+
+**Consequence for the next pass.** The hardware arm cannot reach arm A's numbers by configuration.
+The repair has to be in the client's swapchain path - the CEF/ANGLE surface and the GBM/AHB handoff
+of §50/§53-55 - so that the window CEF creates is the size Wayland reports, and its frames present
+through the PowerVR ICD.
+
+### 85a. What the 1x1 actually is — proved in code, and the log defect fixed (2026-11-14)
+
+§85 classified the `1x1 -> 1602x720 -> 1x1` lines as the client's swapchain. That was wrong, and the
+code says so: `compositor.c` (surface state, ~line 617) records that *gamescope keeps the picture it
+shows in a SUBSURFACE - its toplevel only ever commits a 1x1 placeholder*, and `tree_size()` exists to
+take the largest content-bearing extent in the window's tree for exactly that reason. So the 1x1 is
+**(a): the surface as committed before the window is mapped - an artefact of the toplevel placeholder,
+not a resize and not an unmap.**
+
+The defect was in our accounting: `take_dmabuf()` wrote every commit's size into `s->buf_w/h` and
+logged a change whenever it differed, so each placeholder commit produced a `1x1 -> WxH` pair and
+re-announced the window. Fixed in `take_dmabuf()`: a buffer whose extent is 1x1 or smaller no longer
+updates the announced extent and never logs a size change; the last real extent is kept.
+
+**Measured before/after (hardware arm, powervr-g5x ICD, fresh session each time):**
+
+| | before | after |
+|---|---|---|
+| `1x1 -> ...` frame-size lines | 4-6 per session | **0** |
+| remaining frame-size lines | `1602x720 <-> 1280x800` | `1602x720 <-> 1280x800` (unchanged) |
+| compositor | 0.2-4.3 fps | 0.2-4.3 fps |
+| whole-frame brightness | 1.3 | 1.3 |
+
+With the placeholder noise gone, what is left is one surface - gamescope renames it in the log
+(`[window] renamed "Steam" -> "Steam Big Picture Mode"`), so both names are the same window - whose
+swapchain alternates between **1280x800** (Big Picture's native UI size) and **1602x720**. That
+alternation is the flash, and it happens on the software arm too (`1650x732`/`1920x1080` scenes are
+those same two sizes fitted). Turning gamescope's Steam mode off (`BL_GAMESCOPE_STEAM_MODE=0`) does
+not change it, so it is not the `-e` size feedback.
+
+**Still immovable this pass, with the proving line:** the hardware arm's picture is black although
+frames arrive -
+```
+[stats] last 10 s: 43 frames on screen (4.3 fps) | 18 GPU frames from games
+```
+- so presentation runs and the client's own raster is black: the CEF/ANGLE surface drawn through the
+PowerVR ICD produces no visible content on this path (the GBM/AHB handoff of §50/§53-55). That, not
+the size, is what keeps the hardware arm from the software arm's brightness (1.3 vs 47.7).
+
+## 86. Where the hardware arm's pixels die: import is clean, the producer's frame is already black (2026-11-14)
+
+§85a left one question: presentation runs on the hardware arm (43 frames on screen, 18 GPU frames
+from games) yet the picture is black (whole-frame mean 1.3 vs 47.7 on the software arm). This pass
+instrumented the compositor's receiving end to decide between "we import it wrong" and "it arrives
+black".
+
+**Instrument.** `compositor.c`, `take_dmabuf()`: one `[probe]` line per surface, the first buffer it
+receives, carrying everything that can make an import sample as black without failing - extent,
+fourcc, modifier, stride, offset, plane count, import result, fd.
+
+**Measured, hardware arm, freshly restarted session (bundled `powervr-g5x` ICD active):**
+
+```
+[probe] "Steam" (gamescope) first buffer: 1602x720 fmt=0x34325241 mod=0x0 stride=6408 off=0 planes=1 imported=1 fd=288
+[probe] "Steam" (gamescope) first buffer: 1x1     fmt=0x34325241 mod=0xffffffffffffff stride=8 off=0 planes=1 imported=1 fd=160
+```
+
+What that rules out, precisely:
+
+* **fourcc** `0x34325241` = `ARGB8888` - the format the compositor already samples from the software
+  arm, not a swapped-channel or depth-mismatch case.
+* **modifier 0x0** = `DRM_FORMAT_MOD_LINEAR`, and **stride 6408 = 4 x 1602 exactly** - the tight
+  linear layout. The "tiled surface imported as linear samples black" failure cannot apply.
+* **offset 0, one plane, `imported=1`** - the dma-buf is the one fd the client handed us, and the
+  Vulkan import succeeded (a failed import logs `dmabuf import failed`, which is absent).
+
+So the compositor's input is a correctly-imported, tightly-strided linear ARGB image of the right
+extent - and its content is black. The loss is **upstream of the compositor**: between the client's
+PowerVR raster and the exported dma-buf. The next site, already instrumented in the shim, is
+`pvr_wsi.c` `wsi_queue_present()` (X11/DRI3 path: `xcb_dri3_pixmap_from_buffer_checked`, then
+`PixmapFromBuffers` with `DRM_FORMAT_MOD_INVALID` and then `LINEAR` fallbacks) - it logs the window,
+size, stride, depth and fd per present, but never the *content* of what it exports. The decisive next
+measurement is a checksum of the exported image's first rows at present time: black there means the
+client's raster through the PowerVR path is empty; non-black means the loss is in the DRI3 hand-off to
+Xwayland or in gamescope before our socket.
+
+**Size pinning.** The `1x1` placeholder commits no longer produce frame-size lines (§85a), and this
+session logged zero `changed its frame size` lines; the remaining alternation (1280x800 <-> 1602x720)
+is a genuine client resize and is unchanged by this pass.
+
+**Before/after, hardware arm:** brightness 1.3 -> 1.3; compositor 0.2-4.3 fps -> 0.2-4.3 fps;
+frame-size-change lines with a 1x1 source: 4-6 -> 0. Nothing in the numbers moved except the logging
+defect, because the defect that matters is upstream of everything measured here.
+
+## 87. Present-time probe added; the dma-buf cannot be read back from the ICD (2026-11-14)
+
+§86 proved the compositor receives a correctly-imported linear ARGB frame whose content is black, so
+the remaining question was whether the client's exported buffer is already black. This pass added the
+present-time instrument in the shim ICD (`docs/development/pvr-re/hybshim/icd/pvr_wsi.c`,
+`probe_export()`), called from both present paths before the buffer leaves the process:
+
+* X11: just before `xcb_dri3_pixmap_from_buffer_checked`.
+* Wayland: just before `wl_surface_attach`.
+
+It reports `export[wl|x11] image=N fd=F WxH stride=S rows4 mean=M nonblack_bytes=K/N`.
+
+**Result: the readback itself fails, and that is the finding.**
+
+```
+pvr_wsi[16583]: export[wl]  mmap failed: Permission denied
+pvr_wsi[16177]: export[x11] mmap failed: Permission denied
+pvr_wsi[16583]: export[wl]  mmap failed: Permission denied
+```
+
+`pread()` on the exported fd returns -1 (a dma-buf fd is not seekable; the first version of the probe
+reported `mean=-1.0 nonblack_bytes=0/0`, which is why the probe was rewritten), and `mmap()` is
+refused with `EACCES` both with `PROT_READ` and with `PROT_READ|PROT_WRITE`. The fd the HAL hands out
+therefore carries no mappable access for us - so an in-ICD CPU readback of the exported image is not
+available, and the content test has to happen where a Vulkan image exists (a readback image /
+`vkCmdCopyImageToBuffer` on the swapchain image) rather than through the raw fd.
+
+**What the same run did establish, and it corrects §85/§86:**
+
+```
+pvr_wsi[12169]: caps: surf=... kind=0 window=0x0 geom=1602x720 out=1602x720 map=-1 -> currentExtent=1602x720
+pvr_wsi[7398]:  swapchain: 3 images 1602x720 stride 6408 fmt 44 (fd0=26)
+pvr_wsi[7396]:  swapchain: 3 images 1x1 stride 8 fmt 44 ...
+pvr_wsi[7639]:  caps: surf=... kind=1 window=0x2200034 geom=32x32 ... map=0 -> currentExtent=32x32
+```
+
+* The Big Picture window is a **Wayland** surface (kind=0) whose caps report `1602x720` and whose
+  swapchain is really `1602x720 stride 6408 fmt 44` - the same extent and pitch the compositor
+  receives. Size negotiation for that window is correct.
+* The `1x1` swapchains and the `32x32` X11 surfaces belong to **helper windows that are never mapped**
+  (`map=0`, `geom=32x32`): Steam's small X11 popups. They are not the picture, and their size churn is
+  not the flash.
+
+So the surface path is a dead end as the cause: correct extent, correct stride, correct format, and
+the frames are black. The loss is in the client's raster into that swapchain or in the HAL's export of
+it, and the CPU-side readback that would settle it is blocked by the fd's permissions above.
+
+**Before/after (hardware arm, fresh sessions):** brightness 1.3 -> 6.4 -> 1.3 across runs (noise, not
+a fix); compositor fps unchanged 0.2-4.3; frame-size-change lines from 1x1 sources stay at 0 after
+§85a. Nothing under our control moved the picture, and the pass ends on the instrument boundary above.
+
+## 88. Vulkan readback answers it: the frame is black BEFORE export (2026-11-14)
+
+The fd route closed in §87 (`pread` -1, `mmap` EACCES), so the content test moved into the API. New
+instrument: `probe_vk_readback()` in `docs/development/pvr-re/hybshim/icd/pvr_wsi.c`, called from both
+present paths just before the buffer leaves the process. Per call it creates a `TRANSFER_DST`
+host-visible buffer, issues `vkCmdPipelineBarrier` (GENERAL -> TRANSFER_SRC_OPTIMAL) +
+`vkCmdCopyImageToBuffer` of the exact image being presented, waits on a fence (500 ms), maps it and
+samples four quadrants x 8 rows x 64 px (2048 px), reporting mean and non-black count.
+
+Two blockers had to be cleared to get a number, and both are recorded here because they were false
+leads on their own:
+
+* `vkMapMemory` is impossible without memory types: the swapchain kept an **all-zero**
+  `VkPhysicalDeviceMemoryProperties` (the field was resolved and then `(void)`ed). Fixed by fetching it
+  through a new `pvr_icd_mem_props()` in `pvr_icd.c`, called from the surface-caps path (which is the
+  only place the WSI ever sees a `VkPhysicalDevice`) and copied into the swapchain. Log before the fix:
+  `readback[wl]: no host-visible type (bits=0x7 types=0)`.
+* Steam's never-mapped helper popups (32x32 / 64x24, `map=0`) consumed the probe budget first, so the
+  probe is now gated to `width >= 800 && height >= 400`, i.e. the picture only.
+
+**The answer, on the real 1602x720 surface:**
+
+```
+pvr_wsi[5318]: readback[wl]: submit=0 fence=1
+pvr_wsi[5318]: readback[wl] image=1 1602x720 stride=6408 mean=3.40 nonblack_px=1024/2048
+pvr_wsi[5318]: readback[wl] image=2 1602x720 stride=6408 mean=3.40 nonblack_px=1024/2048
+pvr_wsi[5318]: readback[wl] image=0 1602x720 stride=6408 mean=3.40 nonblack_px=1024/2048
+screen mean 1.3
+```
+
+Identical across all three swapchain images, so it is a steady state, not a mid-frame sample. `mean=3.40`
+is essentially black (Steam's UI base is ~#1b2838, mean 27 per channel), and exactly half the samples
+carry any non-zero byte - the letterbox/half-frame shape seen in arm A's screenshot, not content.
+
+The same run shows the instrument itself is sound on a surface that *does* have content - one of
+Steam's X11 helper windows read back a **flat grey** frame:
+
+```
+pvr_wsi[30516]: readback[x11] image=0 32x32 stride=128 mean=127.67 nonblack_px=2048/2048
+```
+
+**Verdict: the loss is pre-export.** The client's own present-time swapchain image is black; nothing is
+being lost in the dma-buf export, in gamescope's import, or in our compositor - §86's conclusion that
+the compositor "receives correctly imported but black content" is now explained from the producer side.
+The fault is the client's raster into the LINEAR exportable swapchain image (the HAL path already
+documented as incomplete for render-pass writes: zero rows at 64-row granularity, transfer path clean).
+
+**Before / after, hardware arm:**
+
+| measurement | before this pass | after the readback + gate |
+|---|---|---|
+| present-time content (1602x720) | unknown (fd probe dead) | `mean=3.40`, 1024/2048 non-black - black |
+| readback instrument | `pread` -1 / `mmap` EACCES | works: `submit=0 fence=1`, maps and samples |
+| helper-popup surfaces | consuming the probe | gated out (`>=800x400`) |
+| compositor fps | 0.2-4.3 | 0.2-4.3 (unchanged) |
+| screen mean (hardware arm) | 1.3 | 1.3 (unchanged) |
+
+No rendering fix landed here: the number this pass produced is the one that decides *where* the fix
+belongs, and it says client raster, not display. The next change is therefore the standard two-image
+swapchain: render into a `TILING_OPTIMAL` image (the HAL's working path) and blit it into the LINEAR
+exportable image at present, instead of handing the app a LINEAR render target.
+
+
+## 89. Two-image swapchain landed and shipped; tiling is not the fault (2026-11-14)
+
+Built from §88's verdict ("the app rasterises straight into the LINEAR image, and that HAL path is
+the broken one"), the swapchain now has two images per slot (`pvr_wsi.c`):
+
+* `images[i].render` - `VK_IMAGE_TILING_OPTIMAL`, no external handle, `COLOR_ATTACHMENT |
+  TRANSFER_SRC | TRANSFER_DST` plus the app's requested usage, its own dedicated allocation. This is
+  what `vkGetSwapchainImagesKHR` hands the app (`images[i] = render ? render : image`).
+* `images[i].image` - the original `TILING_LINEAR`, dma-buf-exportable image, never rendered into.
+* `wsi_blit_to_export()` at present: barrier render `GENERAL -> TRANSFER_SRC_OPTIMAL`, barrier linear
+  `GENERAL -> TRANSFER_DST_OPTIMAL`, `vkCmdCopyImage` over the whole extent (1602x720, stride 6408),
+  barrier linear back to `GENERAL`, submit on the client's queue and wait on a fence. Command pool,
+  command buffer and fence are created **once per swapchain** (no per-present allocation churn), and
+  the render image is destroyed with its memory on swapchain destruction.
+* The probe now samples twice per present, before and after the copy: `readback[*]` labels are
+  `wl-render` / `x11-render` (the optimal image) and `wl` / `x11` (the linear one, post-copy).
+
+Built in WSL and pushed to `files/linux_vulkan_drivers/powervr-g5x/libvulkan_powervr.so` (343,256 B).
+
+**It did not fix the frame, and that is the finding:**
+
+```
+pvr_wsi[16166]: readback[wl-render] image=0 1602x720 stride=6408 mean=3.40 nonblack_px=1024/2048
+pvr_wsi[16166]: readback[wl]        image=0 1602x720 stride=6408 mean=3.40 nonblack_px=1024/2048
+pvr_wsi[16166]: readback[wl-render] image=1 1602x720 stride=6408 mean=3.40 nonblack_px=1024/2048
+pvr_wsi[16166]: readback[wl]        image=1 1602x720 stride=6408 mean=3.40 nonblack_px=1024/2048
+```
+
+The optimal image and the linear image report the *same* content, to the same mean and the same
+non-black count, and the copy path is confirmed working (the linear image now shows exactly what the
+optimal one holds, where before it held whatever the broken render path left). So:
+
+* **The LINEAR-render-target hypothesis is dead.** Handing the app a `TILING_OPTIMAL` image changes
+  nothing, so the HAL's linear render-pass granularity is not what makes Steam's frames black.
+* The frame is black at the source: Steam is not putting its UI into the swapchain image at all. The
+  1024-of-2048 non-black signature is constant across all three images and both tilings - a uniform
+  near-black fill (RGB ~3.4), i.e. a clear, not a composite of Steam's UI.
+
+Next target is therefore Steam's own renderer, not the WSI: whether its Vulkan/CEF compositor is
+submitting draws for the Big Picture surface at all, or falling back after a feature it queries.
+
+**Before / after, hardware arm:**
+
+| measurement | before (single linear image) | after (two-image, optimal render + copy) |
+|---|---|---|
+| present-time content, render image | n/a (app drew into linear) | `mean=3.40`, 1024/2048 - black |
+| present-time content, export image | `mean=3.40`, 1024/2048 | `mean=3.40`, 1024/2048 |
+| copy/present cost | none | one submit + fence wait per present, no allocations |
+| compositor | 81 frames / 10 s | unchanged |
+| screen mean | 1.3 - 6.4 | 6.4 |
+
+Device left on **arm A** (the arm that actually renders Steam's sign-in page) with the 8-line
+`droiddeck-env` in place; the two-image swapchain stays in the shipped driver because it is correct
+and costs nothing, and because it removed the tiling question from the search.
+
+
+## 90. The discriminator: on the arm that renders, this ICD is never loaded at all (2026-11-14)
+
+§89 left the black unexplained because both arms were being described in the same terms. They are not
+the same path, and one measurement separates them.
+
+**Arm A (renders: screen mean 39.9, 77-78 frames / 10 s, 156 GPU frames), instrumented driver installed:**
+
+```
+grep -e 'swapchain:' -e 'create_swapchain' -e 'readback' -e 'blit['  <session>.log
+(no output)
+```
+
+Not one line. On the arm where Steam's sign-in UI is actually visible, the PowerVR shim ICD is **never
+entered**: no surface, no swapchain, no present, no readback. Steam's UI there arrives entirely through
+`BL_CEF_VULKAN_ICD=/tmp/swiftshader_icd.json` + `LIBGL_ALWAYS_SOFTWARE=1` - SwiftShader and llvmpipe -
+which is why it displays and why it is slow.
+
+**Arm B (hardware, black):** the same client *does* go through this ICD, and it is not falling back at
+the API level - 13 shader modules are created successfully (`pvr_icd: vkCreateShaderModule codeSize=...
+rc=0`), a real 1602x720 swapchain exists, and presents happen - but each present carries only a clear:
+`readback[wl-render] ... mean=3.40 nonblack_px=1024/2048`, identical on the optimal render image, on the
+linear export image after the copy, on all three slots, and unchanged by §89's tiling change.
+
+So the question §89 posed is answered, and neither of its two options was right:
+
+* It is **not** that Steam's UI travels somewhere else and never reaches this swapchain - on the
+  hardware arm this swapchain is the only path the client has, and nothing else publishes to the
+  compositor from it.
+* It is **not** clear-only-because-pipelines-failed either - the shaders compile, the swapchain is the
+  right size, and the app is drawing with its own pipelines into its own `TILING_OPTIMAL` images.
+
+What is left is narrow and specific: **CEF/ANGLE's own Vulkan composition produces black on this HAL**
+before it ever reaches a swapchain image. Steam's UI is assembled in CEF's offscreen images (painted by
+Skia through ANGLE/Vulkan), and that assembly step - not the WSI, not gamescope, not our compositor -
+is where the pixels are lost. The `PVR_ICD_FORCE_LINEAR` image rewrite cannot be the cause: by default
+it is scoped by `/proc/self/comm` to the `gamescope` process only, so a Steam/CEF image keeps the
+tiling it asked for.
+
+**Before / after, on the 1602x720 surface:**
+
+| measurement | arm A (software, visible) | arm B (PowerVR, before §89) | arm B (PowerVR, two-image swapchain) |
+|---|---|---|---|
+| shim ICD entered | **never** | yes | yes |
+| shader modules built | n/a (SwiftShader) | 13, all rc=0 | 13, all rc=0 |
+| swapchain | n/a | 1602x720 stride 6408 | 1602x720 stride 6408, optimal+linear |
+| present content (render image) | n/a | n/a | `mean=3.40`, 1024/2048 |
+| present content (export image) | n/a | `mean=3.40`, 1024/2048 | `mean=3.40`, 1024/2048 |
+| compositor | 77-78 frames / 10 s (7.8 fps) | 0.1 fps, 0 GPU frames from games | unchanged |
+| screen mean | 39.9 | 6.4 | 6.4 |
+
+**Device left on arm A** - it is the only arm that shows Steam's UI, at 7.8 fps, and it is not worse
+than before. The two-image swapchain and every probe stay in the shipped driver
+(`files/linux_vulkan_drivers/powervr-g5x/libvulkan_powervr.so`): they are correct, they cost one submit
+per present, and they are what made this discriminator measurable.
+
+The next change belongs in CEF's path, not in the WSI: establish whether CEF's ANGLE device on this HAL
+is actually executing its composite pass (a draw/pipeline counter on the client's queue) and, if it is,
+why its output is black - trailing at the point where the UI's own images are painted rather than where
+they are presented.
+
+
+## 91. Command accounting: the presenting client records no draws at all (2026-11-14)
+
+§90 left one gap: the layer API (swapchain, formats, presents) said "the app is here", but nothing had
+counted the client's actual command stream. This pass closed it with counters inside the ICD
+(`pvr_icd_cmd_proc()` in `pvr_icd.c`, wrappers on `vkCmdDraw`, `vkCmdDrawIndexed`, `vkCmdDispatch`,
+`vkCmdBeginRenderPass`, `vkCmdBeginRendering`, `vkCmdClearColorImage`, `vkCmdClearAttachments`,
+`vkCmdCopyImage`, `vkCmdCopyBufferToImage`, `vkCmdBlitImage`), dumped and reset once per present for the
+real surface (`pvr_icd_cmd_report()`, called from the WSI present path only for `>= 800x400`):
+
+```
+pvr_cmd[wl] WxH #n draw=.. drawi=.. dispatch=.. beginrp=.. beginrend=.. clearimg=.. clearatt=.. copyimg=.. copybuf=.. blit=..
+```
+
+Two hook points were needed to make that measurement possible, and the first attempt is itself a result:
+
+* Hooking `icd_gdpa` (device proc address) produced **no `pvr_cmd` line at all** — the loader fills its
+  device dispatch from `vk_icdGetInstanceProcAddr` and calls those pointers directly, so the device
+  entry is bypassed. The counters were hooked in `vk_icdGetInstanceProcAddr` as well.
+* With both hooks in place the answer is unchanged: **zero `pvr_cmd` lines**. The process that owns the
+  1602x720 swapchain, presents through this ICD and produces the black image does **not record a single
+  draw, dispatch, clear, copy or blit** into it. Nothing is being dropped by the HAL, and no pipeline or
+  format is failing: there are no commands to drop.
+
+**Which path Steam's UI actually travels, and why the swapchain readback was black**
+
+The readback was black because the client presenting that swapchain never draws into it. Steam's Big
+Picture UI is composed somewhere else (CEF's own compositor/offscreen images, or the software path) and
+the 1602x720 Vulkan swapchain this ICD services is presented without content - a surface that exists,
+is acquired, is presented, and is never drawn into. That is §89's option (b), and it is now measured
+rather than inferred: it is not a tiling problem, not a format problem, not a barrier problem, and not
+a HAL draw-drop problem.
+
+**Before / after on the 1602x720 surface:**
+
+| measurement | §90 | this pass |
+|---|---|---|
+| reads: draw/drawi/dispatch/renderpass/clear/copy/blit | not measured | **all zero** through this ICD |
+| present content (render / export image) | `mean=3.40` / `mean=3.40` | unchanged (`mean=3.40`, 1024/2048) |
+| shader modules built | 13, rc=0 | 13, rc=0 (shaders exist, nothing is drawn with them) |
+| compositor | 0.1 fps, 0 GPU frames from games | unchanged |
+| screen mean (hardware arm) | 6.4 | 6.4 |
+| arm A (software) | 7.8 fps, mean 39.9 | unchanged |
+
+**Device left on arm A** - the only arm that shows Steam's UI (7.8 fps, screen mean 39.9), with the
+8-line `droiddeck-env` in place. The shipped driver carries the two-image swapchain, the readback and
+this accounting; the device copy was verified byte-identical to the local build after each push.
+
+The next step is now unambiguous: follow CEF's own compositor - which device and which target it paints
+Steam's UI into, and why that result never reaches this swapchain - rather than the WSI or the HAL, both
+of which are now excluded by measurement.
+
+
+## 92. Producer found: `steam -child-update-ui` draws, then copies black (2026-11-14)
+
+§91 said "the presenting client records no draws", based on counters that never produced a log line. This
+pass closed that gap and **corrects §91**: the counters do fire, the client does draw, and the accounting
+identifies both the process and the path.
+
+**Instrument.** The ICD now logs its own identity at load - `pvr_proc pid=N cmd=<full /proc/self/cmdline>` -
+and, at every present with no size filter, the presenting pid, the surface extent and the command counters
+for the interval since the last present:
+
+```
+pvr_wsi[8014]: present[wl] pid=8014 1602x720 cmd=/root/.local/share/Steam/steamrtarm64/steam -child-update-ui ...
+pvr_cmd[wl] 1602x720 #21 draw=3 drawi=0 dispatch=0 beginrp=0 beginrend=1 clearimg=0 clearatt=0 copyimg=1 copybuf=0 blit=0
+pvr_cmd[wl] 1602x720 #22 draw=3 drawi=0 dispatch=0 beginrp=0 beginrend=1 clearimg=0 clearatt=0 copyimg=1 copybuf=0 blit=0
+pvr_cmd[wl] 1602x720 #23 draw=3 drawi=0 dispatch=0 beginrp=0 beginrend=1 clearimg=0 clearatt=0 copyimg=1 copybuf=0 blit=0
+```
+
+**Who produces the UI.** Sixteen processes load this ICD, including `gamescope`, `Xwayland.real`, the
+`steam -gamepadui` parent, `steamsysinfo`, `gldriverquery`, `vulkandriverquery`, and - decisively -
+`steam -child-update-ui`. Only the last one presents the 1602x720 surface. So Steam's Big Picture UI is
+painted by the **update-UI child process** (CEF), through this ICD, and not by some other path: the
+presenting process is the drawing process.
+
+**What it records per present:** one `vkCmdBeginRendering`, **3 draws**, and one `vkCmdCopyImage`. The
+pattern is: render the UI into CEF's own image with dynamic rendering, then copy that image into the
+swapchain we hand out. The copy is what lands in the LINEAR exportable image - and the readback of that
+image is `mean=3.40, nonblack_px=1024/2048`. Since the copy path itself is proven working (§89: the
+optimal render image and the linear image read identically), **the black is the source of the copy**: CEF's
+own dynamic-rendering target comes out black through this HAL.
+
+**Two fixes attempted, both rejected by measurement (not by guesswork):**
+
+1. *Hide `VK_KHR_dynamic_rendering`* (`icd_ext_suppressed`, the same mechanism that suppresses
+   `VK_EXT_image_drm_format_modifier`). Rebuilt and shipped: **no change** -
+   `beginrend=1 draw=3 copyimg=1`, `mean=3.40`, `screen mean 1.3`. Dynamic rendering is **core** in
+   Vulkan 1.3, which is the API version this HAL reports, so suppressing an extension removes nothing.
+2. *Claim Vulkan 1.2 instead of 1.3* (`vkGetPhysicalDeviceProperties` / `Properties2` clamped to
+   1.2.0), so dynamic rendering becomes an extension again and the suppression above can hide it.
+   **Strictly worse**: CEF's Vulkan device never came up - no presents, no `pvr_cmd` line, the session
+   fell through to the Android home screen (`screen mean 103.9` was the launcher wallpaper). Reverted
+   immediately.
+
+**Device left on arm A**, with the reverted-but-instrumented driver pushed and verified:
+`5c56217d241fa060d12c0b4d0843334e` on the device == local build, `droiddeck-env` 8 lines, compositor
+`76 frames / 10 s` (7.6 fps).
+
+**Before / after on the 1602x720 surface:**
+
+| measurement | §91 (claimed) | this pass (measured) |
+|---|---|---|
+| producer identified | "unknown process" | `steam -child-update-ui`, pid 8014, cmdline logged |
+| commands per present | "all zero" | `beginrend=1 draw=3 copyimg=1` - **not zero** |
+| present content (export image) | `mean=3.40`, 1024/2048 | `mean=3.40`, 1024/2048 (unchanged) |
+| hide VK_KHR_dynamic_rendering | - | no effect (core at 1.3) |
+| claim Vulkan 1.2 | - | session died, reverted |
+| compositor (hardware arm) | 0.1 fps | 0.1 fps, 0 GPU frames |
+| screen mean (hardware arm) | 6.4 | 1.3 - 6.4 |
+| arm A | 7.8 fps, 39.9 | 7.6 fps, 3.9 at startup |
+
+**Route Steam's UI takes:** CEF (`steam -child-update-ui`) -> dynamic-rendering pass into its own image
+-> `vkCmdCopyImage` into our LINEAR exportable swapchain image -> gamescope import -> our compositor. The
+route is correct end to end; the content of CEF's own render target is black by the time it is copied.
+
+**Still open, precisely:** why the HAL's dynamic-rendering pass yields black for CEF's target when the
+same HAL renders CEF's frames fine under SwiftShader. The next lever is inside that pass - the colour
+attachment's format/tiling/load-op and whether the HAL is executing the 3 draws at all (a per-draw
+visibility probe, not another layer-level counter).

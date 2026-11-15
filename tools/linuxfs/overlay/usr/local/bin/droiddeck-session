@@ -69,6 +69,8 @@ collect_steam_logs() {
   [ -d "$steam_root/logs" ] && find "$steam_root/logs" -maxdepth 1 -type f -size -8192k \
     -exec cp {} "$BL_DEBUG_DIR/steam/" \; 2>/dev/null
   [ -f "$HOME/.steam/steam/logs/steamwebhelper.log" ] && cp "$HOME/.steam/steam/logs/steamwebhelper.log" "$BL_DEBUG_DIR/steam/" 2>/dev/null
+  [ -f "/tmp/steamwebhelper_peak.log" ] && cp "/tmp/steamwebhelper_peak.log" "$BL_DEBUG_DIR/steam/" 2>/dev/null
+  [ -f "/tmp/pvr_wsi.log" ] && cp "/tmp/pvr_wsi.log" "$BL_DEBUG_DIR/pvr_wsi.log" 2>/dev/null
   # NOT copied, ever: loginusers.vdf, config.vdf and the ssfn* files, which hold the credentials
   # themselves rather than a mention of them.
   local sync_store=$HOME/.local/share/droiddeck-esync sync_file
@@ -106,6 +108,17 @@ if [ -n "${BL_VK_DRIVER:-}" ]; then
     export VK_DRIVER_FILES="$BL_VK_DRIVER"
     # Loaders older than 1.3.207 only know the old name; both are harmless together.
     export VK_ICD_FILENAMES="$BL_VK_DRIVER"
+    # Keep Gamescope WSI on direct Wayland dmabuf bypass even when helper windows overlap.
+    export GAMESCOPE_WSI_FORCE_BYPASS=1
+    export STEAM_GLCOMPOSER_USE_MAKECURRENT_LEGACY=1
+    export vk_x11_ignore_suboptimal=true
+    case "$BL_VK_DRIVER:$bl_icd_lib" in
+      *powervr*)
+        export SDL_FRAMEBUFFER_ACCELERATION=${SDL_FRAMEBUFFER_ACCELERATION:-0}
+        export BL_STEAM_SYSTEM_COMPOSER=${BL_STEAM_SYSTEM_COMPOSER:-1}
+        ;;
+    esac
+    rm -f /tmp/pvr_wsi.log /tmp/steamwebhelper_peak.log 2>/dev/null || true
     echo "== vulkan driver: imported $bl_icd_lib (via $BL_VK_DRIVER)"
   else
     echo "== vulkan driver: IGNORING $BL_VK_DRIVER (manifest or ${bl_icd_lib:-library} unreadable); using the runtime's own"
@@ -220,7 +233,10 @@ if [ -z "${BL_INSIDE:-}" ]; then
   elif [ "${BL_REFRESH:-0}" -gt 0 ]; then
     args+=(-r "$BL_REFRESH")
   fi
-  [ "$mode" = steam ] && args+=(-e)
+  # -e is gamescope's Steam mode: it treats the client's window as the thing it composes and sizes its
+  # own output to it. BL_GAMESCOPE_STEAM_MODE=0 drops it for an experiment (the control run that shows
+  # a picture, droiddeckctl run, starts gamescope without it).
+  [ "$mode" = steam ] && [ "${BL_GAMESCOPE_STEAM_MODE:-1}" = 1 ] && args+=(-e)
   # Two Xwayland servers, as SteamOS runs Steam: the client on the first, games on the second
   # (STEAM_GAME_DISPLAY_0). The client then sizes the games' server to each game's Game Resolution
   # (GAMESCOPE_XWAYLAND_MODE_CONTROL; native unless one is set), and gamescope scales it to the
@@ -229,8 +245,10 @@ if [ -z "${BL_INSIDE:-}" ]; then
   # overlay is also on another server than the game, so opening it no longer takes the game's X
   # keyboard focus, which made games like FlatOut shrink their window.
   # BL_XWAYLAND_COUNT=1 in Download/droiddeck-env goes back to one.
-  if [ "$mode" = steam ] && [ "${BL_XWAYLAND_COUNT:-2}" -gt 1 ]; then
-    args+=(--xwayland-count "${BL_XWAYLAND_COUNT:-2}")
+  _bl_default_xwayland_count=2
+  [[ "${BL_VK_DRIVER:-}" == *powervr* ]] && _bl_default_xwayland_count=1
+  if [ "$mode" = steam ] && [ "${BL_XWAYLAND_COUNT:-$_bl_default_xwayland_count}" -gt 1 ]; then
+    args+=(--xwayland-count "${BL_XWAYLAND_COUNT:-$_bl_default_xwayland_count}")
     export STEAM_MULTIPLE_XWAYLANDS=1
   fi
   # Touch passes through to the client as touch until the client says otherwise, as SteamOS's
@@ -238,6 +256,10 @@ if [ -z "${BL_INSIDE:-}" ]; then
   # only once it has a controller; until then gamescope's own default made a finger a left-click
   # mouse, so the Steam interface took taps but would not scroll on a phone with no pad attached.
   [ "$mode" = steam ] && args+=(--default-touch-mode 4)
+  # On Tensor G5 (PowerVR), force windows fullscreen to prevent header borders/grey window decorations
+  if [[ "${BL_VK_DRIVER:-}" == *powervr* ]]; then
+    args+=(--force-windows-fullscreen)
+  fi
   # No --force-windows-fullscreen: it was for games that shrink their window when the Steam menu
   # opens over them (FlatOut), which no longer happens with the games on their own Xwayland server
   # (above), and it made any game drawing at another size than its display fight it. An experiment
@@ -260,6 +282,7 @@ if [ -z "${BL_INSIDE:-}" ]; then
   echo "== gamescope: baselayer fallback appID ${GAMESCOPE_FALLBACK_APPID:-none}"
   # Extra gamescope arguments for an experiment (--debug-focus, say), from Download/droiddeck-env.
   [ -n "${BL_GAMESCOPE_ARGS:-}" ] && read -r -a _bl_extra <<<"$BL_GAMESCOPE_ARGS" && args+=("${_bl_extra[@]}")
+  echo "== gamescope: steam mode ${BL_GAMESCOPE_STEAM_MODE:-1} args: ${args[*]}"
   # Deck mode's performance overlay (Quick Access Menu → Performance → Overlay Level) is drawn by
   # mangoapp, which gamescope starts beside the client; the client sets the level by rewriting
   # MANGOHUD_CONFIGFILE. The apk stages Valve's aarch64 build (tools/mangoapp) - without it the menu
@@ -274,7 +297,24 @@ if [ -z "${BL_INSIDE:-}" ]; then
     echo "== gamescope: mangoapp on ($(command -v mangoapp), config $MANGOHUD_CONFIGFILE)"
   fi
   export BL_INSIDE=1
-  exec gamescope "${args[@]}" -- "$0" "$mode" "$@"
+  # gamescope composites on the session's Vulkan driver and exports ITS OWN allocation, which this
+  # app then has to import with the system device. On PowerVR those exports are tiled with an implicit
+  # modifier and the import cannot bind them at all (state doc, 2026-11-13); a client whose frames come
+  # out LINEAR does import, which is why glxgears shows and Steam does not. BL_GAMESCOPE_VK_ICD gives
+  # gamescope a different ICD for itself - the runtime's Turnip - while the client and its games keep
+  # the session's driver, so what it exports is a layout the compositor can bind.
+  cores=$(program_cores)
+  _bl_taskset=()
+  if [ -n "$cores" ]; then
+    _bl_taskset=(taskset -c "$cores")
+    echo "== gamescope: pinning session to cores $cores"
+  fi
+  if [ -n "${BL_GAMESCOPE_VK_ICD:-}" ]; then
+    echo "== gamescope: its own vulkan ICD $BL_GAMESCOPE_VK_ICD"
+    exec "${_bl_taskset[@]}" env -u VK_DRIVER_FILES VK_ICD_FILENAMES="$BL_GAMESCOPE_VK_ICD" \
+      gamescope "${args[@]}" -- "$0" "$mode" "$@"
+  fi
+  exec "${_bl_taskset[@]}" gamescope "${args[@]}" -- "$0" "$mode" "$@"
 fi
 
 # gamescope manages X windows: toolkits go through Xwayland, not gamescope's own Wayland socket.
@@ -697,6 +737,44 @@ BUSCONF
       exit 69
     fi
 
+    # A SESSION bus, which is the one Chromium uses. The system bus above serves NetworkManager and
+    # is no substitute: Chromium reads DBUS_SESSION_BUS_ADDRESS, and without it the client's CEF
+    # repeats "Failed to connect to the bus: Could not parse server address" on every start - and the
+    # same seam kills it outright once a connection drops (bus.cc: "D-Bus connection was
+    # disconnected. Aborting."). Steam records that as a crash in CefInitialize and recycles the
+    # webhelper, which is the "Verifying installation" loop the deck sat in.
+    if command -v dbus-daemon >/dev/null 2>&1; then
+      mkdir -p /run/dbus /usr/local/share/droiddeck
+      cat > /usr/local/share/droiddeck/session-bus.conf <<'SESSIONCONF'
+<!DOCTYPE busconfig PUBLIC "-//freedesktop//DTD D-Bus Bus Configuration 1.0//EN"
+ "http://www.freedesktop.org/standards/dbus/1.0/busconfig.dtd">
+<busconfig>
+  <type>session</type>
+  <listen>unix:path=/run/dbus/session_bus_socket</listen>
+  <auth>EXTERNAL</auth>
+  <policy context="default">
+    <allow user="*"/>
+    <allow own="*"/>
+    <allow send_destination="*"/>
+    <allow receive_sender="*"/>
+  </policy>
+</busconfig>
+SESSIONCONF
+      rm -f /run/dbus/session_bus_socket
+      dbus-daemon --config-file=/usr/local/share/droiddeck/session-bus.conf --nofork --nopidfile &
+      session_bus=$!
+      for _ in $(seq 1 50); do
+        [ -S /run/dbus/session_bus_socket ] && break
+        sleep 0.1
+      done
+      if [ -S /run/dbus/session_bus_socket ]; then
+        export DBUS_SESSION_BUS_ADDRESS=unix:path=/run/dbus/session_bus_socket
+        echo "== bus: session bus up at $DBUS_SESSION_BUS_ADDRESS"
+      else
+        echo "== bus: the session bus did not come up; CEF will log a bus parse error"
+      fi
+    fi
+
     export STEAM_RUNTIME=1
     export LD_LIBRARY_PATH=$steam_root/steamrtarm64:$steam_root/steamrtarm64/panorama${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}
     export SDL_VIDEO_X11_DGAMOUSE=0
@@ -837,8 +915,11 @@ BUSCONF
     elif [ -n "${BL_CEF_ANGLE:-}" ]; then
       _bl_cef=(-cef-force-gpu "-cef-ozone-platform=$_bl_cef_ozone" -cef-use-gl=angle -cef-use-angle="${BL_CEF_ANGLE}")
     fi
+    if [ "${BL_STEAM_SYSTEM_COMPOSER:-0}" = 1 ]; then
+      _bl_cef+=(-system-composer)
+    fi
     [ -n "${BL_CEF_EXTRA:-}" ] && read -r -a _bl_cef_extra <<<"$BL_CEF_EXTRA" && _bl_cef+=("${_bl_cef_extra[@]}")
-    echo "== steam: CEF ozone=$_bl_cef_ozone use-gl=$_bl_cef_gl angle=${BL_CEF_ANGLE:-vulkan} disable-gpu=${BL_CEF_DISABLE_GPU:-0} extra='${BL_CEF_EXTRA:-}'"
+    echo "== steam: CEF ozone=$_bl_cef_ozone use-gl=$_bl_cef_gl angle=${BL_CEF_ANGLE:-vulkan} disable-gpu=${BL_CEF_DISABLE_GPU:-0} syscomp=${BL_STEAM_SYSTEM_COMPOSER:-0} sdl_fb=${SDL_FRAMEBUFFER_ACCELERATION:-unset} extra='${BL_CEF_EXTRA:-}'"
     echo "== steam args: ${_bl_ui[*]} ${_bl_cdp[*]} ${_bl_lang[*]} -clientbeta $steam_channel -no-cef-sandbox ${_bl_cef[*]} $*"
     # An update that cannot install asks for a restart (rc=42) every time; the count is capped so a
     # session can never again loop in silence, which reads as a menu opening and closing by itself.
@@ -879,6 +960,7 @@ BUSCONF
       stop_watcher=$!
     fi
     while :; do
+      rm -rf /tmp/steam* /tmp/Steam* /tmp/.com.valvesoftware.Steam* /dev/shm/* /tmp/*.sock 2>/dev/null || true
       rm -f "$HOME/.bl-restart-once"
       if [ -f "$steam_beta" ] && [ "$(cat "$steam_beta" 2>/dev/null)" != "$steam_channel" ]; then
         echo "== steam: client branch on disk was '$(cat "$steam_beta" 2>/dev/null)', set to '$steam_channel' to match -clientbeta"
@@ -893,23 +975,126 @@ BUSCONF
         droiddeck-steam-language "$HOME" "$BL_STEAM_LANGUAGE" || true
       fi
       step "starting the Steam client${BL_STEAM_UI:+ ($BL_STEAM_UI UI)}"
-      # Scoped to the client and its children only (gamescope and Xwayland are already running, so
-      # they keep the real ICD): BL_CEF_VULKAN_ICD points the client's Vulkan at another driver.
-      # Setting it to Steam's bundled SwiftShader is the experiment for the CEF GPU-process crash -
-      # a software Vulkan that never touches the PowerVR node's absent GBM (state doc section 45).
-      if [ -n "${BL_CEF_VULKAN_ICD:-}" ]; then
-        export VK_ICD_FILENAMES="$BL_CEF_VULKAN_ICD"
-        echo "== steam: VK_ICD_FILENAMES=$VK_ICD_FILENAMES (client only)"
-      fi
       # Client-only LD_LIBRARY_PATH prefix, for replacing one library (e.g. libgbm) in the client's
       # search path without touching gamescope/Xwayland. Cleared before the next start.
       if [ -n "${BL_CEF_LIBDIR:-}" ]; then
         export LD_LIBRARY_PATH="$BL_CEF_LIBDIR${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
         echo "== steam: LD_LIBRARY_PATH prefixed with $BL_CEF_LIBDIR (client only)"
       fi
+      export GAMESCOPE_WSI_FORCE_BYPASS=1
+      export STEAM_GLCOMPOSER_USE_MAKECURRENT_LEGACY=1
+      export vk_x11_ignore_suboptimal=true
       "$steam_root/steamrtarm64/steam" "${_bl_ui[@]}" "${_bl_cdp[@]}" "${_bl_lang[@]}" -clientbeta "$steam_channel" \
         -no-cef-sandbox "${_bl_cef[@]}" "$@" &
       _bl_steam_pid=$!
+      # Stall sampler (diagnostic, on by default for PowerVR): the client restarts the web helper a few
+      # seconds after the Big Picture popup, so only the seconds before that matter. Follow just CEF's
+      # browser process - the steamwebhelper whose cmdline carries no --type= - and print every one of
+      # its threads with kernel state and wait channel, once a second. A thread blocked on a futex, a
+      # poll or a Vulkan fence sleeps in state S, so the state is always printed, not filtered.
+      # Discovery needs a whole-/proc scan, which costs seconds through proot; it is refreshed every
+      # fourth sample, and a sample then costs only the browser's own task dir: two builtin reads per
+      # thread (status carries the name as well as the state). Killed when its client exits.
+      _bl_sampler_pid=
+      if [[ "${BL_VK_DRIVER:-}" == *powervr* ]] && [ "${BL_STALL_SAMPLER:-1}" = 1 ]; then
+        (
+          _bl_thread_line() { # task dir, label
+            local tdir=$1 label=$2 tid name state wchan line rss
+            tid=${tdir##*/}
+            name= state= wchan=
+            while read -r line; do
+              case "$line" in
+                Name:*) name=${line#Name:}; name=${name#"${name%%[![:space:]]*}"} ;;
+                State:*) state=${line#State:}; state=${state#"${state%%[![:space:]]*}"}; state=${state%% *}; break ;;
+              esac
+            done < "$tdir/status"
+            read -r wchan < "$tdir/wchan"
+            if [ "$label" = MAIN ]; then
+              rss=
+              while read -r line; do
+                case "$line" in VmRSS:*) rss=${line#VmRSS:}; rss=${rss#"${rss%%[![:space:]]*}"}; break ;; esac
+              done < "$tdir/status"
+              echo "   MAIN  $name state=${state:-?} wchan=${wchan:-?} rss=${rss:-?}"
+            else
+              echo "   $tid  $name state=${state:-?} wchan=${wchan:-?}"
+            fi
+          }
+          _bl_browsers=()
+          _bl_scan() {
+            local d c
+            _bl_found=()
+            for d in /proc/[0-9]*; do
+              c=
+              read -r c < "$d/comm" 2>/dev/null
+              [ "$c" = steamwebhelper ] || continue
+              case "$(tr '\0' ' ' < "$d/cmdline" 2>/dev/null)" in
+                *--type=*) continue ;; # renderer, gpu-process, zygote, utility
+              esac
+              _bl_found+=("${d#/proc/}")
+            done
+            _bl_browsers=("${_bl_found[@]}")
+          }
+          _bl_scan
+          _swh_frozen=0
+          _swh_prev=0
+          for _bl_n in $(seq 1 "${BL_STALL_SAMPLES:-90}"); do
+            nap 1
+            if [ -n "${BL_DEBUG_DIR:-}" ]; then
+              mkdir -p "$BL_DEBUG_DIR/steam" 2>/dev/null || true
+              if [ "$_swh_frozen" = 0 ]; then
+                _swh_sz=$(stat -c %s "$HOME/.steam/steam/logs/steamwebhelper.log" 2>/dev/null || echo 0)
+                _swh_disk_sz=$(stat -c %s "$BL_DEBUG_DIR/steam/steamwebhelper_first.log" 2>/dev/null || echo 0)
+                if [ "$_swh_sz" -lt "$_swh_prev" ] && [ "$_swh_prev" -gt 4096 ]; then
+                  _swh_frozen=1
+                elif [ "$_swh_sz" -gt 1024 ] && [ "$_swh_sz" -ge "$_swh_prev" ] && [ "$_swh_sz" -ge "$_swh_disk_sz" ]; then
+                  cp "$HOME/.steam/steam/logs/steamwebhelper.log" "$BL_DEBUG_DIR/steam/steamwebhelper_first.log" 2>/dev/null || true
+                  _swh_prev=$_swh_sz
+                fi
+              fi
+              if [ -f "/tmp/steamwebhelper_peak.log" ]; then
+                _swh_pk_sz=$(stat -c %s "/tmp/steamwebhelper_peak.log" 2>/dev/null || echo 0)
+                _swh_pk_disk_sz=$(stat -c %s "$BL_DEBUG_DIR/steam/steamwebhelper_peak.log" 2>/dev/null || echo 0)
+                if [ "$_swh_pk_sz" -gt "$_swh_pk_disk_sz" ]; then
+                  cp "/tmp/steamwebhelper_peak.log" "$BL_DEBUG_DIR/steam/steamwebhelper_peak.log" 2>/dev/null || true
+                fi
+              fi
+              [ -f "/tmp/pvr_wsi.log" ] && cp "/tmp/pvr_wsi.log" "$BL_DEBUG_DIR/pvr_wsi.log" 2>/dev/null || true
+            fi
+            [ $((_bl_n % 4)) -eq 1 ] && _bl_scan
+            if [ ${#_bl_browsers[@]} -eq 0 ]; then _bl_list=none; else _bl_list=${_bl_browsers[*]}; fi
+            echo "== stall-sample $_bl_n $(date +%T) client=${_bl_steam_pid:-?} browser=$_bl_list"
+            if [ ${#_bl_browsers[@]} -gt 0 ]; then
+              for _bl_bp in "${_bl_browsers[@]}"; do
+                if [ ! -d "/proc/$_bl_bp" ]; then echo "-- pid $_bl_bp gone"; continue; fi
+                _bl_count=0
+                for _bl_t in "/proc/$_bl_bp"/task/*; do _bl_count=$((_bl_count + 1)); done
+                echo "-- pid $_bl_bp type=browser threads=$_bl_count"
+                for _bl_t in "/proc/$_bl_bp"/task/*; do
+                  [ "${_bl_t##*/}" = "$_bl_bp" ] && _bl_thread_line "$_bl_t" MAIN 2>/dev/null
+                done
+                for _bl_t in "/proc/$_bl_bp"/task/*; do
+                  [ "${_bl_t##*/}" = "$_bl_bp" ] || _bl_thread_line "$_bl_t" '' 2>/dev/null
+                done | head -40
+                # A zombie still carries its wait status in /proc/<pid>/stat field 52, which is what
+                # separates a caught fault (signal 11, with a crashpad line) from a silent SIGKILL.
+                _bl_stat=
+                if [ -r "/proc/$_bl_bp/stat" ]; then
+                  while read -r _bl_stat; do break; done < "/proc/$_bl_bp/stat"
+                fi
+                if [ -n "$_bl_stat" ]; then
+                  _bl_rest=${_bl_stat##*) }
+                  _bl_arr=($_bl_rest)
+                  if [ "${_bl_arr[0]:-}" = Z ] && [ ${#_bl_arr[@]} -ge 50 ]; then
+                    _bl_ec=${_bl_arr[49]}
+                    echo "   exit=$_bl_ec signal=$(( _bl_ec & 127 )) code=$(( (_bl_ec >> 8) & 255 ))"
+                  fi
+                fi
+              done
+            fi
+          done
+        ) >> "$BL_LOG" 2>&1 &
+        _bl_sampler_pid=$!
+      fi
       # Diagnostic only (BL_UI_PROBE=1): sample the client's X windows while it runs, to see what
       # size gamescope gives them and whether they are ever mapped. off by default.
       if [ "${BL_UI_PROBE:-0}" = 1 ]; then
@@ -929,6 +1114,11 @@ BUSCONF
       fi
       wait "$_bl_steam_pid"
       rc=$?
+      if [ -n "${_bl_sampler_pid:-}" ]; then
+        kill "$_bl_sampler_pid" 2>/dev/null || true
+        wait "$_bl_sampler_pid" 2>/dev/null || true
+        _bl_sampler_pid=
+      fi
       echo "== steam exited rc=$rc"
       if [ -n "${BL_ADDED_GAMES:-}" ] && [ -f "$BL_ADDED_GAMES" ]; then
         droiddeck-steam-shortcuts "$steam_root" "$BL_ADDED_GAMES" || true
@@ -948,14 +1138,25 @@ BUSCONF
         set --
         continue
       fi
-      [ "$rc" -eq 42 ] || break
-      steam_updates=$((steam_updates + 1))
-      if [ "$steam_updates" -ge 3 ]; then
-        echo "== steam: asked to restart for an update $steam_updates times and it is not installing; the session stops here rather than loop"
-        break
+      if [ "$rc" -eq 42 ]; then
+        steam_updates=$((steam_updates + 1))
+        if [ "$steam_updates" -ge 5 ]; then
+          echo "== steam: asked to restart for an update $steam_updates times and it is not installing; the session stops here rather than loop"
+          break
+        fi
+        set --
+        continue
       fi
-      # The URL arguments were acted on the first time; a restart must not repeat them.
-      set --
+      # If steam exited rc=0 and no stop was requested, allow retry/restart so updater -> client transition survives:
+      _bl_uptime=${SECONDS:-0}
+      if [ "$rc" -eq 0 ] && [ "$_bl_uptime" -lt 600 ] && [ "${steam_restarts:-0}" -lt 5 ]; then
+        steam_restarts=$((${steam_restarts:-0} + 1))
+        echo "== steam: exited rc=0 during startup without stop request (attempt $steam_restarts); restarting client"
+        sleep 1
+        set --
+        continue
+      fi
+      break
     done
     if [ -n "${stop_watcher:-}" ]; then
       kill "$stop_watcher" 2>/dev/null || true
@@ -965,6 +1166,20 @@ BUSCONF
       kill "$games_watcher" 2>/dev/null || true
       wait "$games_watcher" 2>/dev/null || true
     fi
+    # A client that is killed rather than asked to quit leaves Steam thinking the last run was unclean,
+    # and the next start then verifies the whole install - the "Verifying installation..." window that
+    # sits in front of the sign-in page for ~25 s on every launch. Ask it to quit first and give it a
+    # few seconds to write its own state; the teardown below still takes down whatever is left.
+    _bl_alive=$(pgrep -f 'steamrtarm64/steam' 2>/dev/null)
+    if [ -n "$_bl_alive" ]; then
+      kill $_bl_alive 2>/dev/null
+      for _i in 1 2 3 4 5 6 7 8; do
+        pgrep -f 'steamrtarm64/steam' >/dev/null 2>&1 || break
+        sleep 1
+      done
+      echo "== steam: asked the client to quit so the next start does not verify the install"
+    fi
+    unset _bl_alive _i
     if [ -n "${BL_DESKTOP:-}" ]; then
       # Started from the desktop (droiddeck-steam-launch): the desktop's own programs share this
       # script's parent, so reap_orphans - right under gamescope, where everything is the client's -

@@ -400,11 +400,12 @@ static int alloc_slot(struct layer *l, struct slot *s, int w, int h, uint32_t fm
         AHardwareBuffer_Desc d = {
             .width = (uint32_t)w, .height = (uint32_t)h, .layers = 1,
             .format = fmt,
-            /* GPU render target (the blit writes it) + sampled (SurfaceFlinger's GPU fallback reads it) +
-             * composer overlay (the display scans it out). See the tiers above for the rest. */
+            /* GPU render target (the blit writes it) + sampled (SurfaceFlinger's GPU fallback reads it).
+             * Only request COMPOSER_OVERLAY on hardware-compressed tiers (UBWC). On linear tiers,
+             * the hardware DPU cannot scan out a linear buffer rotated 90/270 degrees without scanline
+             * corruption, so the buffer must be composited via GPU (CLIENT composition). */
             .usage = AHARDWAREBUFFER_USAGE_GPU_COLOR_OUTPUT | AHARDWAREBUFFER_USAGE_GPU_SAMPLED_IMAGE |
-                     AHARDWAREBUFFER_USAGE_COMPOSER_OVERLAY |
-                     (tier == TIER_UBWC ? DROIDDECK_AHB_USAGE_VENDOR_UBWC : 0) |
+                     (tier == TIER_UBWC ? (AHARDWAREBUFFER_USAGE_COMPOSER_OVERLAY | DROIDDECK_AHB_USAGE_VENDOR_UBWC) : 0) |
                      (tier == TIER_LINEAR ? AHARDWAREBUFFER_USAGE_CPU_READ_RARELY : 0)};
         AHardwareBuffer *ahb = NULL;
         if (AHardwareBuffer_allocate(&d, &ahb) != 0 || !ahb) {
@@ -445,6 +446,83 @@ static int alloc_slot(struct layer *l, struct slot *s, int w, int h, uint32_t fm
             if (tier < TIER_LINEAR) { l->alloc_tier = tier + 1; continue; }
             g_alloc_failed = 1;
             return -1;
+        }
+        /* Check if Gralloc allocated with row stride > requested width (e.g. 1664 > 1650 on Tensor G5).
+         * If stride differs from width, reallocate with width = stride so width * 4 == stride * 4,
+         * ensuring ZERO row padding in the buffer. SurfaceFlinger's setGeometry source crop keeps
+         * displaying [0, 0, w, h] without any horizontal displacement or shear. */
+        if (got.stride > (uint32_t)w) {
+            uint32_t padded_w = got.stride;
+            droiddeck_log("layer", "%s: gralloc stride %u px > width %d px: reallocating pool buffer at %ux%d "
+                                   "so buffer width matches hardware stride exactly",
+                          l->name, got.stride, w, padded_w, h);
+            vkp_image_destroy(img);
+            AHardwareBuffer_release(ahb);
+            ahb = NULL;
+            d.width = padded_w;
+            if (AHardwareBuffer_allocate(&d, &ahb) != 0 || !ahb) {
+                droiddeck_log("error", "layer: %s: padded AHardwareBuffer_allocate %ux%d failed", l->name, padded_w, h);
+                if (tier < TIER_LINEAR) { l->alloc_tier = tier + 1; continue; }
+                g_alloc_failed = 1;
+                return -1;
+            }
+            AHardwareBuffer_describe(ahb, &got);
+            nh = api.getNativeHandle(ahb);
+            fd = (nh && nh->numFds > 0) ? nh->data[0] : -1;
+            img = fd >= 0 ? vkp_image_import_dmabuf(fd, fmt == AHB_RGB10A2 ? DRM_ABGR2101010 : DRM_ABGR8888,
+                                                    mod, padded_w, h, got.stride * 4, 0, 1) : NULL;
+            if (!img) {
+                droiddeck_log("error", "layer: %s: padded pool buffer import (%ux%d, stride %u px) failed",
+                              l->name, padded_w, h, got.stride);
+                AHardwareBuffer_release(ahb);
+                if (tier < TIER_LINEAR) { l->alloc_tier = tier + 1; continue; }
+                g_alloc_failed = 1;
+                return -1;
+            }
+        }
+
+        /* Verify honoured row pitch: on tile-based GPUs like PowerVR (Tensor G5), linear 2D images
+         * enforce power-of-two or hardware-aligned row pitches (e.g. 8192 or 16384 bytes). Gralloc
+         * allocates with smaller 64-byte alignment (e.g. 1664 px = 6656 bytes for 1650w; 2432 px =
+         * 9728 bytes for 2404w). If the driver's row pitch differs from Gralloc's stride, the GPU
+         * writes rows spaced by the driver pitch while SurfaceFlinger / Hardware Composer DPU scans
+         * out rows using Gralloc's stride - shifting each scanline horizontally and producing
+         * incoherent horizontal noise / TV-static lines.
+         *
+         * When a mismatch is detected, re-allocate the AHardwareBuffer with width padded to the
+         * driver's row pitch (padded_w = driver_pitch / 4), so Gralloc allocates with full backing
+         * memory and got.stride == padded_w. SurfaceFlinger's setGeometry source crop will cleanly
+         * display the active [0, 0, w, h] region without any displacement. */
+        uint64_t rp = vkp_image_row_pitch(img);
+        if (rp > 0 && rp != (uint64_t)got.stride * 4) {
+            uint32_t padded_w = (uint32_t)(rp / 4);
+            if (rp % 4 != 0) padded_w = (uint32_t)((rp + 3) / 4);
+            droiddeck_log("layer", "%s: driver row pitch %llu bytes != gralloc stride %u px (%u bytes): "
+                                   "reallocating pool buffer at %ux%u to match hardware scanout stride",
+                          l->name, (unsigned long long)rp, got.stride, got.stride * 4, padded_w, h);
+            vkp_image_destroy(img);
+            AHardwareBuffer_release(ahb);
+            ahb = NULL;
+            d.width = padded_w;
+            if (AHardwareBuffer_allocate(&d, &ahb) != 0 || !ahb) {
+                droiddeck_log("error", "layer: %s: padded AHardwareBuffer_allocate %ux%d failed", l->name, padded_w, h);
+                if (tier < TIER_LINEAR) { l->alloc_tier = tier + 1; continue; }
+                g_alloc_failed = 1;
+                return -1;
+            }
+            AHardwareBuffer_describe(ahb, &got);
+            nh = api.getNativeHandle(ahb);
+            fd = (nh && nh->numFds > 0) ? nh->data[0] : -1;
+            img = fd >= 0 ? vkp_image_import_dmabuf(fd, fmt == AHB_RGB10A2 ? DRM_ABGR2101010 : DRM_ABGR8888,
+                                                    mod, padded_w, h, got.stride * 4, 0, 1) : NULL;
+            if (!img) {
+                droiddeck_log("error", "layer: %s: padded pool buffer import (%ux%d, stride %u px) failed",
+                              l->name, padded_w, h, got.stride);
+                AHardwareBuffer_release(ahb);
+                if (tier < TIER_LINEAR) { l->alloc_tier = tier + 1; continue; }
+                g_alloc_failed = 1;
+                return -1;
+            }
         }
         s->ahb = ahb; s->img = img; s->w = w; s->h = h; s->fmt = fmt; s->release_fd = -1; s->busy = 0;
         l->pool_modifier = mod;
@@ -586,24 +664,11 @@ static void apply_geometry(ASurfaceTransaction *tx, struct layer *l, const int r
     ARect srcR = {r[0], r[1], r[2], r[3]}, dstR = {r[4], r[5], r[6], r[7]};
     if (l == &g_layers[SC_LAYER_GAME]) { g_game_src = srcR; g_game_dst = dstR; g_game_geo_known = 1; }
     if (!l->geo_valid || memcmp(&srcR, &l->geo_src, sizeof(srcR)) || memcmp(&dstR, &l->geo_dst, sizeof(dstR))) {
-        /* Transform 0, deliberately.
-         *
-         * The NDK header states the contract for this call: `destination` is "the rect in the
-         * PARENT's space where this surface will be drawn", and `transform` is "applied AFTER the
-         * source rect is applied to the buffer". So `destination` is the FINAL rect and the
-         * transform is a second rotation on top of it.
-         *
-         * The rect this function is handed is ALREADY rotated: vkp_update_map swaps the scene's
-         * axes for a 90/270 surface (g_map_scene_swapped) before building the mapping, so
-         * vkp_map_rect returns a destination in the parent's frame. Passing the panel's transform
-         * as well rotated it twice. MEASURED on the Pixel 10 (dumpsys SurfaceFlinger):
-         *
-         *     opaqueRegion={0,0,1650,732}  toDisplayTransform={ scale x=3.2842 y=0.6467 }
-         *     bounds={0,6,1073,2404}
-         *
-         * which is a ROT_90 applied to a landscape rect that was already placed, and the
-         * non-uniform 3.28/0.65 stretch is the per-scanline misread - the horizontal
-         * random-colour-lines symptom. A ROT_90 of a 1650x732 source must land on 732x1650. */
+        /* Transform 0.
+         * The parent of ASurfaceControl is the window (ANativeWindow), which is already in
+         * sensorLandscape orientation (e.g. 2404x1080). Destination rect dstR is mapped directly
+         * in the window's coordinate space with uniform scaling and aspect ratio preserved.
+         * SurfaceFlinger handles rotation of the parent window to the physical display panel. */
         api.setGeometry(tx, l->sc, &srcR, &dstR, 0);
         l->geo_src = srcR; l->geo_dst = dstR; l->geo_valid = 1;
         char cov[96] = "";
@@ -919,7 +984,7 @@ int sc_layer_present(struct vkp_image *src, int scene_w, int scene_h, const stru
                    "HUD and pointer stay Android views above it", sw, sh,
                    l->pool_modifier == MOD_QCOM_COMPRESSED ? "UBWC" : "linear", l->pool_n);
     }
-    vkp_signal_first_frame();
+    /* Note: vkp_signal_first_frame() is handled in render_display_impl when drawn > 0 */
     return 0;
 }
 
@@ -962,7 +1027,11 @@ int sc_layer_present_display(void *img_handle, int rw, int rh, int scene_w, int 
     /* Evidence about the buffer the display will actually read, not the scene it came from. Off
      * unless BL_FRAME_DIGEST is set; the same record `diag frame --panel` produces, so the two can
      * be correlated directly. */
-    if (vkp_fd_level() > 0) vkp_digest_pool_buffer(l->slots[idx].img, rw, rh, vkp_fd_level());
+    static int g_dump_done = 0;
+    if (g_dump_done < 3 || vkp_fd_level() > 0) {
+        g_dump_done++;
+        vkp_digest_pool_buffer(l->slots[idx].img, rw, rh, 1);
+    }
     if (present_slot(l, idx, r, NULL, 0) != 0) return -1;
     if (!l->first_logged) {
         l->first_logged = 1;

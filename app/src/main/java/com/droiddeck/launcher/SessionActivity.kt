@@ -398,7 +398,7 @@ class SessionActivity : ComponentActivity(), SurfaceHolder.Callback {
             if (FrameGen.engine(this) != FrameGen.ENGINE_OFF) CompositorHost.rearmFrameGen { applyFrameGen() }
         }
         // A session that has already drawn is past its milestones; do not cover its picture.
-        if (SessionState.running && SessionState.firstFrameSeen) {
+        if (SessionState.running && SessionState.frameEverSeen) {
             loading.visible = false
             hud.start()
         }
@@ -465,7 +465,9 @@ class SessionActivity : ComponentActivity(), SurfaceHolder.Callback {
                 CursorOverlay(cursorPos, cursorVisible, resources.displayMetrics.density,
                     cursorImage, cursorHotX, cursorHotY, cursorImageScale)
                 if (hud.text.isNotEmpty()) HudText(hud.text)
-                if (loading.visible) LoadingOverlay(
+                // Once this session has drawn a frame the launch panel must not come back, not even
+                // while the client restarts: the picture is what the user is looking at.
+                if (loading.visible && !(SessionState.running && SessionState.frameEverSeen)) LoadingOverlay(
                     loading.step, loading.percent, loading.elapsed, loading.hint, loading.ended,
                     topic = loading.topic, readable = loading.readable,
                     title = loadingTitle(), steam = loadingMode() == SessionService.MODE_STEAM,
@@ -478,7 +480,13 @@ class SessionActivity : ComponentActivity(), SurfaceHolder.Callback {
                     flood = floodColor?.let { androidx.compose.ui.graphics.Color(it) },
                     onFlooded = {
                         floodColor = null
-                        window.setBackgroundDrawable(android.graphics.drawable.ColorDrawable(android.graphics.Color.BLACK))
+                        // An opaque window background is drawn OVER the compositor's SurfaceView, so once
+                        // a session is presenting a picture it must stay transparent. Black here is what
+                        // blacked Steam out and left only the on-screen pad visible - intermittently,
+                        // whenever the loading panel had flooded.
+                        val bg = if (SessionState.running && SessionState.frameEverSeen) android.graphics.Color.TRANSPARENT
+                                 else android.graphics.Color.BLACK
+                        window.setBackgroundDrawable(android.graphics.drawable.ColorDrawable(bg))
                     },
                 )
                 // Opening the drawer takes the controller away from the game: release its pad.
@@ -1157,6 +1165,15 @@ class SessionActivity : ComponentActivity(), SurfaceHolder.Callback {
                     finish()
                     return
                 }
+                // A session that has already presented a frame must not sit under the launch overlay.
+                // Hiding it was a one-shot event (firstFrameListener), so an activity that started after
+                // that event - or lost it while the surface was rebuilt - kept the splash (the DroidDeck
+                // logo with the pad legend) over a live picture, which is the flashing the user sees.
+                // Checked here as well, every 500 ms, so the two can never disagree.
+                if (loading.visible && !loading.ended && SessionState.running && SessionState.frameEverSeen) {
+                    loading.visible = false
+                    hud.start()
+                }
                 if (loading.visible && !loading.ended) {
                     if (!installingRuntime) loading.update(this@SessionActivity, SessionState.logFile)
                     if (ticks++ % 2 == 0) loading.tick()
@@ -1203,9 +1220,21 @@ class SessionActivity : ComponentActivity(), SurfaceHolder.Callback {
 
     private fun showEnded(status: Int, hint: EndHint?) {
         if (status == 0 && hint?.evenOnSuccess != true) {
+            // Steam's own bootstrapper exits rc=0 on a normal start and the session script brings the
+            // client straight back. Finishing here dropped to the launcher, which relaunched this
+            // activity, and Android drew its starting window - the DroidDeck mark - over the session.
+            // That is the flashing logo, at whatever rate the client was being restarted. Stay put
+            // while the session is still running; the picture comes back by itself.
+            if (SessionState.running) return
             finish()
             return
         }
+        // A client the session restarts (Steam's bootstrapper exits rc=0 and comes back by itself) reports
+        // an end and then a start within a second. Painting the launch screen for each of those is what
+        // looked like the DroidDeck logo flashing over Steam's sign-in every half second: the picture was
+        // there, the overlay kept being re-shown on top of it. Once a frame has been drawn, only a real
+        // end - the service no longer running - gets the ended screen.
+        if (SessionState.frameEverSeen && SessionState.running) return
         // It stays until the user leaves: a failure read against a timer is a failure not read.
         val stopped = when (SessionState.mode) {
             SessionService.MODE_RUN -> com.droiddeck.launcher.frontend.Library.nameForProgram(SessionState.program)

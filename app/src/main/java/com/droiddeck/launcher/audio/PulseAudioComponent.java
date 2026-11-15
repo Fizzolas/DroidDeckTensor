@@ -105,7 +105,8 @@ public class PulseAudioComponent extends SessionPart {
         File stamp = new File(modulesDir, ".bundle");
         String have = FileUtils.readString(stamp);
         String want = BUNDLE_STAMP + "-" + bundleChecksum();
-        if (!new File(modulesDir, "arm64/module-aaudio-sink.so").isFile()
+        if ((!new File(modulesDir, "arm64/module-aaudio-sink.so").isFile()
+                && !new File(modulesDir, "arm64/module-aaudio-classic-sink.so").isFile())
                 || !new File(workingDir, "pactl").isFile()
                 || have == null || !want.equals(have.trim())) {
             Log.i(TAG, "unpacking pulseaudio.tzst (" + want + "; had " + have + ")");
@@ -142,8 +143,14 @@ public class PulseAudioComponent extends SessionPart {
         if (relaySocketPath != null && !relaySocketPath.isEmpty()) {
             config.add("load-module module-directaudio-sink sink_name=DirectAudio socket=\"" + relaySocketPath + "\" performance_mode=1 adaptive=1 volume=1.0");
             config.add("set-default-sink DirectAudio");
-        } else {
+        } else if (new File(workingDir, "modules/arm64/module-aaudio-sink.so").isFile()) {
             config.add("load-module module-aaudio-sink sink_name=AAudioSink performance_mode=1 adaptive=1 volume=1.0");
+            config.add("set-default-sink AAudioSink");
+        } else if (new File(workingDir, "modules/arm64/module-aaudio-classic-sink.so").isFile()) {
+            config.add("load-module module-aaudio-classic-sink sink_name=AAudioSink performance_mode=1 adaptive=1 volume=1.0");
+            config.add("set-default-sink AAudioSink");
+        } else {
+            config.add("load-module module-null-sink sink_name=AAudioSink");
             config.add("set-default-sink AAudioSink");
         }
         if (micFifoPath != null && !micFifoPath.isEmpty()) {
