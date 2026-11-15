@@ -1,0 +1,500 @@
+diff --git a/hybris/vulkan/Makefile.am b/hybris/vulkan/Makefile.am
+index e033f7b..bc723c6 100644
+--- a/hybris/vulkan/Makefile.am
++++ b/hybris/vulkan/Makefile.am
+@@ -60,7 +60,7 @@ libvulkan_la_LDFLAGS = \
+ 	-version-info 3:183:2
+ 
+ # Optional standard-loader backend; no default ICD JSON is installed.
+-libhybris_vulkan_icd_la_SOURCES = icd/icd.c icd/instance.c icd/instance.h icd/device.c icd/device.h icd/wsi.c icd/wsi.h icd/swapchain.c icd/swapchain.h icd/vk_android_native_buffer.h icd/hwvulkan.h icd/physical_commands.inc
++libhybris_vulkan_icd_la_SOURCES = icd/icd.c icd/instance.c icd/instance.h icd/device.c icd/device.h icd/map_placed.c icd/map_placed.h icd/wsi.c icd/wsi.h icd/swapchain.c icd/swapchain.h icd/vk_android_native_buffer.h icd/hwvulkan.h icd/physical_commands.inc
+ EXTRA_DIST = compat/shaders/bc7.glsl compat/shaders/bc6h.glsl compat/shaders/LICENSE.bcdec icd/README.md compat/shaders/bc_decode.comp compat/shaders/generate-bc.py layer/VkLayer_hybris_compat.json
+ libhybris_vulkan_icd_la_CFLAGS = $(libvulkan_la_CFLAGS) -fvisibility=hidden
+ libhybris_vulkan_icd_la_CXXFLAGS = $(libvulkan_la_CXXFLAGS) -fvisibility=hidden
+diff --git a/hybris/vulkan/icd/device.c b/hybris/vulkan/icd/device.c
+index 1758b37..d855753 100644
+--- a/hybris/vulkan/icd/device.c
++++ b/hybris/vulkan/icd/device.c
+@@ -3,6 +3,7 @@
+ #define VK_NO_PROTOTYPES
+ #include "device.h"
+ #include "instance.h"
++#include "map_placed.h"
+ #include "swapchain.h"
+ #include <pthread.h>
+ #include <stdlib.h>
+@@ -41,6 +42,7 @@ static void free_state(struct device_state *state)
+ void VKAPI_CALL hybris_icd_destroy_device(VkDevice device, const VkAllocationCallbacks *allocator)
+ {
+     if (!device) return;
++    hybris_icd_map_placed_release_device(device);
+     hybris_icd_swapchain_release_device(device);
+     pthread_mutex_lock(&device_guard);
+     struct device_state **link = &devices;
+@@ -150,6 +152,8 @@ PFN_vkVoidFunction VKAPI_CALL hybris_icd_device_proc(VkDevice device, const char
+     PFN_vkVoidFunction backend = resolver ? resolver(device, name) : NULL;
+     PFN_vkVoidFunction local = hybris_icd_swapchain_proc(name, swapchain_enabled);
+     if (local) return local;
++    PFN_vkVoidFunction placed = hybris_icd_map_placed_device_proc(name);
++    if (placed) return placed;
+     if (backend && swapchain_enabled) {
+         PFN_vkVoidFunction image = hybris_icd_swapchain_image_proc(name);
+         if (image) return image;
+diff --git a/hybris/vulkan/icd/instance.c b/hybris/vulkan/icd/instance.c
+index 6ff495a..d46162e 100644
+--- a/hybris/vulkan/icd/instance.c
++++ b/hybris/vulkan/icd/instance.c
+@@ -3,6 +3,7 @@
+ #define VK_NO_PROTOTYPES
+ #include "instance.h"
+ #include "device.h"
++#include "map_placed.h"
+ #include "wsi.h"
+ #include "swapchain.h"
+ #include <pthread.h>
+@@ -283,6 +284,10 @@ PFN_vkVoidFunction hybris_icd_instance_proc(VkInstance instance, const char *nam
+     if (swapchain) return swapchain;
+     PFN_vkVoidFunction image = backend ? hybris_icd_swapchain_image_proc(name) : NULL;
+     if (image) return image;
++    PFN_vkVoidFunction placed_phys = backend ? hybris_icd_map_placed_physical_proc(name) : NULL;
++    if (placed_phys) return placed_phys;
++    PFN_vkVoidFunction placed_dev = hybris_icd_map_placed_device_proc(name);
++    if (placed_dev) return placed_dev;
+     /* Preserve the HAL's command scope and extension gating. */
+     if (backend && !strcmp(name, "vkDestroyInstance"))
+         return (PFN_vkVoidFunction)destroy_instance;
+diff --git a/hybris/vulkan/icd/map_placed.c b/hybris/vulkan/icd/map_placed.c
+new file mode 100644
+index 0000000..1ac5679
+--- /dev/null
++++ b/hybris/vulkan/icd/map_placed.c
+@@ -0,0 +1,357 @@
++/* SPDX-License-Identifier: Apache-2.0 */
++#define _GNU_SOURCE
++#define VK_NO_PROTOTYPES
++#include "map_placed.h"
++#include "device.h"
++#include "instance.h"
++#include <errno.h>
++#include <pthread.h>
++#include <stdint.h>
++#include <stdlib.h>
++#include <string.h>
++#include <sys/mman.h>
++#include <unistd.h>
++
++/* Local ABI definitions so this builds regardless of Vulkan-Headers version. */
++#define HYBRIS_STYPE_MAP_MEMORY_PLACED_FEATURES_EXT   ((VkStructureType)1000272000u)
++#define HYBRIS_STYPE_MAP_MEMORY_PLACED_PROPERTIES_EXT ((VkStructureType)1000272001u)
++#define HYBRIS_STYPE_MEMORY_MAP_PLACED_INFO_EXT       ((VkStructureType)1000272002u)
++#define HYBRIS_MEMORY_MAP_PLACED_BIT_EXT              0x00000001u
++#define HYBRIS_MEMORY_UNMAP_RESERVE_BIT_EXT           0x00000001u
++
++struct hybris_placed_features_ext {
++    VkStructureType sType;
++    void *pNext;
++    VkBool32 memoryMapPlaced;
++    VkBool32 memoryMapRangePlaced;
++    VkBool32 memoryUnmapReserve;
++};
++
++struct hybris_placed_properties_ext {
++    VkStructureType sType;
++    void *pNext;
++    VkDeviceSize minPlacedMemoryMapAlignment;
++};
++
++struct hybris_map_placed_info_ext {
++    VkStructureType sType;
++    const void *pNext;
++    void *pPlacedAddress;
++};
++
++struct hybris_memory_map_info_khr {
++    VkStructureType sType;
++    const void *pNext;
++    VkFlags flags;
++    VkDeviceMemory memory;
++    VkDeviceSize offset;
++    VkDeviceSize size;
++};
++
++struct hybris_memory_unmap_info_khr {
++    VkStructureType sType;
++    const void *pNext;
++    VkFlags flags;
++    VkDeviceMemory memory;
++};
++
++struct placed_mem_entry {
++    VkDevice device;
++    VkDeviceMemory memory;
++    VkDeviceSize size;
++    void *placed_addr;
++    size_t placed_size;
++    struct placed_mem_entry *next;
++};
++
++static pthread_mutex_t mem_guard = PTHREAD_MUTEX_INITIALIZER;
++static struct placed_mem_entry *mem_entries;
++
++static void track_alloc(VkDevice device, VkDeviceMemory memory, VkDeviceSize size)
++{
++    struct placed_mem_entry *entry = calloc(1, sizeof(*entry));
++    if (!entry) return;
++    entry->device = device;
++    entry->memory = memory;
++    entry->size = size;
++    pthread_mutex_lock(&mem_guard);
++    entry->next = mem_entries;
++    mem_entries = entry;
++    pthread_mutex_unlock(&mem_guard);
++}
++
++static int lookup_alloc(VkDevice device, VkDeviceMemory memory, VkDeviceSize *size_out,
++    void **placed_addr_out, size_t *placed_size_out)
++{
++    int found = 0;
++    pthread_mutex_lock(&mem_guard);
++    for (struct placed_mem_entry *e = mem_entries; e; e = e->next) {
++        if (e->device == device && e->memory == memory) {
++            if (size_out) *size_out = e->size;
++            if (placed_addr_out) *placed_addr_out = e->placed_addr;
++            if (placed_size_out) *placed_size_out = e->placed_size;
++            found = 1;
++            break;
++        }
++    }
++    pthread_mutex_unlock(&mem_guard);
++    return found;
++}
++
++static void set_placed(VkDevice device, VkDeviceMemory memory, void *addr, size_t size)
++{
++    pthread_mutex_lock(&mem_guard);
++    for (struct placed_mem_entry *e = mem_entries; e; e = e->next) {
++        if (e->device == device && e->memory == memory) {
++            e->placed_addr = addr;
++            e->placed_size = size;
++            break;
++        }
++    }
++    pthread_mutex_unlock(&mem_guard);
++}
++
++static void unmap_placed_region(void *addr, size_t size, int reserve)
++{
++    if (!addr || !size) return;
++    if (reserve) {
++        void *r = mmap(addr, size, PROT_NONE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED, -1, 0);
++        if (r != MAP_FAILED) return;
++    }
++    munmap(addr, size);
++}
++
++void hybris_icd_map_placed_release_device(VkDevice device)
++{
++    pthread_mutex_lock(&mem_guard);
++    struct placed_mem_entry **link = &mem_entries;
++    while (*link) {
++        if ((*link)->device == device) {
++            struct placed_mem_entry *dead = *link;
++            *link = dead->next;
++            if (dead->placed_addr)
++                unmap_placed_region(dead->placed_addr, dead->placed_size, 0);
++            free(dead);
++        } else {
++            link = &(*link)->next;
++        }
++    }
++    pthread_mutex_unlock(&mem_guard);
++}
++
++static void patch_placed_features(void *pNext)
++{
++    for (VkBaseOutStructure *node = pNext; node; node = node->pNext) {
++        if (node->sType == HYBRIS_STYPE_MAP_MEMORY_PLACED_FEATURES_EXT) {
++            struct hybris_placed_features_ext *f = (struct hybris_placed_features_ext *)node;
++            f->memoryMapPlaced = VK_TRUE;
++            f->memoryMapRangePlaced = VK_TRUE;
++            f->memoryUnmapReserve = VK_TRUE;
++        }
++    }
++}
++
++static void patch_placed_properties(void *pNext)
++{
++    long page = sysconf(_SC_PAGESIZE);
++    VkDeviceSize align = (page > 0) ? (VkDeviceSize)page : 4096u;
++    for (VkBaseOutStructure *node = pNext; node; node = node->pNext) {
++        if (node->sType == HYBRIS_STYPE_MAP_MEMORY_PLACED_PROPERTIES_EXT) {
++            struct hybris_placed_properties_ext *p = (struct hybris_placed_properties_ext *)node;
++            p->minPlacedMemoryMapAlignment = align;
++        }
++    }
++}
++
++static void get_features2_common(VkPhysicalDevice physical, VkPhysicalDeviceFeatures2 *features, const char *name)
++{
++    struct hybris_icd_physical context;
++    if (!hybris_icd_lookup_physical(physical, &context)) return;
++    PFN_vkGetPhysicalDeviceFeatures2 fn =
++        (PFN_vkGetPhysicalDeviceFeatures2)context.resolver(context.instance, name);
++    if (fn) fn(physical, features);
++    if (features) patch_placed_features(features->pNext);
++}
++
++static void VKAPI_CALL get_features2_core(VkPhysicalDevice physical, VkPhysicalDeviceFeatures2 *features)
++{
++    get_features2_common(physical, features, "vkGetPhysicalDeviceFeatures2");
++}
++
++static void VKAPI_CALL get_features2_khr(VkPhysicalDevice physical, VkPhysicalDeviceFeatures2 *features)
++{
++    get_features2_common(physical, features, "vkGetPhysicalDeviceFeatures2KHR");
++}
++
++static void get_properties2_common(VkPhysicalDevice physical, VkPhysicalDeviceProperties2 *props, const char *name)
++{
++    struct hybris_icd_physical context;
++    if (!hybris_icd_lookup_physical(physical, &context)) return;
++    PFN_vkGetPhysicalDeviceProperties2 fn =
++        (PFN_vkGetPhysicalDeviceProperties2)context.resolver(context.instance, name);
++    if (fn) fn(physical, props);
++    if (props) patch_placed_properties(props->pNext);
++}
++
++static void VKAPI_CALL get_properties2_core(VkPhysicalDevice physical, VkPhysicalDeviceProperties2 *props)
++{
++    get_properties2_common(physical, props, "vkGetPhysicalDeviceProperties2");
++}
++
++static void VKAPI_CALL get_properties2_khr(VkPhysicalDevice physical, VkPhysicalDeviceProperties2 *props)
++{
++    get_properties2_common(physical, props, "vkGetPhysicalDeviceProperties2KHR");
++}
++
++static VkResult VKAPI_CALL allocate_memory(VkDevice device, const VkMemoryAllocateInfo *info,
++    const VkAllocationCallbacks *allocator, VkDeviceMemory *memory)
++{
++    struct hybris_icd_device dev;
++    if (!hybris_icd_lookup_device(device, &dev)) return VK_ERROR_INITIALIZATION_FAILED;
++    PFN_vkAllocateMemory fn = (PFN_vkAllocateMemory)dev.resolver(device, "vkAllocateMemory");
++    if (!fn) return VK_ERROR_INITIALIZATION_FAILED;
++    VkResult result = fn(device, info, allocator, memory);
++    if (result == VK_SUCCESS && memory && info)
++        track_alloc(device, *memory, info->allocationSize);
++    return result;
++}
++
++static void VKAPI_CALL free_memory(VkDevice device, VkDeviceMemory memory,
++    const VkAllocationCallbacks *allocator)
++{
++    struct hybris_icd_device dev;
++    if (!hybris_icd_lookup_device(device, &dev)) return;
++    if (memory != VK_NULL_HANDLE) {
++        pthread_mutex_lock(&mem_guard);
++        struct placed_mem_entry **link = &mem_entries;
++        while (*link) {
++            if ((*link)->device == device && (*link)->memory == memory) {
++                struct placed_mem_entry *dead = *link;
++                *link = dead->next;
++                if (dead->placed_addr)
++                    unmap_placed_region(dead->placed_addr, dead->placed_size, 0);
++                free(dead);
++                break;
++            }
++            link = &(*link)->next;
++        }
++        pthread_mutex_unlock(&mem_guard);
++    }
++    PFN_vkFreeMemory fn = (PFN_vkFreeMemory)dev.resolver(device, "vkFreeMemory");
++    if (fn) fn(device, memory, allocator);
++}
++
++static VkResult VKAPI_CALL map_memory2(VkDevice device, const void *info_ptr, void **ppData)
++{
++    const struct hybris_memory_map_info_khr *info = info_ptr;
++    if (!info || !ppData) return VK_ERROR_INITIALIZATION_FAILED;
++    struct hybris_icd_device dev;
++    if (!hybris_icd_lookup_device(device, &dev)) return VK_ERROR_INITIALIZATION_FAILED;
++
++    if (info->flags & HYBRIS_MEMORY_MAP_PLACED_BIT_EXT) {
++        void *placed_addr = NULL;
++        for (const VkBaseInStructure *node = info->pNext; node; node = node->pNext) {
++            if (node->sType == HYBRIS_STYPE_MEMORY_MAP_PLACED_INFO_EXT) {
++                placed_addr = ((const struct hybris_map_placed_info_ext *)node)->pPlacedAddress;
++                break;
++            }
++        }
++        if (!placed_addr) return VK_ERROR_MEMORY_MAP_FAILED;
++        VkDeviceSize alloc_size = 0;
++        if (!lookup_alloc(device, info->memory, &alloc_size, NULL, NULL))
++            return VK_ERROR_MEMORY_MAP_FAILED;
++        if (info->offset > alloc_size) return VK_ERROR_MEMORY_MAP_FAILED;
++        VkDeviceSize map_size = (info->size == VK_WHOLE_SIZE) ? (alloc_size - info->offset) : info->size;
++        if (!map_size || info->offset + map_size > alloc_size)
++            return VK_ERROR_MEMORY_MAP_FAILED;
++
++        PFN_vkGetMemoryFdKHR get_fd = (PFN_vkGetMemoryFdKHR)dev.resolver(device, "vkGetMemoryFdKHR");
++        if (!get_fd) return VK_ERROR_MEMORY_MAP_FAILED;
++        int fd = -1;
++        VkMemoryGetFdInfoKHR fd_info = {
++            .sType = VK_STRUCTURE_TYPE_MEMORY_GET_FD_INFO_KHR,
++            .pNext = NULL,
++            .memory = info->memory,
++            .handleType = VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT,
++        };
++        VkResult fd_res = get_fd(device, &fd_info, &fd);
++        if (fd_res != VK_SUCCESS || fd < 0) {
++            fd_info.handleType = VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_FD_BIT;
++            fd_res = get_fd(device, &fd_info, &fd);
++        }
++        if (fd_res != VK_SUCCESS || fd < 0) return VK_ERROR_MEMORY_MAP_FAILED;
++
++        void *mapped = mmap(placed_addr, (size_t)map_size, PROT_READ | PROT_WRITE,
++                            MAP_SHARED | MAP_FIXED, fd, (off_t)info->offset);
++        close(fd);
++        if (mapped == MAP_FAILED) return VK_ERROR_MEMORY_MAP_FAILED;
++
++        set_placed(device, info->memory, mapped, (size_t)map_size);
++        *ppData = mapped;
++        return VK_SUCCESS;
++    }
++
++    typedef VkResult (VKAPI_CALL *pfn_map2)(VkDevice, const void *, void **);
++    pfn_map2 hal_map2 = (pfn_map2)dev.resolver(device, "vkMapMemory2");
++    if (!hal_map2) hal_map2 = (pfn_map2)dev.resolver(device, "vkMapMemory2KHR");
++    if (hal_map2) return hal_map2(device, info_ptr, ppData);
++
++    PFN_vkMapMemory hal_map = (PFN_vkMapMemory)dev.resolver(device, "vkMapMemory");
++    if (!hal_map) return VK_ERROR_INITIALIZATION_FAILED;
++    return hal_map(device, info->memory, info->offset, info->size, info->flags, ppData);
++}
++
++static VkResult VKAPI_CALL unmap_memory2(VkDevice device, const void *info_ptr)
++{
++    const struct hybris_memory_unmap_info_khr *info = info_ptr;
++    if (!info) return VK_ERROR_INITIALIZATION_FAILED;
++    struct hybris_icd_device dev;
++    if (!hybris_icd_lookup_device(device, &dev)) return VK_ERROR_INITIALIZATION_FAILED;
++
++    void *placed_addr = NULL;
++    size_t placed_size = 0;
++    if (info->memory != VK_NULL_HANDLE &&
++        lookup_alloc(device, info->memory, NULL, &placed_addr, &placed_size) &&
++        placed_addr) {
++        unmap_placed_region(placed_addr, placed_size,
++                            (info->flags & HYBRIS_MEMORY_UNMAP_RESERVE_BIT_EXT) != 0);
++        set_placed(device, info->memory, NULL, 0);
++        return VK_SUCCESS;
++    }
++
++    typedef VkResult (VKAPI_CALL *pfn_unmap2)(VkDevice, const void *);
++    pfn_unmap2 hal_unmap2 = (pfn_unmap2)dev.resolver(device, "vkUnmapMemory2");
++    if (!hal_unmap2) hal_unmap2 = (pfn_unmap2)dev.resolver(device, "vkUnmapMemory2KHR");
++    if (hal_unmap2) return hal_unmap2(device, info_ptr);
++
++    PFN_vkUnmapMemory hal_unmap = (PFN_vkUnmapMemory)dev.resolver(device, "vkUnmapMemory");
++    if (!hal_unmap) return VK_ERROR_INITIALIZATION_FAILED;
++    hal_unmap(device, info->memory);
++    return VK_SUCCESS;
++}
++
++PFN_vkVoidFunction hybris_icd_map_placed_physical_proc(const char *name)
++{
++    if (!name) return NULL;
++    if (!strcmp(name, "vkGetPhysicalDeviceFeatures2"))
++        return (PFN_vkVoidFunction)get_features2_core;
++    if (!strcmp(name, "vkGetPhysicalDeviceFeatures2KHR"))
++        return (PFN_vkVoidFunction)get_features2_khr;
++    if (!strcmp(name, "vkGetPhysicalDeviceProperties2"))
++        return (PFN_vkVoidFunction)get_properties2_core;
++    if (!strcmp(name, "vkGetPhysicalDeviceProperties2KHR"))
++        return (PFN_vkVoidFunction)get_properties2_khr;
++    return NULL;
++}
++
++PFN_vkVoidFunction hybris_icd_map_placed_device_proc(const char *name)
++{
++    if (!name) return NULL;
++    if (!strcmp(name, "vkAllocateMemory")) return (PFN_vkVoidFunction)allocate_memory;
++    if (!strcmp(name, "vkFreeMemory")) return (PFN_vkVoidFunction)free_memory;
++    if (!strcmp(name, "vkMapMemory2") || !strcmp(name, "vkMapMemory2KHR"))
++        return (PFN_vkVoidFunction)map_memory2;
++    if (!strcmp(name, "vkUnmapMemory2") || !strcmp(name, "vkUnmapMemory2KHR"))
++        return (PFN_vkVoidFunction)unmap_memory2;
++    return NULL;
++}
+diff --git a/hybris/vulkan/icd/map_placed.h b/hybris/vulkan/icd/map_placed.h
+new file mode 100644
+index 0000000..29cb9f2
+--- /dev/null
++++ b/hybris/vulkan/icd/map_placed.h
+@@ -0,0 +1,10 @@
++#ifndef HYBRIS_ICD_MAP_PLACED_H
++#define HYBRIS_ICD_MAP_PLACED_H
++
++#include <vulkan/vulkan.h>
++
++PFN_vkVoidFunction hybris_icd_map_placed_physical_proc(const char *name);
++PFN_vkVoidFunction hybris_icd_map_placed_device_proc(const char *name);
++void hybris_icd_map_placed_release_device(VkDevice device);
++
++#endif
+diff --git a/hybris/vulkan/icd/swapchain.c b/hybris/vulkan/icd/swapchain.c
+index 18f71dc..5b11b5d 100644
+--- a/hybris/vulkan/icd/swapchain.c
++++ b/hybris/vulkan/icd/swapchain.c
+@@ -672,19 +672,29 @@ VkResult hybris_icd_prepare_device(VkPhysicalDevice physical, PFN_vkGetInstanceP
+     *swapchain_enabled = 0;
+ #ifdef WANT_WAYLAND
+     uint32_t count = info->enabledExtensionCount;
+-    const char **kept = malloc(((size_t)count + 1) * sizeof(*kept));
++    const char **kept = malloc(((size_t)count + 2) * sizeof(*kept));
+     if (!kept) return VK_ERROR_OUT_OF_HOST_MEMORY;
+     uint32_t kept_count = 0;
+     int anb = 0;
++    int ext_mem_fd = 0;
++    int map_placed_requested = 0;
+     for (uint32_t i = 0; i < count; ++i) {
+         const char *name = info->ppEnabledExtensionNames[i];
+         if (!strcmp(name, VK_KHR_SWAPCHAIN_EXTENSION_NAME)) {
+             *swapchain_enabled = 1;
+             continue;
+         }
++        if (!strcmp(name, "VK_KHR_map_memory2") ||
++            !strcmp(name, "VK_EXT_map_memory_placed")) {
++            map_placed_requested = 1;
++            continue;
++        }
++        if (!strcmp(name, VK_KHR_EXTERNAL_MEMORY_FD_EXTENSION_NAME)) ext_mem_fd = 1;
+         if (!strcmp(name, VK_ANDROID_NATIVE_BUFFER_EXTENSION_NAME)) anb = 1;
+         kept[kept_count++] = name;
+     }
++    if (map_placed_requested && !ext_mem_fd)
++        kept[kept_count++] = VK_KHR_EXTERNAL_MEMORY_FD_EXTENSION_NAME;
+     if (*swapchain_enabled && !hybris_icd_physical_has_native_buffer(physical)) {
+         free(kept);
+         return VK_ERROR_EXTENSION_NOT_PRESENT;
+@@ -735,7 +745,10 @@ VkResult hybris_icd_enumerate_device_extensions(VkPhysicalDevice physical, const
+ #else
+     const int extra = 0;
+ #endif
+-    uint32_t total = hal_count + (extra ? 1u : 0u);
++    static const VkExtensionProperties map_mem2_ext = {"VK_KHR_map_memory2", 1};
++    static const VkExtensionProperties map_placed_ext = {"VK_EXT_map_memory_placed", 1};
++    uint32_t extra_placed = 2u;
++    uint32_t total = hal_count + (extra ? 1u : 0u) + extra_placed;
+     if (!properties) {
+         *count = total;
+         return VK_SUCCESS;
+@@ -758,6 +771,8 @@ VkResult hybris_icd_enumerate_device_extensions(VkPhysicalDevice physical, const
+ #ifdef WANT_WAYLAND
+     if (extra && written < space) properties[written++] = swapchain;
+ #endif
++    if (written < space) properties[written++] = map_mem2_ext;
++    if (written < space) properties[written++] = map_placed_ext;
+     *count = written;
+     return written < total ? VK_INCOMPLETE : VK_SUCCESS;
+ }
