@@ -659,8 +659,8 @@ static VkResult wsi_surface_caps(VkPhysicalDevice pd, VkSurfaceKHR surface, VkSu
               pthread_mutex_unlock(&g_memprops_mu);
           }
       } }
-    caps->minImageCount = 2;
-    caps->maxImageCount = 3;
+    caps->minImageCount = (s->kind == WSI_WAYLAND) ? 3 : 2;
+    caps->maxImageCount = 4;
     /* The size of the window this presents into, re-read every time. Reporting a hardcoded extent is
      * worse than reporting none: a real non-UINT32_MAX currentExtent tells the app that exact size is
      * required, so Steam built a 1280x720 swapchain and presented it into the gamescope window (the
@@ -802,7 +802,7 @@ struct wsi_swapchain {
      * land on these same WSI entrypoints. One lock for the whole WSI is coarse but this is a
      * hand-off path, not a hot loop. */
     pthread_mutex_t lock;
-    struct wsi_swapchain_image images[3];
+    struct wsi_swapchain_image images[4];
     PFN_vkCreateImage CreateImage; PFN_vkGetImageMemoryRequirements GetImageMemoryRequirements;
     PFN_vkGetImageSubresourceLayout GetImageSubresourceLayout;
     PFN_vkAllocateMemory AllocateMemory; PFN_vkBindImageMemory BindImageMemory;
@@ -867,7 +867,7 @@ static VkResult wsi_create_swapchain(VkDevice device, const VkSwapchainCreateInf
     struct wsi_swapchain *sc = calloc(1, sizeof(*sc));
     if (!sc) return VK_ERROR_OUT_OF_HOST_MEMORY;
     pthread_mutex_init(&sc->lock, NULL);
-    for (uint32_t i = 0; i < 3; i++) sc->images[i].fd = -1;
+    for (uint32_t i = 0; i < 4; i++) sc->images[i].fd = -1;
     sc->device = device; sc->surface = surf; sc->pending = 0;
     if (surf && surf->kind == WSI_WAYLAND && surf->display && surf->dmabuf) {
         sc->wl_queue = wl_display_create_queue(surf->display);
@@ -889,7 +889,7 @@ static VkResult wsi_create_swapchain(VkDevice device, const VkSwapchainCreateInf
             (void *)surf, surf->kind, (unsigned)surf->window,
             ci->imageExtent.width, ci->imageExtent.height, ci->minImageCount);
     sc->drm_format = drm_format_for(ci->imageFormat);
-    sc->count = ci->minImageCount > 3 ? 3 : (ci->minImageCount < 2 ? 2 : ci->minImageCount);
+    sc->count = ci->minImageCount > 4 ? 4 : (ci->minImageCount < 2 ? 2 : ci->minImageCount);
     sc->CreateImage = (PFN_vkCreateImage)dev_proc(device, "vkCreateImage");
     sc->GetImageMemoryRequirements = (PFN_vkGetImageMemoryRequirements)dev_proc(device, "vkGetImageMemoryRequirements");
     sc->GetImageSubresourceLayout = (PFN_vkGetImageSubresourceLayout)dev_proc(device, "vkGetImageSubresourceLayout");
@@ -1916,15 +1916,13 @@ static VkResult wsi_queue_present(VkQueue queue, const VkPresentInfoKHR *pi) {
                 }
             }
             if (sc->images[idx].pixmap) {
-                xcb_void_cookie_t pck = xcb_present_pixmap_checked(surf->c, surf->window, sc->images[idx].pixmap, ++sc->serial,
+                xcb_present_pixmap(surf->c, surf->window, sc->images[idx].pixmap, ++sc->serial,
                                    XCB_NONE, XCB_NONE, 0, 0, XCB_NONE, XCB_NONE, XCB_NONE,
                                    XCB_PRESENT_OPTION_NONE, 0, 0, 0, 0, NULL);
-                xcb_generic_error_t *perr = xcb_request_check(surf->c, pck);
-                if (perr) {
-                    WSI_LOG("X11 present: xcb_present_pixmap error_code=%u major=%u minor=%u",
-                            perr->error_code, perr->major_code, perr->minor_code);
-                    free(perr);
-                } else {
+                xcb_flush(surf->c);
+                static int x11_pres_logged;
+                if (x11_pres_logged < 5) {
+                    x11_pres_logged++;
                     WSI_LOG("X11 present: xcb_present_pixmap ok (conn_err=%d)", xcb_connection_has_error(surf->c));
                 }
             }

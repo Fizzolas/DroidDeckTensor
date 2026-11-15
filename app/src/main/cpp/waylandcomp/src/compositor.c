@@ -236,6 +236,8 @@ struct surface {
     struct vkp_image *shm_img;              /* our copy of the last wl_shm buffer */
     struct wl_resource *dmabuf;             /* current dmabuf wl_buffer (NULL once the client destroyed it) */
     struct dmabuf_buffer *dmabuf_buf;       /* its imported image, kept until replaced or the surface goes */
+    struct dmabuf_buffer *gs_base_buf;      /* PowerVR: last nominal gamescope frame kept behind bypass overlays */
+    int gs_nom_w, gs_nom_h;
     struct wl_listener dmabuf_destroy;
     int buf_w, buf_h, has_content;
     int probe_logged;                       /* one-line dump of the producer's first buffer */
@@ -448,7 +450,12 @@ static void release_buffer(struct surface *s, struct wl_resource *buffer, int64_
      * rate was thrown away - 178 frames a second for 91 on screen, measured (WinNative, maxjivi05).
      * One release per refresh is the back-pressure X11 gives, and the screen shows the same frames
      * either way. */
-    const int64_t interval = limit > 0 ? 1000000000LL / limit : g_refresh_ns;
+    const int64_t raw_interval = limit > 0 ? 1000000000LL / limit : g_refresh_ns;
+    /* Pace uncapped releases at 3/4 of the refresh period so the client receives its buffer
+     * ~4 ms before the next Choreographer tick instead of just after it (avoids 60 -> 30 fps
+     * quantization without releasing before vkp_render reads the buffer). */
+    const int64_t interval = (limit == 0 && raw_interval > 8000000LL)
+        ? (raw_interval * 3 / 4) : raw_interval;
     if (interval <= 0 || g_release_timer_fd < 0) { wl_buffer_send_release(buffer); perf_note_release(since_ns); return; }
     int64_t now = now_ns();
     int64_t at = s->next_release_ns + interval;
@@ -659,6 +666,10 @@ static void tree_size(const struct surface *s, int *w, int *h) {
 }
 
 static void surface_size(const struct surface *s, int *w, int *h) {
+    if (s->gs_nom_w > 0 && s->gs_nom_h > 0 && !s->dst_set) {
+        *w = s->gs_nom_w; *h = s->gs_nom_h;
+        return;
+    }
     if (s->dst_set) { *w = s->dst[0]; *h = s->dst[1]; }
     else if (s->src_set) { *w = (int)(s->src[2] + 0.5f); *h = (int)(s->src[3] + 0.5f); }
     else { *w = s->buf_w; *h = s->buf_h; }
@@ -815,6 +826,12 @@ extern void droiddeck_on_game_frame(void);
  * ("" when /proc gave none) - the app arms its CPU affinity on it (X11 does that from window events). */
 extern void droiddeck_on_game_program(int pid, const char *program);
 
+static int is_gamescope_surface(const struct surface *s) {
+    if (!s || !s->resource || s->parent) return 0;
+    const char *prog = client_name(wl_resource_get_client(s->resource));
+    return prog && strcmp(prog, "gamescope") == 0;
+}
+
 static void take_dmabuf(struct surface *s, struct dmabuf_buffer *b, struct wl_resource *buffer) {
     if (s->dmabuf != buffer || s->dmabuf_buf != b) {
         drop_dmabuf(s, 1);
@@ -832,6 +849,17 @@ static void take_dmabuf(struct surface *s, struct dmabuf_buffer *b, struct wl_re
             b->import_failed = 1;
             WLOGE("dmabuf import failed (%dx%d fmt=0x%08x mod=0x%llx)", b->width, b->height,
                   b->format, (unsigned long long)b->modifier);
+        }
+    }
+    if (g_swapchain_copy && b->img && b->width > 1 && b->height > 1 && is_gamescope_surface(s)) {
+        if (s->gs_nom_w == 0) {
+            s->gs_nom_w = b->width;
+            s->gs_nom_h = b->height;
+        }
+        if (b->width == s->gs_nom_w && b->height == s->gs_nom_h && s->gs_base_buf != b) {
+            dmabuf_buffer_unref(s->gs_base_buf);
+            s->gs_base_buf = b;
+            b->refs++;
         }
     }
     /* One line per surface describing exactly what the producer handed us, so a black picture can be
@@ -1303,6 +1331,8 @@ static void surface_resource_destroy(struct wl_resource *r) {
     if (s->pending_buffer) wl_list_remove(&s->pending_buffer_destroy.link);
     pending_releases_forget_surface(s);
     drop_dmabuf(s, 0);
+    dmabuf_buffer_unref(s->gs_base_buf);
+    s->gs_base_buf = NULL;
     ahb_swapchain_surface_gone(s);
     vkp_image_destroy(s->shm_img);
     wl_resource_for_each_safe(cb, cbtmp, &s->pending_frames) wl_resource_destroy(cb);
@@ -1828,6 +1858,17 @@ static int surface_translucent(const struct surface *s, int w, int h) {
              (long long)o[0] + o[2] >= w && (long long)o[1] + o[3] >= h);
 }
 
+static void emit_draw(struct draw_list *dl, struct vkp_draw d) {
+    if (dl->n == dl->cap) {
+        int cap = dl->cap ? dl->cap * 2 : 32;
+        struct vkp_draw *buf = realloc(dl->d, (size_t)cap * sizeof(*buf));
+        if (!buf) return;
+        dl->d = buf;
+        dl->cap = cap;
+    }
+    dl->d[dl->n++] = d;
+}
+
 static void add_surface(struct draw_list *dl, struct surface *s, int ox, int oy) {
     struct vkp_image *img = surface_image(s);
     float sx = 0, sy = 0, sw = (float)s->buf_w, sh = (float)s->buf_h;
@@ -1837,18 +1878,31 @@ static void add_surface(struct draw_list *dl, struct surface *s, int ox, int oy)
         if (g_zero_copy && droiddeck_color_hdr_open()) note_hdr_unimported(dl, s, ox, oy);
         return;
     }
+    if (s->gs_nom_w > 0 && s->gs_nom_h > 0 && !s->dst_set &&
+        (s->buf_w != s->gs_nom_w || s->buf_h != s->gs_nom_h)) {
+        if (s->gs_base_buf && s->gs_base_buf->img) {
+            emit_draw(dl, (struct vkp_draw){s->gs_base_buf->img, 0, 0,
+                (float)s->gs_nom_w, (float)s->gs_nom_h, ox, oy, s->gs_nom_w, s->gs_nom_h, 0});
+        }
+        int dx = ox, dy = oy;
+        if (s->buf_w <= s->gs_nom_w / 2 && s->buf_h <= s->gs_nom_h / 2) {
+            dx = ox + s->gs_nom_w - s->buf_w - 16;
+            dy = oy + s->gs_nom_h - s->buf_h - 16;
+            dw = s->buf_w;
+            dh = s->buf_h;
+        } else {
+            dw = s->buf_w > s->gs_nom_w ? s->gs_nom_w : s->buf_w;
+            dh = s->buf_h > s->gs_nom_h ? s->gs_nom_h : s->buf_h;
+        }
+        emit_draw(dl, (struct vkp_draw){img, 0, 0, (float)dw, (float)dh, dx, dy, dw, dh, 1});
+        s->drawn = 1;
+        return;
+    }
     if (s->src_set) { sx = s->src[0]; sy = s->src[1]; sw = s->src[2]; sh = s->src[3]; }
     surface_size(s, &dw, &dh);
     if (dw <= 0 || dh <= 0 || sw <= 0 || sh <= 0) return;
-    if (dl->n == dl->cap) {
-        int cap = dl->cap ? dl->cap * 2 : 32;
-        struct vkp_draw *d = realloc(dl->d, (size_t)cap * sizeof(*d));
-        if (!d) return;
-        dl->d = d;
-        dl->cap = cap;
-    }
-    dl->d[dl->n++] = (struct vkp_draw){img, sx, sy, sw, sh, ox, oy, dw, dh,
-                                      surface_translucent(s, dw, dh)};
+    emit_draw(dl, (struct vkp_draw){img, sx, sy, sw, sh, ox, oy, dw, dh,
+                                    surface_translucent(s, dw, dh)});
     s->drawn = 1;
 }
 

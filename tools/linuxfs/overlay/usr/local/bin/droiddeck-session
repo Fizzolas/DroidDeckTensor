@@ -108,8 +108,6 @@ if [ -n "${BL_VK_DRIVER:-}" ]; then
     export VK_DRIVER_FILES="$BL_VK_DRIVER"
     # Loaders older than 1.3.207 only know the old name; both are harmless together.
     export VK_ICD_FILENAMES="$BL_VK_DRIVER"
-    # Keep Gamescope WSI on direct Wayland dmabuf bypass even when helper windows overlap.
-    export GAMESCOPE_WSI_FORCE_BYPASS=1
     export STEAM_GLCOMPOSER_USE_MAKECURRENT_LEGACY=1
     export vk_x11_ignore_suboptimal=true
     case "$BL_VK_DRIVER:$bl_icd_lib" in
@@ -260,6 +258,13 @@ if [ -z "${BL_INSIDE:-}" ]; then
   # opens over them (FlatOut), which no longer happens with the games on their own Xwayland server
   # (above), and it made any game drawing at another size than its display fight it. An experiment
   # can still pass it with BL_GAMESCOPE_ARGS.
+  # On PowerVR, force gamescope to composite overlays, QAM, and toast notifications onto its
+  # output framebuffer and disable Wayland/DRM overlay planes instead of passing sub-sized
+  # dmabufs (e.g. 477x120 or 1273x722) directly to waylandcomp where fit/center scaling
+  # stretches them fullscreen or flip-flops sizes.
+  case "${BL_VK_DRIVER:-}" in
+    *powervr*) args+=(--force-composition --disable-layers) ;;
+  esac
   # HDR10: the app opened its compositor's colour-management gate for this session (BL_HDR=1);
   # gamescope then offers HDR to its clients through the same wp_color_manager_v1 it binds on ours.
   [ "${BL_HDR:-0}" = 1 ] && args+=(--hdr-enabled)
@@ -329,6 +334,9 @@ bl_xprop_set_all() {
   done
   [ "$ok" = 1 ]
 }
+case "${BL_VK_DRIVER:-}" in
+  *powervr*) bl_xprop_set_all GAMESCOPE_COMPOSITE_FORCE 1 || true ;;
+esac
 export GDK_BACKEND=x11 QT_QPA_PLATFORM=xcb SDL_VIDEODRIVER=x11
 # gamescope's reaper waits for every process left under it before the compositor comes down. A
 # process a game left behind - a Wine service blocked on a server that is already gone - is

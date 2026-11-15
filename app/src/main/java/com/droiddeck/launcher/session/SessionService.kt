@@ -656,15 +656,11 @@ class SessionService : Service() {
             // threads on big.LITTLE, and bound D3D9 frame latency to 1 for PowerVR TBDR.
             guest.add("DXVK_STATE_CACHE=1")
             guest.add("DXVK_STATE_CACHE_PATH=/root/.cache/dxvk")
-            guest.add("DXVK_CONFIG=dxvk.numCompilerThreads = 4; d3d9.maxFrameLatency = 1")
+            guest.add("DXVK_CONFIG=dxvk.numCompilerThreads = 4; d3d9.invariantPosition = True; d3d11.invariantPosition = True; d3d9.forceSingleSample = True")
             guest.add("MESA_SHADER_CACHE_MAX_SIZE=2G")
             guest.add("MESA_SHADER_CACHE_DIR=/root/.cache/mesa")
             if (SessionPrefs.fexPreset(this) == "PERFORMANCE_TSO") {
                 guest.add("FEX_SMCCHECKS=none")
-                guest.add("FEX_DISABLEL2CACHE=1")
-                guest.add("FEX_DYNAMICL1CACHE=1")
-                guest.add("FEX_DYNAMICL1CACHEINCREASECOUNTHEURISTIC=250")
-                guest.add("FEX_DYNAMICL1CACHEDECREASECOUNTHEURISTIC=50")
             }
         } else if (SessionPrefs.zinkLazy(this)) {
             guest.add("ZINK_DESCRIPTORS=lazy")
@@ -1490,6 +1486,23 @@ class SessionService : Service() {
                 return@Thread
             }
             Log.i(TAG, "proot tracer $pid: nice $nice (asked for $TRACER_NICE)")
+            val isPowerVr = SessionPrefs.linuxDriver(this).ifEmpty { bundledId() ?: "" }
+                .contains("powervr", ignoreCase = true)
+            if (isPowerVr) {
+                val freqs = com.droiddeck.launcher.core.CpuCores.all.mapNotNull { c ->
+                    com.droiddeck.launcher.core.CpuCores.maxGhz(c)?.let { c to it }
+                }
+                val minFreq = freqs.minOfOrNull { it.second }
+                val fast = if (minFreq != null) freqs.filter { it.second > minFreq + 0.05 }.map { it.first } else emptyList()
+                if (fast.isNotEmpty() && java.io.File("/system/bin/taskset").canExecute()) {
+                    val mask = fast.joinToString(",")
+                    runCatching {
+                        ProcessBuilder("/system/bin/taskset", "-pc", mask, pid.toString())
+                            .redirectErrorStream(true).start().waitFor()
+                        Log.i(TAG, "proot tracer $pid: pinned to fast cores $mask")
+                    }
+                }
+            }
         }, "tracer-priority").start()
     }
 
