@@ -655,8 +655,17 @@ class SessionService : Service() {
             // recompiling shaders, cap compiler threads to avoid starving the main/compositor
             // threads on big.LITTLE, and bound D3D9 frame latency to 1 for PowerVR TBDR.
             guest.add("DXVK_STATE_CACHE=1")
+            guest.add("DXVK_STATE_CACHE_PATH=/root/.cache/dxvk")
             guest.add("DXVK_CONFIG=dxvk.numCompilerThreads = 4; d3d9.maxFrameLatency = 1")
             guest.add("MESA_SHADER_CACHE_MAX_SIZE=2G")
+            guest.add("MESA_SHADER_CACHE_DIR=/root/.cache/mesa")
+            if (SessionPrefs.fexPreset(this) == "PERFORMANCE_TSO") {
+                guest.add("FEX_SMCCHECKS=none")
+                guest.add("FEX_DISABLEL2CACHE=1")
+                guest.add("FEX_DYNAMICL1CACHE=1")
+                guest.add("FEX_DYNAMICL1CACHEINCREASECOUNTHEURISTIC=250")
+                guest.add("FEX_DYNAMICL1CACHEDECREASECOUNTHEURISTIC=50")
+            }
         } else if (SessionPrefs.zinkLazy(this)) {
             guest.add("ZINK_DESCRIPTORS=lazy")
             guest.add("ZINK_DEBUG=compact")
