@@ -643,28 +643,7 @@ class SessionService : Service() {
         val isPowerVr = SessionPrefs.linuxDriver(this).ifEmpty { bundledId() ?: "" }
             .contains("powervr", ignoreCase = true)
         if (isPowerVr) {
-            // PowerVR TBDR leaves uninitialized tile memory behind Zink's renderpass load/store
-            // tracking (ZINK_DEBUG=rp), producing static/animated red-teal quads on UI layers.
-            guest.add("ZINK_DEBUG=norp")
-            // Gallium threaded context (tc_batch_execute) and mesa_glthread race with Zink's
-            // resource/kopper barrier state on PowerVR, faulting in libgallium and failing
-            // WineD3D's glClientWaitSync checks. Keep GL/Gallium submission synchronous for Zink.
-            guest.add("GALLIUM_THREAD=0")
-            guest.add("mesa_glthread=false")
-            // Persist DXVK pipeline state cache across launches so subsequent startups avoid
-            // recompiling shaders, cap compiler threads to avoid starving the main/compositor
-            // threads on big.LITTLE, and bound D3D9 frame latency to 1 for PowerVR TBDR.
-            guest.add("DXVK_STATE_CACHE=1")
-            guest.add("DXVK_STATE_CACHE_PATH=/root/.cache/dxvk")
-            guest.add("DXVK_LOG_LEVEL=none")
-            guest.add("VKD3D_DEBUG=none")
-            guest.add("WINEDEBUG=-all")
-            guest.add("DXVK_CONFIG=dxvk.numCompilerThreads = 4; dxvk.allowMemoryOvercommit = True; d3d11.cachedDynamicResources = vi; d3d9.invariantPosition = True; d3d11.invariantPosition = True; d3d9.forceSingleSample = True")
-            guest.add("MESA_SHADER_CACHE_MAX_SIZE=2G")
-            guest.add("MESA_SHADER_CACHE_DIR=/root/.cache/mesa")
-            if (SessionPrefs.fexPreset(this) == "PERFORMANCE_TSO") {
-                guest.add("FEX_SMCCHECKS=none")
-            }
+            guest.addAll(powerVrGuestEnv(SessionState.fpsLimit, SessionPrefs.fexPreset(this)))
         } else if (SessionPrefs.zinkLazy(this)) {
             guest.add("ZINK_DESCRIPTORS=lazy")
             guest.add("ZINK_DEBUG=compact")
@@ -1899,6 +1878,39 @@ class SessionService : Service() {
                     .setAction(ACTION_AUXILIARY_EXITED)
                     .putExtra(EXTRA_AUXILIARY_PID, pid),
             )
+        }
+
+        /**
+         * Guest environment overrides specific to PowerVR (Tensor G5): synchronous Zink state,
+         * persistent shader/state caches, balanced compiler threads and bounded swapchain queue,
+         * plus DXVK/VKD3D frame-rate matching to prevent VSync-off thermal runaway.
+         */
+        internal fun powerVrGuestEnv(fpsLimit: Int, fexPreset: String): List<String> = buildList {
+            // PowerVR TBDR leaves uninitialized tile memory behind Zink's renderpass load/store
+            // tracking (ZINK_DEBUG=rp), producing static/animated red-teal quads on UI layers.
+            add("ZINK_DEBUG=norp")
+            // Gallium threaded context (tc_batch_execute) and mesa_glthread race with Zink's
+            // resource/kopper barrier state on PowerVR, faulting in libgallium and failing
+            // WineD3D's glClientWaitSync checks. Keep GL/Gallium submission synchronous for Zink.
+            add("GALLIUM_THREAD=0")
+            add("mesa_glthread=false")
+            // Persist DXVK pipeline state cache across launches, reserve 3 of 6 big/prime cores for
+            // FEX/main/render threads, and cap swapchain frame queuing to 2 for lower temps/latency.
+            add("DXVK_STATE_CACHE=1")
+            add("DXVK_STATE_CACHE_PATH=/root/.cache/dxvk")
+            add("DXVK_LOG_LEVEL=none")
+            add("VKD3D_DEBUG=none")
+            add("WINEDEBUG=-all")
+            add("DXVK_CONFIG=dxvk.numCompilerThreads = 3; dxvk.allowMemoryOvercommit = True; d3d11.cachedDynamicResources = vi; d3d9.invariantPosition = True; d3d11.invariantPosition = True; d3d9.forceSingleSample = True; dxgi.maxFrameLatency = 2; d3d9.maxFrameLatency = 2")
+            if (fpsLimit > 0) {
+                add("DXVK_FRAME_RATE=$fpsLimit")
+                add("VKD3D_FRAME_RATE=$fpsLimit")
+            }
+            add("MESA_SHADER_CACHE_MAX_SIZE=2G")
+            add("MESA_SHADER_CACHE_DIR=/root/.cache/mesa")
+            if (fexPreset == "PERFORMANCE_TSO") {
+                add("FEX_SMCCHECKS=none")
+            }
         }
     }
 }

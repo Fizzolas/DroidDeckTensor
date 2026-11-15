@@ -65,6 +65,13 @@ object CompositorHost {
      * clocks from that a session that has been slowed reads as one that wants to be. (WinNative,
      * WaylandSession.)
      */
+    /** Dynamically adjusts frame pacing and layer refresh rate vote while the compositor is live. */
+    @Synchronized
+    fun updatePacing(refreshHz: Float, fpsLimit: Int) {
+        if (!started) return
+        pace(refreshHz, fpsLimit)
+    }
+
     private fun pace(refreshHz: Float, fpsLimit: Int) {
         WaylandCompositor.nativeSetFpsLimit(fpsLimit)
         WaylandCompositor.nativeSetLayerFrameRate(if (fpsLimit > 0) fpsLimit.toFloat() else refreshHz)

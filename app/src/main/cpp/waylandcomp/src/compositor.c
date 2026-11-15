@@ -451,16 +451,25 @@ static void release_buffer(struct surface *s, struct wl_resource *buffer, int64_
      * One release per refresh is the back-pressure X11 gives, and the screen shows the same frames
      * either way. */
     const int64_t raw_interval = limit > 0 ? 1000000000LL / limit : g_refresh_ns;
-    /* Pace uncapped releases at 3/4 of the refresh period so the client receives its buffer
-     * ~4 ms before the next Choreographer tick instead of just after it (avoids 60 -> 30 fps
-     * quantization without releasing before vkp_render reads the buffer). */
-    const int64_t interval = (limit == 0 && raw_interval > 8000000LL)
-        ? (raw_interval * 3 / 4) : raw_interval;
+    /* Always advance at exact 1x cadence (refresh period or 1/limit): shrinking the period to
+     * 3/4 made every subsequent release fire at 4/3x rate (80/s on 60 Hz, 160/s on 120 Hz),
+     * wasting ~33% GPU energy on phantom frames. Preserve the ~1/4-period pre-vsync lead by
+     * phase-aligning the anchor on cold/late starts when swapchain-copy is active. */
+    const int64_t interval = raw_interval;
     if (interval <= 0 || g_release_timer_fd < 0) { wl_buffer_send_release(buffer); perf_note_release(since_ns); return; }
     int64_t now = now_ns();
     int64_t at = s->next_release_ns + interval;
     int64_t latest = now + interval * (int64_t)(s->releases_pending + 1);
-    if (at < now) at = now;
+    if (at < now) {
+        if (g_swapchain_copy && limit == 0 && g_last_vsync_ns > 0 && interval > 8000000LL) {
+            int64_t lead = g_last_vsync_ns + (interval * 3 / 4);
+            int64_t delta = now - lead;
+            if (delta > 0) lead += ((delta + interval - 1) / interval) * interval;
+            at = lead;
+        } else {
+            at = now;
+        }
+    }
     if (at > latest) at = latest;
     s->next_release_ns = at;
     struct pending_release *pr = calloc(1, sizeof(*pr));

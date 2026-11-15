@@ -11,6 +11,7 @@ import android.os.Bundle
 import android.os.Environment
 import android.os.Handler
 import android.os.Looper
+import android.os.PowerManager
 import android.os.SystemClock
 import android.util.Log
 import android.view.InputDevice
@@ -40,6 +41,7 @@ import com.droiddeck.launcher.core.TextureFiltering
 import com.droiddeck.launcher.files.InAppFilePicker
 import com.droiddeck.launcher.frontend.Library
 import com.droiddeck.launcher.gpu.FrameGen
+import com.droiddeck.launcher.gpu.GpuInfo
 import com.droiddeck.launcher.gpu.ScreenEffectLooks
 import com.droiddeck.launcher.gpu.ScreenEffects
 import com.droiddeck.launcher.gpu.Lossless
@@ -70,6 +72,7 @@ import com.droiddeck.launcher.session.SessionPaths
 import com.droiddeck.launcher.wayland.HdrSupport
 import com.droiddeck.launcher.session.SessionService
 import com.droiddeck.launcher.session.SessionState
+import com.droiddeck.launcher.session.ThermalGovernor
 import com.droiddeck.launcher.ui.CursorOverlay
 import androidx.compose.ui.graphics.asImageBitmap
 import com.droiddeck.launcher.ui.DrawerActions
@@ -118,7 +121,72 @@ class SessionActivity : ComponentActivity(), SurfaceHolder.Callback {
     private var padMotion: com.droiddeck.launcher.input.PadMotion? = null
     /** Between onResume and onPause. */
     private var resumed = false
+    private val thermalGovernor by lazy { ThermalGovernor() }
+    private var lastSustainedMode: Boolean? = null
+    private var lastGovernedFps: Int? = null
+    private var thermalListener: Any? = null
     private val deckPadListener: () -> Unit = { uiHandler.post { updatePadMotion(); openDeckRing("deck pad changed") } }
+
+    private fun currentThermalStatus(): Int {
+        if (Build.VERSION.SDK_INT < 29) return ThermalGovernor.STATUS_NONE
+        return runCatching {
+            (getSystemService(POWER_SERVICE) as? PowerManager)?.currentThermalStatus
+                ?: ThermalGovernor.STATUS_NONE
+        }.getOrDefault(ThermalGovernor.STATUS_NONE)
+    }
+
+    private fun isScreenInteractive(): Boolean =
+        runCatching { (getSystemService(POWER_SERVICE) as? PowerManager)?.isInteractive ?: true }
+            .getOrDefault(true)
+
+    private fun registerThermalGovernor() {
+        if (Build.VERSION.SDK_INT < 29 || GpuInfo.detect().family.vendor != GpuInfo.Vendor.POWERVR) return
+        val pm = getSystemService(POWER_SERVICE) as? PowerManager ?: return
+        val listener = PowerManager.OnThermalStatusChangedListener { status ->
+            applyThermalPolicy(thermalStatus = status)
+        }
+        pm.addThermalStatusListener({ r -> uiHandler.post(r) }, listener)
+        thermalListener = listener
+        applyThermalPolicy(thermalStatus = pm.currentThermalStatus)
+    }
+
+    private fun unregisterThermalGovernor() {
+        val listener = thermalListener ?: return
+        thermalListener = null
+        if (Build.VERSION.SDK_INT >= 29) {
+            @Suppress("UNCHECKED_CAST")
+            val pmListener = listener as? PowerManager.OnThermalStatusChangedListener
+            if (pmListener != null) {
+                runCatching { (getSystemService(POWER_SERVICE) as? PowerManager)?.removeThermalStatusListener(pmListener) }
+            }
+        }
+    }
+
+    private fun applyThermalPolicy(thermalStatus: Int = currentThermalStatus()) {
+        if (GpuInfo.detect().family.vendor != GpuInfo.Vendor.POWERVR) return
+        val hz = refreshHz()
+        val policy = thermalGovernor.update(
+            baseFpsLimit = SessionState.fpsLimit,
+            panelRefreshHz = hz,
+            thermalStatus = thermalStatus,
+            activityVisible = started || resumed,
+            screenOn = isScreenInteractive(),
+        )
+        var changed = false
+        if (Build.VERSION.SDK_INT >= 24 && lastSustainedMode != policy.sustainedPerformance) {
+            runCatching { window.setSustainedPerformanceMode(policy.sustainedPerformance) }
+            lastSustainedMode = policy.sustainedPerformance
+            changed = true
+        }
+        if (CompositorHost.isStarted && lastGovernedFps != policy.effectiveFpsLimit) {
+            CompositorHost.updatePacing(hz, policy.effectiveFpsLimit)
+            lastGovernedFps = policy.effectiveFpsLimit
+            changed = true
+        }
+        if (changed) {
+            Log.i(TAG, "thermal governor (${policy.reason}): fps=${policy.effectiveFpsLimit}, sustained=${policy.sustainedPerformance}")
+        }
+    }
 
     /**
      * A Deck's controller is there from the moment it boots, and the client looks for it once, as
@@ -335,6 +403,7 @@ class SessionActivity : ComponentActivity(), SurfaceHolder.Callback {
             )
         }
         Log.i(TAG, "perf: " + PerfMode.apply(this, SessionState.fpsLimit))
+        registerThermalGovernor()
         goFullscreen()
         // The device's volume keys change the stream the session plays on (the relay and
         // PulseAudio are media playback); they are never forwarded to the guest.
@@ -1035,6 +1104,8 @@ class SessionActivity : ComponentActivity(), SurfaceHolder.Callback {
             driverId?.let { turnip.driverPath(it) }, driverId?.let { turnip.libraryName(it) },
             applicationInfo.nativeLibraryDir, size.first, size.second, refreshHz(), SessionState.fpsLimit,
         )
+        lastGovernedFps = null
+        applyThermalPolicy()
         if (!SessionState.running) SessionEvents.record("compositor.started")
         // The service owns everything below the compositor. It is started whenever no session is
         // running - NOT only when the compositor was just started: the compositor lives for the
@@ -1950,6 +2021,7 @@ class SessionActivity : ComponentActivity(), SurfaceHolder.Callback {
         refreshSecondScreenDisplays()
         if (secondScreenMode != SecondScreenMode.NONE && secondScreenPresentation == null) showSecondScreen(secondScreenMode)
         SessionService.setActivityVisible(this, true)
+        applyThermalPolicy()
     }
 
     override fun onStop() {
@@ -1960,6 +2032,7 @@ class SessionActivity : ComponentActivity(), SurfaceHolder.Callback {
         // onStart puts it back.
         closeSecondScreen(reset = false)
         SessionService.setActivityVisible(this, false)
+        applyThermalPolicy()
         super.onStop()
     }
 
@@ -2094,6 +2167,7 @@ class SessionActivity : ComponentActivity(), SurfaceHolder.Callback {
         if (SessionState.endListener === endListener) SessionState.endListener = null
         WaylandCompositor.clearFirstFrameListener(firstFrameListener)
         WaylandCompositor.clearPointerLockListener(pointerLockListener)
+        unregisterThermalGovernor()
         super.onDestroy()
     }
 

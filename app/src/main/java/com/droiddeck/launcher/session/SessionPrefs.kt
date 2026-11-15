@@ -681,7 +681,19 @@ object SessionPrefs {
      * 144 Hz panel with nothing else changed judders; this is what WinNative's per-shortcut limit
      * does. Applies next session.
      */
-    fun fpsLimit(context: Context, mode: String): Int = prefs(context).getInt("fpsLimit.$mode", 0)
+    /**
+     * Default frame cap when the user has not explicitly picked one yet: 60 fps on PowerVR
+     * (Tensor G5), dividing its 120 Hz LTPO panel evenly without burning GPU/display power on
+     * uncapped menus or loading screens; 0 (uncapped) on Adreno and other GPUs.
+     */
+    internal fun defaultFpsLimitForVendor(vendor: GpuInfo.Vendor): Int =
+        if (vendor == GpuInfo.Vendor.POWERVR) 60 else 0
+
+    fun fpsLimit(context: Context, mode: String): Int {
+        val p = prefs(context)
+        val key = "fpsLimit.$mode"
+        return if (p.contains(key)) p.getInt(key, 0) else defaultFpsLimitForVendor(GpuInfo.detect().family.vendor)
+    }
 
     fun setFpsLimit(context: Context, mode: String, fps: Int) {
         prefs(context).edit().putInt("fpsLimit.$mode", fps.coerceAtLeast(0)).apply()
